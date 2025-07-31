@@ -1,0 +1,2 @@
+# FastHier
+Fast hierarchical modeling
