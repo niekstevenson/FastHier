@@ -187,6 +187,70 @@ build_rw_step <- function(param_vec, log_sd_block, cholR) {
   param_vec + step
 }
 
+# ---------- Adaptive cache refreshing utilities ---------------------------
+monitor_cache_quality <- function(cache, mu_curr, L_curr, refresh_threshold = 0.15) {
+  Sig_curr <- Sigma_from_L(L_curr)
+  
+  # Quick ESS check for each subject
+  ess_vals <- sapply(cache, function(cache_i) {
+    # Compute raw IS weights
+    logw_raw <- cache_i$loglik + 
+      mvtnorm::dmvnorm(cache_i$Theta, mu_curr, Sig_curr, log = TRUE) - 
+      cache_i$logq
+    w <- exp(logw_raw - logsumexp(logw_raw))
+    kish_ess <- (sum(w)^2) / sum(w^2)
+    kish_ess / length(w)  # relative ESS
+  })
+  
+  mean_rel_ess <- mean(ess_vals)
+  min_rel_ess <- min(ess_vals)
+  
+  # Flag for refresh if average ESS drops below threshold
+  needs_refresh <- (mean_rel_ess < refresh_threshold) || (min_rel_ess < 0.05)
+  
+  list(mean_rel_ess = mean_rel_ess, 
+       min_rel_ess = min_rel_ess,
+       needs_refresh = needs_refresh,
+       subject_ess = ess_vals)
+}
+
+refresh_cache_subject <- function(subj_data, model, mu_curr, L_curr, 
+                                  M_cache = 1000L, G = 5) {
+  # Build new proposal centered on current hyperparameters
+  Sig_curr <- Sigma_from_L(L_curr)
+  
+  # Enhanced proposal: mixture of current posterior + exploration
+  prop_means <- list(mu_curr, mu_curr)  # Could add more components
+  prop_covs <- list(Sig_curr, 2 * Sig_curr)  # Second component wider
+  prop_weights <- c(0.7, 0.3)
+  
+  # Sample from enhanced proposal
+  comp <- sample(1:2, M_cache, replace = TRUE, prob = prop_weights)
+  Theta <- matrix(NA_real_, M_cache, length(mu_curr))
+  for (g in 1:2) {
+    idx <- which(comp == g)
+    if (length(idx) > 0) {
+      Theta[idx, ] <- mvtnorm::rmvnorm(length(idx), prop_means[[g]], prop_covs[[g]])
+    }
+  }
+  
+  # Evaluate likelihood and proposal density
+  loglik <- EMC2:::calc_ll_manager(Theta, subj_data, model)
+  
+  # Compute mixture proposal density
+  logq <- rep(-Inf, M_cache)
+  for (g in 1:2) {
+    logq_g <- mvtnorm::dmvnorm(Theta, prop_means[[g]], prop_covs[[g]], log = TRUE) + 
+              log(prop_weights[g])
+    # Element-wise logsumexp
+    for (i in 1:M_cache) {
+      logq[i] <- logsumexp(c(logq[i], logq_g[i]))
+    }
+  }
+  
+  list(Theta = Theta, loglik = loglik, logq = logq)
+}
+
 # ---------- main PMMH driver -----------------------------------------------
 run_pmmh <- function(cache,
                      n_iter      = 6000L,
@@ -201,6 +265,10 @@ run_pmmh <- function(cache,
                      t0          = 10,
                      kappa_da    = 0.75,
                      diag_print  = 1000L,
+                     adaptive_cache = TRUE,
+                     cache_refresh_freq = 500L,
+                     cache_refresh_threshold = 0.15,
+                     single_subjects = NULL,  # for cache rebuilding
                      seed        = NULL) {
 
   if (!is.null(seed)) set.seed(seed)
@@ -328,9 +396,38 @@ run_pmmh <- function(cache,
       keep$loglike_hat[draw_idx] <- loglike_curr
     }
 
+    ## 6. adaptive cache refreshing ----------------------------------------
+    if (adaptive_cache && !is.null(single_subjects) && 
+        t > burn && t %% cache_refresh_freq == 0) {
+      
+      quality <- monitor_cache_quality(cache, mu_curr, L_curr, cache_refresh_threshold)
+      
+      if (quality$needs_refresh) {
+        cat(sprintf("  Refreshing cache at iter %d (mean ESS=%.3f, min ESS=%.3f)\n",
+                    t, quality$mean_rel_ess, quality$min_rel_ess))
+        
+        # Rebuild cache for subjects with poor ESS
+        poor_subjects <- which(quality$subject_ess < cache_refresh_threshold)
+        for (i in poor_subjects) {
+          subj_data <- single_subjects[[i]][[1]]$data[[1]]
+          subj_model <- single_subjects[[i]][[1]]$model
+          cache[[i]] <- refresh_cache_subject(subj_data, subj_model, mu_curr, L_curr, M_cache)
+        }
+        
+        # Recompute current likelihood with new cache
+        loglike_curr <- log_marginals_from_Z(mu_curr, L_curr, cache, Z_curr, z_cut, p_inc)
+      }
+    }
+
     if (t %% diag_print == 0L) {
-      cat(sprintf("iter %d | acc=%.3f | RW‑share=%.2f | loglikê=%.1f\n",
-                  t, mean(accept[1:t]), mean(rw_step[1:t]), loglike_curr))
+      if (adaptive_cache && t > burn) {
+        quality <- monitor_cache_quality(cache, mu_curr, L_curr, cache_refresh_threshold)
+        cat(sprintf("iter %d | acc=%.3f | RW-share=%.2f | loglike=%.1f | ESS=%.3f\n",
+                    t, mean(accept[1:t]), mean(rw_step[1:t]), loglike_curr, quality$mean_rel_ess))
+      } else {
+        cat(sprintf("iter %d | acc=%.3f | RW‑share=%.2f | loglikê=%.1f\n",
+                    t, mean(accept[1:t]), mean(rw_step[1:t]), loglike_curr))
+      }
     }
   }
 
@@ -409,12 +506,16 @@ cache   <- lapply(single, make_is_cache, G = 5, M_cache = M_cache)
 # print(rel_ess)        # relative ESS per subject
 
 ## ------------------------------------------------------------------
-## 3.  Run the fully-correlated PMMH sampler
+## 3.  Run the enhanced PMMH sampler with adaptive cache
 ## ------------------------------------------------------------------
 res <- run_pmmh(cache,
                 n_iter = 5000,
                 burn   = 1000,
                 thin   = 5,
+                adaptive_cache = TRUE,
+                cache_refresh_freq = 500,
+                cache_refresh_threshold = 0.15,
+                single_subjects = single,  # for cache rebuilding
                 seed   = 1234)
 
 sel <- seq_len(length(res$draws$loglike_hat))

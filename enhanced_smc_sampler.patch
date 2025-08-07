@@ -1,0 +1,53 @@
+diff --git a/enhanced_smc_sampler.R b/enhanced_smc_sampler.R
+@@
+-      if (!is.null(difficulty_ema)) {
+-        if (difficulty_ema > 0.75 && adaptive_settings$mtm_K < 3){
+-          adaptive_settings$mtm_K <- adaptive_settings$mtm_K + 1L
+-        } else if (difficulty_ema < 0.55 && adaptive_settings$mtm_K > 1){
+-          adaptive_settings$mtm_K <- adaptive_settings$mtm_K - 1L
+-        }
+-      }
++
++      ## ------------------------------------------------------------------
++      ##  ❐  STALL‑DETECTION / EARLY‑RESCUE  --------------------------------
++      ## ------------------------------------------------------------------
++
++      stalled_moves <- (move$accept_rate < 0.01 && esjd_total_pp < 1e-4)
++      near_uniform  <- (ESS(w) / length(w) > 0.90)
++
++      if (stalled_moves && near_uniform) {
++        ## 1)  make independence kernel more aggressive
++        adaptive_settings$mtm_K     <- max(3L, adaptive_settings$mtm_K)
++        adaptive_settings$indep_t_prob <- min(0.95, adaptive_settings$indep_t_prob + 0.15)
++        adaptive_settings$indep_t_df   <- max(4L,  adaptive_settings$indep_t_df - 1L)
++
++        ## 2)  force a *weighted* transport refit next round
++        force_refit_next <- TRUE
++
++        ## 3)  shrink RW step immediately
++        rw_scale <- max(0.08, rw_scale * 0.75)
++      }
++
++      ## retain original difficulty‑based MTM, but relax threshold
++      if (!is.null(difficulty_ema)) {
++        if (difficulty_ema > 0.60) adaptive_settings$mtm_K <- max(3L, adaptive_settings$mtm_K)
++        else if (difficulty_ema < 0.50 && adaptive_settings$mtm_K > 1L)
++          adaptive_settings$mtm_K <- adaptive_settings$mtm_K - 1L
++      }
+@@
+-      need_refit_base <- ((round %% adaptive_settings$refit_every) == 0L) ||
+-        (length(acc_hist) && tail(acc_hist, 1) < 0.15)
++      need_refit_base <- force_refit_next ||
++        ((round %% adaptive_settings$refit_every) == 0L) ||
++        (length(acc_hist) && tail(acc_hist, 1) < 0.15)
++      force_refit_next <- FALSE
+@@
+-      if (move$rw_accept_rate < 0.18) rw_scale <- rw_scale * 0.90
+-      else if (move$rw_accept_rate > 0.35) rw_scale <- rw_scale * 1.08
++      ## sharpen adaptation of RW scale (faster shrink / grow)
++      if (move$rw_accept_rate < 0.15) rw_scale <- rw_scale * 0.85
++      else if (move$rw_accept_rate > 0.40) rw_scale <- rw_scale * 1.12
+@@
+-      accept_min_dynamic <- if (lambda < 0.10) 0.04 else if (lambda < 0.25) 0.02 else 0.01
++      ## tolerate lower acceptance when tempered likelihood is rough
++      accept_min_dynamic <- if (lambda < 0.10) 0.03 else if (lambda < 0.25) 0.02 else 0.01
