@@ -767,6 +767,7 @@ enhanced_smc_elite <- function(data, loglik_fn, mu_ref, Sigma_ref,
                                max_rounds = 200L,
                                G_mix = 12L,
                                gamma_sharp = 1.0,
+                               mix_difficulty_threshold = 0.2, # skip elite mixture when difficulty_ema below this
                                dalpha_floor_factor = 0.02,
                                dalpha_cap = 0.20,
                                refit_every = 4L,
@@ -950,18 +951,27 @@ enhanced_smc_elite <- function(data, loglik_fn, mu_ref, Sigma_ref,
         }
       } else if (need_refit_base) cat("  Skipping transport refit (coarse step or diffuse weights)...\n")
 
-      cat("  Fitting elite mixture...\n")
-      w_fit <- (w^gamma_sharp); w_fit <- w_fit / sum(w_fit)
       G_eff <- max(2L, min(adaptive_settings$G_mix, 2L + floor(6 * lambda)))
-      elite_q_eff <- max(0.20, elite_quantile * (1 - 0.5 * lambda))
-      do_housekeeping <- (lambda_try > 0.06) || (round > 2)
       minG_keep <- if (lambda_try < 0.10) 4 else 2
-      elite_mix <- fit_elite_mixture_Z(
-        Z, w_fit, elite_quantile = elite_q_eff, G = G_eff,
-        cov_inflation = adaptive_settings$cov_inflation, warm_start_mixZ = last_elite_mix,
-        em_itmax = 8, housekeeping = do_housekeeping, min_G_keep = minG_keep, verbose = FALSE
-      )
-      last_elite_mix <- elite_mix
+      elite_mix <- if (is.null(last_elite_mix))
+        list(meansZ = list(), covsZ = list(), wZ = 1, cache = list(Ls = list(), logw = 0))
+      else last_elite_mix
+      difficulty_metric <- if (is.null(difficulty_ema)) (1 - ess_frac) else difficulty_ema
+      if (difficulty_metric >= mix_difficulty_threshold) {
+        cat("  Fitting elite mixture...\n")
+        w_fit <- (w^gamma_sharp); w_fit <- w_fit / sum(w_fit)
+        elite_q_eff <- max(0.20, elite_quantile * (1 - 0.5 * lambda))
+        do_housekeeping <- (lambda_try > 0.06) || (round > 2)
+        elite_mix <- fit_elite_mixture_Z(
+          Z, w_fit, elite_quantile = elite_q_eff, G = G_eff,
+          cov_inflation = adaptive_settings$cov_inflation, warm_start_mixZ = last_elite_mix,
+          em_itmax = 8, housekeeping = do_housekeeping, min_G_keep = minG_keep, verbose = FALSE
+        )
+        last_elite_mix <- elite_mix
+      } else {
+        cat(sprintf("  Skipping elite mixture fit (difficulty=%.2f < %.2f)\n",
+                    difficulty_metric, mix_difficulty_threshold))
+      }
 
       use_hist_mix <- hist_mix_enable && (lambda >= hist_mix_lambda_thresh) && length(elite_history) > 0
       hist_mix <- NULL
@@ -1117,7 +1127,10 @@ enhanced_smc_elite <- function(data, loglik_fn, mu_ref, Sigma_ref,
         (splitR > split_rhat_max)
       if (!bad) {
         success <- TRUE; lambda <- lambda_try; lambda_hist <- c(lambda_hist, lambda)
-        if (lambda > 0.5) { elite_history[[length(elite_history) + 1L]] <- elite_mix; if (length(elite_history) > 3L) elite_history <- tail(elite_history, 3L) }
+        if (lambda > 0.5 && !is.null(elite_mix)) {
+          elite_history[[length(elite_history) + 1L]] <- elite_mix
+          if (length(elite_history) > 3L) elite_history <- tail(elite_history, 3L)
+        }
         break
       }
       cat("  Step failed convergence checks -> backtracking...\n")
@@ -1188,7 +1201,8 @@ auto_smc <- function(data, loglik_fn, mu_ref, Sigma_ref,
     G_mix = G_from_d(d), rw_prob = 0.35, rw_scale_init = rw_scale_from_d(d),
     indep_t_prob = 0.75, indep_t_df = 5, resample_threshold = 0.5,
     refit_every = refit_every_from_d(d), cov_inflation = cov_inflation_from_d(d),
-    elite_quantile = 0.4, accept_min = 0.05, ess_frac_min = 0.15,
+    elite_quantile = 0.4, mix_difficulty_threshold = 0.2,
+    accept_min = 0.05, ess_frac_min = 0.15,
     max_backtrack_retries = 1L, allow_adaptive_M = TRUE, M_cap = 8000L,
     growth_frac = 0.25, mtm_K = 1L, seed = seed
   )
