@@ -5,7 +5,7 @@
 #   • CRITICAL FIX: Re-vectorize independence kernel
 #       - For mtm_K == 1: fully vectorized (single batched loglik call)
 #       - For mtm_K > 1: batched over K (small K), no per-particle loops
-#   • Defaults keep simple cases fast (mtm_K = 1); extra work only for hard cases
+#   • mtm_K now scales with difficulty (1 for easy cases, up to a higher cap)
 # ========================================================================
 
 suppressPackageStartupMessages({
@@ -335,7 +335,8 @@ knob_targets_from_difficulty <- function(base, d) {
     rw_scale           = .clamp(.lerp(base$rw_scale, 0.06, d), 0.05, base$rw_scale),
     resample_threshold = .clamp(.lerp(base$resample_threshold, 0.30, d), 0.25, 0.80),
     indep_t_prob       = .clamp(.lerp(0.40, 0.98, d), 0.30, 0.98),
-    indep_t_df         = round(.clamp(.lerp(9, 3, d), 3, 15))
+    indep_t_df         = round(.clamp(.lerp(9, 3, d), 3, 15)),
+    mtm_K              = round(.clamp(.lerp(base$mtm_K, min(5L, base$mtm_K + 4L), d), 1L, 5L))
   )
 }
 smooth_update_knobs <- function(current, targets, eta = 0.25) {
@@ -344,7 +345,7 @@ smooth_update_knobs <- function(current, targets, eta = 0.25) {
     v  <- current[[nm]]; vt <- targets[[nm]]
     if (is.null(v) || !is.finite(v)) { out[[nm]] <- vt; next }
     val <- v + eta * (vt - v)
-    if (nm %in% c("n_mcmc_moves", "refit_every", "G_mix", "indep_t_df")) val <- round(val)
+    if (nm %in% c("n_mcmc_moves", "refit_every", "G_mix", "indep_t_df", "mtm_K")) val <- round(val)
     out[[nm]] <- val
   }
   out
@@ -1045,7 +1046,6 @@ enhanced_smc_elite <- function(data, loglik_fn, mu_ref, Sigma_ref,
 
       if (stalled_moves && near_uniform) {
         ## 1)  make independence kernel more aggressive
-        adaptive_settings$mtm_K     <- max(3L, adaptive_settings$mtm_K)
         adaptive_settings$indep_t_prob <- min(0.95, adaptive_settings$indep_t_prob + 0.15)
         adaptive_settings$indep_t_df   <- max(4L,  adaptive_settings$indep_t_df - 1L)
 
@@ -1056,12 +1056,6 @@ enhanced_smc_elite <- function(data, loglik_fn, mu_ref, Sigma_ref,
         rw_scale <- max(0.08, rw_scale * 0.75)
       }
 
-      ## retain original difficulty‑based MTM, but relax threshold
-      if (!is.null(difficulty_ema)) {
-        if (difficulty_ema > 0.60) adaptive_settings$mtm_K <- max(3L, adaptive_settings$mtm_K)
-        else if (difficulty_ema < 0.50 && adaptive_settings$mtm_K > 1L)
-          adaptive_settings$mtm_K <- adaptive_settings$mtm_K - 1L
-      }
       difficulty_history[[round]] <- list(index = difficulty_ema, components = dm$components, raw = dm$raw)
 
       targets <- knob_targets_from_difficulty(base_settings, difficulty_ema)
@@ -1076,10 +1070,6 @@ enhanced_smc_elite <- function(data, loglik_fn, mu_ref, Sigma_ref,
       if (!is.null(esjd_id_ema)) {
         if (esjd_id_ema < 0.3) adaptive_settings$G_mix <- min(adaptive_settings$G_mix + 1L, 32L)
         else if (esjd_id_ema > 1.2) adaptive_settings$G_mix <- max(adaptive_settings$G_mix - 1L, 6L)
-      }
-      if (!is.null(difficulty_ema)) {
-        if (difficulty_ema > 0.75 && adaptive_settings$mtm_K < 3) adaptive_settings$mtm_K <- adaptive_settings$mtm_K + 1L
-        else if (difficulty_ema < 0.55 && adaptive_settings$mtm_K > 1) adaptive_settings$mtm_K <- adaptive_settings$mtm_K - 1L
       }
 
       n_mcmc_moves       <- adaptive_settings$n_mcmc_moves
