@@ -21,9 +21,13 @@ weighted_density_smooth <- function(x, w, n_resample = 5000, adjust = 1) {
 
 #' Diagnose Parameter Recovery from SMC Results
 #'
-#' Creates diagnostic plots showing posterior distributions vs true parameter values
+#' Creates diagnostic plots showing posterior distributions vs true/reference values
 #'
-#' @param true_values Named vector of true parameter values
+#' @param true_values Either (a) a named vector of true parameter values, or (b)
+#'   a matrix/data.frame with ncol == number of parameters containing reference
+#'   samples per parameter (e.g., an MCMC chain; rows = iterations). When a
+#'   matrix/data.frame is provided, a reference density is overlaid instead of a
+#'   vertical line.
 #' @param smc_res SMC results object from enhanced_smc_elite()
 #' @param main_title Main title for the plot (optional)
 #' @param save_plot Logical, whether to save plot to file (default: FALSE)
@@ -52,14 +56,27 @@ diagnose_recovery <- function(true_values, smc_res,
     colnames(Theta) <- param_names
   }
   
-  # Ensure true_values has matching names
-  if (is.null(names(true_values))) {
-    names(true_values) <- param_names
-  }
-  
-  # Check dimensions match
-  if (length(true_values) != D) {
-    stop("Length of true_values must match number of parameters in smc_res")
+  # Determine whether true_values is a reference chain (matrix/data.frame)
+  true_is_chain <- is.matrix(true_values) || is.data.frame(true_values)
+  ref_mat <- NULL
+  if (true_is_chain) {
+    ref_mat <- as.matrix(true_values)
+    if (ncol(ref_mat) != D) {
+      stop("When true_values is a matrix/data.frame, it must have the same number of columns as parameters in smc_res$Theta")
+    }
+    # Reorder columns to match parameter names if available
+    if (!is.null(colnames(ref_mat)) && !is.null(param_names)) {
+      ref_mat <- ref_mat[, param_names, drop = FALSE]
+    }
+  } else {
+    # Ensure true_values has matching names
+    if (is.null(names(true_values))) {
+      names(true_values) <- param_names
+    }
+    # Check dimensions match
+    if (length(true_values) != D) {
+      stop("Length of true_values must match number of parameters in smc_res")
+    }
   }
   
   # Set up plotting device
@@ -81,22 +98,36 @@ diagnose_recovery <- function(true_values, smc_res,
     approx(cw, x_ord, xout = probs, rule = 2)$y
   }
   
-  # Storage for summary statistics
+  # Storage for summary statistics (posterior always; reference optional)
   summary_stats <- data.frame(
     parameter = param_names,
-    true_value = true_values[param_names],
     posterior_mean = numeric(D),
     posterior_median = numeric(D),
-    ci_lower = numeric(D),
-    ci_upper = numeric(D),
-    coverage = logical(D),
+    posterior_ci_lower = numeric(D),
+    posterior_ci_upper = numeric(D),
     stringsAsFactors = FALSE
   )
+  # Fields for when a reference distribution (chain) is provided
+  if (true_is_chain) {
+    summary_stats$ref_median <- numeric(D)
+    summary_stats$ref_ci_lower <- numeric(D)
+    summary_stats$ref_ci_upper <- numeric(D)
+  } else {
+    # True scalar values
+    summary_stats$true_value <- true_values[param_names]
+    summary_stats$coverage <- logical(D)
+    # Also mirror into ref_* columns for unified downstream handling
+    summary_stats$ref_median <- summary_stats$true_value
+    summary_stats$ref_ci_lower <- rep(NA_real_, D)
+    summary_stats$ref_ci_upper <- rep(NA_real_, D)
+  }
   
   # Plot each parameter
   for (i in 1:D) {
     param_name <- param_names[i]
-    true_val <- true_values[param_name]
+    if (!true_is_chain) {
+      true_val <- true_values[param_name]
+    }
     theta_i <- Theta[, i]
     
     # Compute posterior statistics
@@ -105,52 +136,90 @@ diagnose_recovery <- function(true_values, smc_res,
     post_median <- quantiles[2]
     ci_lower <- quantiles[1]
     ci_upper <- quantiles[3]
-    coverage <- (true_val >= ci_lower) && (true_val <= ci_upper)
+    if (!true_is_chain) {
+      coverage <- (true_val >= ci_lower) && (true_val <= ci_upper)
+    }
     
     # Store statistics
     summary_stats[i, "posterior_mean"] <- post_mean
     summary_stats[i, "posterior_median"] <- post_median
-    summary_stats[i, "ci_lower"] <- ci_lower
-    summary_stats[i, "ci_upper"] <- ci_upper
-    summary_stats[i, "coverage"] <- coverage
+    summary_stats[i, "posterior_ci_lower"] <- ci_lower
+    summary_stats[i, "posterior_ci_upper"] <- ci_upper
+    if (!true_is_chain) {
+      summary_stats[i, "coverage"] <- coverage
+    }
     
     # Create weighted density estimate
+    # Determine plotting range to cover both posterior and (optional) reference
+    if (true_is_chain) {
+      ref_vals_i <- ref_mat[, i]
+      x_range <- range(c(theta_i, ref_vals_i))
+    } else {
+      x_range <- range(theta_i)
+    }
+    x_expand <- diff(x_range) * 0.15
+    x_range <- c(x_range[1] - x_expand, x_range[2] + x_expand)
+    
     if (density_method == "smooth") {
-      # Use resampling-based smooth density
+      # Use resampling-based smooth density for posterior
       dens_result <- weighted_density_smooth(theta_i, w, n_resample = 5000, adjust = smooth_adjust)
       x_grid <- dens_result$x
-      density_vals <- dens_result$y
-    } else {
-      # Use proper weighted kernel density estimation
-      x_range <- range(theta_i)
-      x_expand <- diff(x_range) * 0.15
-      x_range <- c(x_range[1] - x_expand, x_range[2] + x_expand)
-      
-      # Improved weighted kernel density estimation
+      # If x_grid from density() is outside our expanded range, rebuild grid
       n_grid <- 200
       x_grid <- seq(x_range[1], x_range[2], length.out = n_grid)
-      
-      # Adaptive bandwidth using Silverman's rule of thumb, adjusted for weights
-      n_eff <- sum(w)^2 / sum(w^2)  # Effective sample size
-      sigma_hat <- sqrt(sum(w * (theta_i - post_mean)^2))  # Weighted std dev
-      # Silverman's bandwidth with effective sample size
+      # Recompute posterior density on the new grid using kernel formula
+      n_eff <- sum(w)^2 / sum(w^2)
+      sigma_hat <- sqrt(sum(w * (theta_i - post_mean)^2))
       bw <- 1.06 * sigma_hat * (n_eff^(-1/5))
-      bw <- max(bw, diff(range(theta_i)) / 50)  # Minimum bandwidth
-      
-      # Weighted kernel density
+      bw <- max(bw, diff(range(theta_i)) / 50)
       density_vals <- numeric(n_grid)
       for (j in 1:n_grid) {
-        # Gaussian kernel weights
         kernel_vals <- exp(-0.5 * ((theta_i - x_grid[j]) / bw)^2) / (bw * sqrt(2 * pi))
         density_vals[j] <- sum(w * kernel_vals)
       }
-      density_vals <- density_vals / sum(w)  # Normalize by total weight
+      density_vals <- density_vals / sum(w)
+    } else {
+      # Weighted kernel density on a fixed grid
+      n_grid <- 200
+      x_grid <- seq(x_range[1], x_range[2], length.out = n_grid)
+      n_eff <- sum(w)^2 / sum(w^2)  # Effective sample size
+      sigma_hat <- sqrt(sum(w * (theta_i - post_mean)^2))  # Weighted std dev
+      bw <- 1.06 * sigma_hat * (n_eff^(-1/5))
+      bw <- max(bw, diff(range(theta_i)) / 50)
+      density_vals <- numeric(n_grid)
+      for (j in 1:n_grid) {
+        kernel_vals <- exp(-0.5 * ((theta_i - x_grid[j]) / bw)^2) / (bw * sqrt(2 * pi))
+        density_vals[j] <- sum(w * kernel_vals)
+      }
+      density_vals <- density_vals / sum(w)
     }
     
     # Plot posterior density
-    plot(x_grid, density_vals, type = "l", lwd = 2, col = "steelblue",
-         xlab = param_name, ylab = "Posterior Density",
-         main = sprintf("%s\n(True: %.3f, Est: %.3f)", param_name, true_val, post_mean))
+    if (true_is_chain) {
+      ref_vals_i <- ref_mat[, i]
+      # Reference stats
+      ref_q <- as.numeric(stats::quantile(ref_vals_i, probs = c(0.025, 0.5, 0.975), na.rm = TRUE))
+      summary_stats[i, "ref_median"] <- ref_q[2]
+      summary_stats[i, "ref_ci_lower"] <- ref_q[1]
+      summary_stats[i, "ref_ci_upper"] <- ref_q[3]
+      # Reference density on same grid
+      ref_dens <- density(ref_vals_i, adjust = smooth_adjust)
+      ref_y <- approx(ref_dens$x, ref_dens$y, xout = x_grid, rule = 2)$y
+      plot(x_grid, density_vals, type = "l", lwd = 2, col = "steelblue",
+           xlab = param_name, ylab = "Density",
+           main = sprintf("%s\n(Ref.med: %.3f [%.3f, %.3f]; Post.med: %.3f [%.3f, %.3f])",
+                          param_name,
+                          summary_stats[i, "ref_median"], summary_stats[i, "ref_ci_lower"], summary_stats[i, "ref_ci_upper"],
+                          post_median, ci_lower, ci_upper))
+      lines(x_grid, ref_y, col = "red", lwd = 2)
+      # Mark reference median and CI lines
+      abline(v = summary_stats[i, "ref_median"], col = "red", lwd = 1, lty = 2)
+      abline(v = c(summary_stats[i, "ref_ci_lower"], summary_stats[i, "ref_ci_upper"]), col = adjustcolor("red", 0.5), lty = 3)
+    } else {
+      plot(x_grid, density_vals, type = "l", lwd = 2, col = "steelblue",
+           xlab = param_name, ylab = "Posterior Density",
+           main = sprintf("%s\n(True: %.3f, Est: %.3f)", param_name, true_val, post_mean))
+    }
     
     # Add credible interval shading
     x_ci <- x_grid[x_grid >= ci_lower & x_grid <= ci_upper]
@@ -160,40 +229,53 @@ diagnose_recovery <- function(true_values, smc_res,
                col = adjustcolor("lightblue", alpha = 0.3), border = NA)
     }
     
-    # Add true value line
-    abline(v = true_val, col = "red", lwd = 3, lty = 1)
+    # Add true value line when not using a reference chain
+    if (!true_is_chain) {
+      abline(v = true_val, col = "red", lwd = 3, lty = 1)
+    }
     
     # Add posterior mean line
     abline(v = post_mean, col = "darkblue", lwd = 2, lty = 2)
     
     # Add legend for first plot
     if (i == 1) {
-      legend("topright", 
-             legend = c("True Value", "Posterior Mean", "95% CI"),
-             col = c("red", "darkblue", "lightblue"),
-             lty = c(1, 2, 1), lwd = c(3, 2, 8),
-             cex = 0.8, bg = "white")
+      if (true_is_chain) {
+        legend("topright",
+               legend = c("Reference Density", "Posterior Mean", "95% CI (post)", "Ref median", "Ref 95% CI"),
+               col = c("red", "darkblue", "lightblue", "red", adjustcolor("red", 0.5)),
+               lty = c(1, 2, 1, 2, 3), lwd = c(2, 2, 8, 1, 1),
+               cex = 0.8, bg = "white")
+      } else {
+        legend("topright", 
+               legend = c("True Value", "Posterior Mean", "95% CI"),
+               col = c("red", "darkblue", "lightblue"),
+               lty = c(1, 2, 1), lwd = c(3, 2, 8),
+               cex = 0.8, bg = "white")
+      }
     }
     
     # Add coverage indicator
-    coverage_text <- ifelse(coverage, "✓", "✗")
-    coverage_color <- ifelse(coverage, "darkgreen", "red")
-    text(x = par("usr")[2], y = par("usr")[4], 
-         labels = coverage_text, col = coverage_color, 
-         cex = 1.5, font = 2, adj = c(1.1, 1.1))
+    if (!true_is_chain) {
+      coverage_text <- ifelse(coverage, "✓", "✗")
+      coverage_color <- ifelse(coverage, "darkgreen", "red")
+      text(x = par("usr")[2], y = par("usr")[4], 
+           labels = coverage_text, col = coverage_color, 
+           cex = 1.5, font = 2, adj = c(1.1, 1.1))
+    }
   }
   
   # Add overall title
   mtext(main_title, outer = TRUE, cex = 1.2, font = 2)
   
-  # Add summary text at bottom
-  n_covered <- sum(summary_stats$coverage)
-  coverage_pct <- round(100 * n_covered / D)
-  summary_text <- sprintf("95%% CI Coverage: %d/%d parameters (%d%%)", 
-                         n_covered, D, coverage_pct)
-  
-  mtext(summary_text, side = 1, outer = TRUE, line = -1, 
-        col = ifelse(coverage_pct >= 80, "darkgreen", "red"), font = 2)
+  # Add summary text at bottom (only for true-value workflow)
+  if (!true_is_chain) {
+    n_covered <- sum(summary_stats$coverage)
+    coverage_pct <- round(100 * n_covered / D)
+    summary_text <- sprintf("95%% CI Coverage: %d/%d parameters (%d%%)", 
+                           n_covered, D, coverage_pct)
+    mtext(summary_text, side = 1, outer = TRUE, line = -1, 
+          col = ifelse(coverage_pct >= 80, "darkgreen", "red"), font = 2)
+  }
   
   if (save_plot) {
     dev.off()
@@ -201,27 +283,45 @@ diagnose_recovery <- function(true_values, smc_res,
   }
   
   # Print summary table
-  cat("\nParameter Recovery Summary:\n")
-  cat("===========================\n")
-  cat(sprintf("%-10s %8s %8s %8s %10s %10s %8s\n", 
-              "Parameter", "True", "Post.Mean", "Error", "CI.Lower", "CI.Upper", "Coverage"))
-  cat(paste(rep("-", 70), collapse = ""), "\n")
-  
-  for (i in 1:D) {
-    error <- summary_stats$posterior_mean[i] - summary_stats$true_value[i]
-    coverage_symbol <- ifelse(summary_stats$coverage[i], "✓", "✗")
-    cat(sprintf("%-10s %8.3f %8.3f %+8.3f %10.3f %10.3f %8s\n",
-                summary_stats$parameter[i],
-                summary_stats$true_value[i],
-                summary_stats$posterior_mean[i],
-                error,
-                summary_stats$ci_lower[i],
-                summary_stats$ci_upper[i],
-                coverage_symbol))
+  if (!true_is_chain) {
+    cat("\nParameter Recovery Summary:\n")
+    cat("===========================\n")
+    cat(sprintf("%-10s %8s %8s %8s %10s %10s %8s\n", 
+                "Parameter", "True", "Post.Mean", "Error", "CI.Lower", "CI.Upper", "Coverage"))
+    cat(paste(rep("-", 70), collapse = ""), "\n")
+    for (i in 1:D) {
+      error <- summary_stats$posterior_mean[i] - summary_stats$true_value[i]
+      coverage_symbol <- ifelse(summary_stats$coverage[i], "✓", "✗")
+      cat(sprintf("%-10s %8.3f %8.3f %+8.3f %10.3f %10.3f %8s\n",
+                  summary_stats$parameter[i],
+                  summary_stats$true_value[i],
+                  summary_stats$posterior_mean[i],
+                  error,
+                  summary_stats$ci_lower[i],
+                  summary_stats$ci_upper[i],
+                  coverage_symbol))
+    }
+    cat(paste(rep("-", 70), collapse = ""), "\n")
+    cat(sprintf("Overall 95%% CI Coverage: %d/%d (%d%%)\n", n_covered, D, coverage_pct))
+  } else {
+    # Reference-chain summary against posterior (report medians and 95% CIs for both)
+    cat("\nPosterior vs Reference Summary:\n")
+    cat("==============================\n")
+    cat(sprintf("%-12s %10s %23s %26s\n",
+                "Parameter", "Post.Med", "Post.CI[2.5%,97.5%]", "Ref.Med | Ref.CI"))
+    cat(paste(rep("-", 74), collapse = ""), "\n")
+    for (i in 1:D) {
+      cat(sprintf("%-12s %10.3f [%8.3f,%8.3f]   %8.3f | [%8.3f,%8.3f]\n",
+                  summary_stats$parameter[i],
+                  summary_stats$posterior_median[i],
+                  summary_stats$posterior_ci_lower[i],
+                  summary_stats$posterior_ci_upper[i],
+                  summary_stats$ref_median[i],
+                  summary_stats$ref_ci_lower[i],
+                  summary_stats$ref_ci_upper[i]))
+    }
+    cat(paste(rep("-", 74), collapse = ""), "\n")
   }
-  
-  cat(paste(rep("-", 70), collapse = ""), "\n")
-  cat(sprintf("Overall 95%% CI Coverage: %d/%d (%d%%)\n", n_covered, D, coverage_pct))
   
   # Return summary statistics invisibly
   invisible(summary_stats)
