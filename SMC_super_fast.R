@@ -330,26 +330,31 @@ weak_dims_from_Z <- function(Z, w, frac = 0.30, min_keep = 1L) {
   head(ord, max(min_keep, ceiling(length(v) * frac)))
 }
 
+# Cheap deterministic ordering used as a fast alternative to Hilbert sorting.
+.cheap_sort_order <- function(Z) {
+  Z <- as.matrix(Z)
+  n <- nrow(Z)
+  if (n <= 1L) return(seq_len(n))
+  if (ncol(Z) <= 1L) return(order(Z[, 1L]))
+  order(rowSums(Z))
+}
+
 # ------------- Mixture helpers moved to utility_funs.R -------------
 # See utility_funs.R for: prep_mix_cache, gmm_logpdf_Z_vec,
 # dmvt_mixture_logpdf_Z_vec, regularize_cov, merge_components,
 # prune_merge_mixture_Z
 
 # ------------- Likelihood cache helpers (tiny, string-keyed) -------------
-.ll_cache_make <- function(mode = c("exact","approx"), digits = 8L, cap = 1e5) {
-  mode <- match.arg(mode)
-  env <- new.env(parent = emptyenv())
-  get_key <- switch(mode,
-                    exact  = function(theta) digest::digest(serialize(theta, NULL)),
-                    approx = function(theta) digest::digest(round(theta, digits))
-  )
+.ll_cache_make <- function(digits = 8L, cap = 1e5, prune_every = 500L) {
+  state <- new.env(parent = emptyenv())
+  state$n_added <- 0L
   list(
-    get = function(theta) { env[[ get_key(theta) ]] },
-    set = function(theta, val) {
-      if (length(ls(env, all.names=TRUE)) >= cap) return(invisible(FALSE))
-      env[[ get_key(theta) ]] <- val; TRUE
-    },
-    mode = mode, env = env
+    env = new.env(hash = TRUE, parent = emptyenv()),
+    digits = as.integer(digits),
+    cap = as.integer(cap),
+    n_added = 0L,
+    prune_every = as.integer(prune_every),
+    state = state
   )
 }
 # faster row keys only for a small set of representatives
@@ -381,8 +386,25 @@ weak_dims_from_Z <- function(Z, w, frac = 0.30, min_keep = 1L) {
   rep_idx <- as.integer(rep_idx)  # vector of length G
   # Build keys only for representatives
   reps <- Theta[rep_idx, , drop = FALSE]
-  keys <- apply(reps, 1L, .ll_cache_key_row, digits = cache$digits)
+  digits <- cache$digits
+  if (is.null(digits) || !is.finite(digits)) digits <- 8L
+  cap <- cache$cap
+  if (is.null(cap) || !is.finite(cap)) cap <- 1e5
+  prune_every <- cache$prune_every
+  if (is.null(prune_every) || !is.finite(prune_every) || prune_every <= 0L) prune_every <- 500L
   ev <- cache$env
+  if (is.null(ev) || !is.environment(ev)) {
+    ev <- new.env(hash = TRUE, parent = emptyenv())
+  }
+  if (is.null(cache$state) || !is.environment(cache$state)) {
+    cache$state <- new.env(parent = emptyenv())
+    cache$state$n_added <- as.integer(ifelse(is.null(cache$n_added), 0L, cache$n_added))
+  }
+  if (!exists("n_added", envir = cache$state, inherits = FALSE) ||
+      is.null(cache$state$n_added) || !is.finite(cache$state$n_added)) {
+    cache$state$n_added <- 0L
+  }
+  keys <- apply(reps, 1L, .ll_cache_key_row, digits = digits)
   hit <- logical(G)
   rep_vals <- numeric(G)
   for (j in seq_len(G)) {
@@ -397,14 +419,15 @@ weak_dims_from_Z <- function(Z, w, frac = 0.30, min_keep = 1L) {
     for (k in seq_along(miss_idx)) {
       ev[[ keys[miss_idx[k]] ]] <- vals[k]
     }
-    cache$n_added <- cache$n_added + length(miss_idx)
-    if (cache$n_added >= cache$prune_every && cache$cap > 0L) {
-      cache$n_added <- 0L
+    cache$state$n_added <- as.integer(cache$state$n_added + length(miss_idx))
+    if (cache$state$n_added >= prune_every && cap > 0L) {
+      cache$state$n_added <- 0L
       # crude check: if env grew too large, just reset (cheap and safe)
       # avoids expensive ls() on every call
-        if (cache$cap > 0 && length(ls(ev, all.names = TRUE)) > cache$cap) {
-          cache$env <- new.env(hash = TRUE, parent = emptyenv())
-        }
+      keys_now <- ls(ev, all.names = TRUE)
+      if (length(keys_now) > cap) {
+        rm(list = keys_now, envir = ev)
+      }
     }
   }
   # Map rep vals back to all rows
@@ -617,6 +640,15 @@ mcmc_moves_z_mix_batched <- function(Z, loglik, lpz, Tmap, lambda,
   # Turn DA on from λ=0 if enabled and we have a screen mixture.
   da_on <- isTRUE(da_enable) && !is.null(da_screen_mix)
   da_eps <- 1e-8
+  # Keep one helper for exact pCN target to avoid DA / non-DA drift.
+  pcn_exact_target <- function(loglik_vec, lref_vec = NULL) {
+    if (gss_on) {
+      if (is.null(lref_vec)) stop("pcn_exact_target requires lref_vec when GSS is enabled.")
+      lambda * loglik_vec + (1 - lambda) * lref_vec
+    } else {
+      lambda * loglik_vec
+    }
+  }
   # vectorized Ltilde for a batch; lpz_vec must correspond to thetas supplied
   Ltilde_batch <- function(Zbat, Theta_bat, lpz_vec, lref_vec = NULL) {
     # log q_mix in Z
@@ -679,8 +711,14 @@ mcmc_moves_z_mix_batched <- function(Z, loglik, lpz, Tmap, lambda,
       # ---- DA: Stage-2 (exact correction on pass) ----
       ll_p_pass <- .ll_cached_eval(Theta_p[pass, , drop = FALSE], data, loglik_fn, ll_cache,
                                    expect_dups = resampled, n_cores = n_cores)
-      Lc_ex <- lpz[idx[pass]] + lambda*loglik[idx[pass]] + if (gss_on) (1-lambda)*lref_c[pass] else 0
-      Lp_ex <- lpz_p[pass]     + lambda*ll_p_pass        + if (gss_on) (1-lambda)*lref_p[pass] else 0
+      Lc_ex <- pcn_exact_target(
+        loglik[idx[pass]],
+        if (gss_on) lref_c[pass] else NULL
+      )
+      Lp_ex <- pcn_exact_target(
+        ll_p_pass,
+        if (gss_on) lref_p[pass] else NULL
+      )
       corr  <- (Lp_ex - Lc_ex) - (Lp_t[pass] - Lc_t[pass])
       u2 <- log(runif(length(pass)))
       acc_idx <- pass[which(u2 < pmin(0, corr))]
@@ -704,9 +742,9 @@ mcmc_moves_z_mix_batched <- function(Z, loglik, lpz, Tmap, lambda,
         }
         Zp_loc <- Tmap$fwd(Theta_p)
         lref_p <- log_r_theta(Theta_p, Zp_loc, Tmap, ref_mix)
-        a <- lambda * (ll_p - loglik[idx]) + (1 - lambda) * (lref_p - lref_c)
+        a <- pcn_exact_target(ll_p, lref_p) - pcn_exact_target(loglik[idx], lref_c)
       } else {
-        a <- lambda * (ll_p - loglik[idx])
+        a <- pcn_exact_target(ll_p) - pcn_exact_target(loglik[idx])
       }
       u <- log(runif(k)); ia <- which(u < pmin(0, a))
       if (length(ia)) {
@@ -903,7 +941,10 @@ maybe_update_ref_mix <- function(lambda, elite_mix, hist_mix,
                                  ref_mix, allow_refresh = TRUE,
                                  lambda_ref_snap = 0.30,
                                  lambda_ref_refresh = 0.60,
-                                 d = NULL) {
+                                 d = NULL,
+                                 snapshot_taken = FALSE,
+                                 refresh_taken = FALSE,
+                                 single_update_policy = TRUE) {
   cand <- elite_mix
   # If you maintain a history mixture, softly blend it to stabilise the ref
   if (!is.null(hist_mix) && !is.null(hist_mix$mix) && !.is_empty_mix(hist_mix$mix)) {
@@ -919,16 +960,33 @@ maybe_update_ref_mix <- function(lambda, elite_mix, hist_mix,
     cand <- blend_mixes(cand, .default_std_normal_mix(d), eps = 0.05)
   }
 
-  # 1) First snapshot
-  if (is.null(ref_mix) && lambda >= lambda_ref_snap && !.is_empty_mix(cand)) {
-    return(list(ref_mix = cand, switched = TRUE))
+  if (!single_update_policy) {
+    # Legacy behavior
+    if (is.null(ref_mix) && lambda >= lambda_ref_snap && !.is_empty_mix(cand)) {
+      return(list(ref_mix = cand, switched = TRUE, event = "snapshot",
+                  snapshot_taken = snapshot_taken, refresh_taken = refresh_taken))
+    }
+    if (!is.null(ref_mix) && allow_refresh && lambda >= lambda_ref_refresh && !isTRUE(attr(ref_mix, "refreshed"))) {
+      attr(cand, "refreshed") <- TRUE
+      return(list(ref_mix = cand, switched = TRUE, event = "refresh",
+                  snapshot_taken = snapshot_taken, refresh_taken = refresh_taken))
+    }
+    return(list(ref_mix = ref_mix, switched = FALSE, event = "none",
+                snapshot_taken = snapshot_taken, refresh_taken = refresh_taken))
   }
-  # 2) Optional one-time refresh later
-  if (!is.null(ref_mix) && allow_refresh && lambda >= lambda_ref_refresh && !isTRUE(attr(ref_mix, "refreshed"))) {
-    attr(cand, "refreshed") <- TRUE
-    return(list(ref_mix = cand, switched = TRUE))
+
+  # Strict-stability policy: at most one snapshot and one refresh attempt overall.
+  if (!snapshot_taken && is.null(ref_mix) && lambda >= lambda_ref_snap && !.is_empty_mix(cand)) {
+    return(list(ref_mix = cand, switched = TRUE, event = "snapshot",
+                snapshot_taken = TRUE, refresh_taken = refresh_taken))
   }
-  list(ref_mix = ref_mix, switched = FALSE)
+  if (snapshot_taken && !refresh_taken && !is.null(ref_mix) &&
+      allow_refresh && lambda >= lambda_ref_refresh && !.is_empty_mix(cand)) {
+    return(list(ref_mix = cand, switched = TRUE, event = "refresh",
+                snapshot_taken = snapshot_taken, refresh_taken = TRUE))
+  }
+  list(ref_mix = ref_mix, switched = FALSE, event = "none",
+       snapshot_taken = snapshot_taken, refresh_taken = refresh_taken)
 }
 
 # ------------- Convergence helpers moved to utility_funs.R -------------
@@ -986,8 +1044,17 @@ enhanced_smc_elite <- function(data, loglik_fn, mu_ref, Sigma_ref,
                                da_calibrate_n = 20L,          # exact calls used for micro-calibration
                                da_alpha_init = 1.00,          # initial mixture power α
                                da_rm_gain = 0.20,             # Robbins–Monro gain on log-scale for α
+                               # ---- Stability controls ----
+                               adapt_lambda_max = 0.15,       # only adapt kernels/maps while λ <= this
+                               freeze_transport_after_gss = TRUE,
+                               single_gss_updates = TRUE,
+                               post_adapt_n_mcmc_moves = 3L,  # fixed-phase move count (post adaptation)
                                # ---- Early-round cheapening ----
                                pre_resample_lambda_gate = 0, # skip light rejuvenation if λ < this
+                               # ---- Inner SMC resampling mode ----
+                               deterministic_resampling = FALSE,
+                               resample_sort_mode = c("adaptive", "hilbert", "cheap1d", "none"),
+                               hilbert_hard_ess = 0.25,
                                # ---- Likelihood cache controls ----
                                ll_cache_enable = TRUE,
                                ll_cache_digits = 8L,
@@ -998,6 +1065,8 @@ enhanced_smc_elite <- function(data, loglik_fn, mu_ref, Sigma_ref,
   vcat <- function(...) { if (verbose) base::cat(...) }
   cat <- vcat
   set.seed(seed)
+  resample_sort_mode <- match.arg(resample_sort_mode)
+  post_adapt_n_mcmc_moves <- as.integer(max(1L, post_adapt_n_mcmc_moves))
   param_names <- names(mu_ref)
   prior_L <- tryCatch(chol(Sigma_ref), error = function(e) chol(Matrix::nearPD(Sigma_ref)$mat))
   # Build likelihood cache (persists across rounds; valid in θ-space)
@@ -1042,6 +1111,9 @@ enhanced_smc_elite <- function(data, loglik_fn, mu_ref, Sigma_ref,
   # GSS state
   ref_mix <- NULL     # frozen working density r
   lp_ref  <- NULL     # current log r(theta) for each particle
+  gss_snapshot_taken <- FALSE
+  gss_refresh_taken <- FALSE
+  transport_frozen <- FALSE
   # DA state across rounds (adapt α between rounds only)
   da_alpha <- da_alpha_init
   last_da_pass_rate <- NA_real_
@@ -1054,6 +1126,15 @@ enhanced_smc_elite <- function(data, loglik_fn, mu_ref, Sigma_ref,
     cat(sprintf("\nRound %d: λ=%.3f -> ", round, lambda))
     resampled <- FALSE
     cess_target <- cess_target_at_lambda(lambda)
+    # Guard against non-finite or invalid normalized weights.
+    w[!is.finite(w) | w < 0] <- 0
+    sw <- sum(w)
+    if (!is.finite(sw) || sw <= 0) {
+      w <- rep(1 / length(w), length(w))
+      cat("  [Guard] Reset invalid weights to uniform.\n")
+    } else {
+      w <- w / sw
+    }
 
     # --- choose step statistic h for rCESS (GSS-aware if ref is active) ---
     if (gss_enable && !is.null(ref_mix) && is.null(lp_ref)) {
@@ -1061,6 +1142,13 @@ enhanced_smc_elite <- function(data, loglik_fn, mu_ref, Sigma_ref,
       lp_ref <- log_r_theta(Theta, Z, Tmap, ref_mix)
     }
     h_step <- if (gss_enable && !is.null(ref_mix) && !is.null(lp_ref)) (loglik - lp_ref) else loglik
+    if (!all(is.finite(h_step))) {
+      bad <- !is.finite(h_step)
+      finite_h <- h_step[!bad]
+      if (!length(finite_h)) stop("All h_step values are non-finite; cannot continue tempering.")
+      h_step[bad] <- min(finite_h)
+      cat(sprintf("  [Guard] Replaced %d non-finite h_step values.\n", sum(bad)))
+    }
 
     next_lambda <- if (gss_enable && !is.null(ref_mix) && !is.null(lp_ref)) {
       next_lambda_via_rCESS_stat(w, h_step, lambda, target = cess_target)
@@ -1068,8 +1156,14 @@ enhanced_smc_elite <- function(data, loglik_fn, mu_ref, Sigma_ref,
       next_lambda_via_rCESS(w, h_step, lambda, target = cess_target)
     }
     lambda_new  <- min(next_lambda, 1.0)
+    if (lambda_new <= lambda) {
+      delta_floor <- min(1e-4, 1 - lambda)
+      lambda_new <- lambda + delta_floor
+      cat(sprintf("  [Guard] Applied lambda step floor (Δ=%.4g).\n", delta_floor))
+    }
     delta       <- lambda_new - lambda
     lambda      <- lambda_new
+    adapt_phase <- (lambda <= adapt_lambda_max)
 
     cat(sprintf("%.3f (Δ=%.4f, CESS target=%.3f)\n", next_lambda, delta, cess_target))
 
@@ -1085,12 +1179,29 @@ enhanced_smc_elite <- function(data, loglik_fn, mu_ref, Sigma_ref,
     var_logZ_inc <- (mu2 - mu1^2) / (max(Neff, 1) * max(mu1^2, .Machine$double.eps))
     mcse_var_accum <- mcse_var_accum + max(var_logZ_inc, 0)
     logw_new_raw <- log(pmax(w, .Machine$double.eps)) + lw_inc
+    lse_new <- logsumexp(logw_new_raw)
     # Compute log evidence increment using log-sum-exp (GSS-aware)
-    logZ_inc <- delta * mll + logsumexp(logw_new_raw)  # == log(sum(w * exp(lw_inc))) + delta*mll
+    logZ_inc <- if (is.finite(lse_new)) delta * mll + lse_new else 0.0
     # Normalize weights in log domain
-    logw_new <- logw_new_raw - logsumexp(logw_new_raw)
-    w_new    <- exp(logw_new)
-    ess <- ESS(w_new); ess_frac <- ess/length(w_new)
+    if (!is.finite(lse_new)) {
+      w_new <- rep(1 / length(w), length(w))
+      logw_new <- rep(-log(length(w)), length(w))
+      cat("  [Guard] Non-finite log-weight normalization; reset to uniform.\n")
+    } else {
+      logw_new <- logw_new_raw - lse_new
+      w_new    <- exp(logw_new)
+      if (!all(is.finite(w_new)) || sum(w_new) <= 0) {
+        w_new <- rep(1 / length(w), length(w))
+        logw_new <- rep(-log(length(w)), length(w))
+        cat("  [Guard] Non-finite normalized weights; reset to uniform.\n")
+      } else {
+        w_new <- w_new / sum(w_new)
+      }
+    }
+    ess <- ESS(w_new)
+    if (!is.finite(ess)) ess <- 0
+    ess_frac <- ess / length(w_new)
+    if (!is.finite(ess_frac)) ess_frac <- 0
     log_evidence <- log_evidence + logZ_inc
     pred_rcess_full <- rCESS_stat(w, h_step, 1 - lambda)
     cat(sprintf("  rCESS(remain)=%.3f | target=%.3f\n", pred_rcess_full, cess_target))
@@ -1126,11 +1237,33 @@ enhanced_smc_elite <- function(data, loglik_fn, mu_ref, Sigma_ref,
           lp_ref <- log_r_theta(Theta, Z, Tmap, ref_mix)
         }
       }
-      cat("  Resampling (Hilbert-sorted stratified)...\n")
-      # Order particles along Hilbert curve in transported space Z
-      ord <- hilbert_sort_order(Z, bits = 16L)
+      sort_used <- "hilbert"
+      if (resample_sort_mode == "none") {
+        ord <- seq_len(nrow(Z))
+        sort_used <- "none"
+      } else if (resample_sort_mode == "cheap1d") {
+        ord <- .cheap_sort_order(Z)
+        sort_used <- "cheap1d"
+      } else if (resample_sort_mode == "hilbert") {
+        ord <- hilbert_sort_order(Z, bits = 16L)
+        sort_used <- "hilbert"
+      } else {
+        # Adaptive default: spend Hilbert cost only in hard low-ESS regimes.
+        if (ess_frac <= hilbert_hard_ess) {
+          ord <- hilbert_sort_order(Z, bits = 16L)
+          sort_used <- "hilbert"
+        } else {
+          ord <- .cheap_sort_order(Z)
+          sort_used <- "cheap1d"
+        }
+      }
+      cat(sprintf("  Resampling (sorted stratified, order=%s)...\n", sort_used))
+      # Stratified resampling on chosen ordering, then map back to original indices.
       # Stratified resampling on sorted weights, then map back
-      idx_sorted <- stratified_resample_sorted(w_new[ord], deterministic = TRUE)
+      idx_sorted <- stratified_resample_sorted(
+        w_new[ord],
+        deterministic = isTRUE(deterministic_resampling)
+      )
       idx <- ord[idx_sorted]
       Theta <- Theta[idx, , drop = FALSE]; Z <- Z[idx, , drop = FALSE]
       loglik <- loglik[idx]; lpz <- lpz[idx]
@@ -1244,27 +1377,55 @@ enhanced_smc_elite <- function(data, loglik_fn, mu_ref, Sigma_ref,
       }
     }
 
-    # Adaptive transport refit with diagnostics (replaces the old block)
-    ref <- maybe_refit_transport(
-      Theta = Theta, w = w, lambda = lambda, round = round,
-      resampled = resampled, ess_frac = ess_frac,
-      Tmap = Tmap, tr_state = tr_state,
-      every_rounds = refit_every,     # advisory cadence; gate is relative
-      verbose = verbose
-    )
+    # Adaptive transport refit with diagnostics.
+    # Stability policy:
+    # - only adapt maps in the early phase
+    # - freeze map adaptation once GSS has been activated
+    allow_transport_refit <- adapt_phase && !(freeze_transport_after_gss && transport_frozen)
+    ref <- if (allow_transport_refit) {
+      maybe_refit_transport(
+        Theta = Theta, w = w, lambda = lambda, round = round,
+        resampled = resampled, ess_frac = ess_frac,
+        Tmap = Tmap, tr_state = tr_state,
+        every_rounds = refit_every,     # advisory cadence; gate is relative
+        verbose = verbose
+      )
+    } else {
+      list(refit = FALSE, Tmap = Tmap, tr_state = tr_state)
+    }
     if (isTRUE(ref$refit)) {
+      # If a GSS reference was active, remove its fixed-lambda contribution
+      # before invalidating it due to transport-coordinate change.
+      if (gss_enable && !is.null(lp_ref)) {
+        lp_ref_old <- as.numeric(lp_ref)
+        bad_old <- !is.finite(lp_ref_old)
+        if (all(bad_old)) {
+          w <- rep(1 / length(w), length(w))
+          cat("  [GSS Guard] All old lp_ref non-finite at refit; reset weights.\n")
+        } else {
+          if (any(bad_old)) {
+            lp_ref_old[bad_old] <- min(lp_ref_old[!bad_old]) - 50
+            cat(sprintf("  [GSS Guard] Clamped %d non-finite old lp_ref values at refit.\n", sum(bad_old)))
+          }
+          logw_corr <- log(pmax(w, .Machine$double.eps)) - (1 - lambda) * lp_ref_old
+          lse_corr <- logsumexp(logw_corr)
+          if (!is.finite(lse_corr)) {
+            w <- rep(1 / length(w), length(w))
+            cat("  [GSS Guard] Refit deweight normalization non-finite; reset weights.\n")
+          } else {
+            w <- exp(logw_corr - lse_corr)
+            w <- w / sum(w)
+          }
+        }
+      }
       Tmap <- ref$Tmap
       Z    <- Tmap$fwd(Theta)
       lpz  <- as.numeric(dmvnorm_chol_log(Theta, mu_ref, prior_L) - Tmap$log_jac(Theta))
-      # Transport changed => mixtures live in different Z; reset them
+      # Transport changed => all Z-space objects are invalid under old coordinates.
       last_elite_mix <- NULL
       elite_history  <- list()
-      # Transport change invalidates lp_ref snapshot; recompute if GSS active
-      if (gss_enable && !is.null(ref_mix)) {
-        lp_ref <- log_r_theta(Theta, Z, Tmap, ref_mix)
-      } else {
-        lp_ref <- NULL
-      }
+      ref_mix <- NULL
+      lp_ref <- NULL
     }
     tr_state <- ref$tr_state
 
@@ -1299,31 +1460,79 @@ enhanced_smc_elite <- function(data, loglik_fn, mu_ref, Sigma_ref,
                                  allow_refresh = allow_ref_refresh,
                                  lambda_ref_snap = lambda_ref_snap,
                                  lambda_ref_refresh = lambda_ref_refresh,
-                                 d = ncol(Z))
+                                 d = ncol(Z),
+                                 snapshot_taken = gss_snapshot_taken,
+                                 refresh_taken = gss_refresh_taken,
+                                 single_update_policy = single_gss_updates)
+      gss_snapshot_taken <- isTRUE(up$snapshot_taken)
+      gss_refresh_taken <- isTRUE(up$refresh_taken)
       if (isTRUE(up$switched)) {
         ref_mix_old <- ref_mix
         ref_mix <- up$ref_mix
         # compute new lp_ref at current lambda
         lp_ref_new <- log_r_theta(Theta, Z, Tmap, ref_mix)
-        if (is.null(lp_ref)) {
-          # first snapshot: incorporate (1 - lambda) * log r into current target
-          w <- w * exp((1 - lambda) * lp_ref_new)
-          w <- w / sum(w)
-          lp_ref <- lp_ref_new
-          cat("  [GSS] reference SNAPSHOT at lambda=", sprintf("%.3f", lambda), " (weights updated)\n")
+        bad_ref <- !is.finite(lp_ref_new)
+        if (all(bad_ref)) {
+          cat("  [GSS] reference update dropped (all lp_ref non-finite).\n")
+          ref_mix <- NULL
+          lp_ref <- NULL
         } else {
-          # refresh: exact corrective reweighting at fixed lambda
-          corr <- exp((1 - lambda) * (lp_ref_new - lp_ref))
-          w <- w * corr
-          w <- w / sum(w)
-          lp_ref <- lp_ref_new
-          cat("  [GSS] reference REFRESH at lambda=", sprintf("%.3f", lambda), " (weights corrected)\n")
+          if (any(bad_ref)) {
+            lp_ref_new[bad_ref] <- min(lp_ref_new[!bad_ref]) - 50
+            cat(sprintf("  [GSS Guard] Clamped %d non-finite lp_ref values.\n", sum(bad_ref)))
+          }
+          if (is.null(lp_ref)) {
+            # first snapshot: incorporate (1 - lambda) * log r into current target
+            logw <- log(pmax(w, .Machine$double.eps)) + (1 - lambda) * lp_ref_new
+            lse <- logsumexp(logw)
+            if (!is.finite(lse)) {
+              w <- rep(1 / length(w), length(w))
+              cat("  [GSS Guard] Snapshot normalization non-finite; reset weights.\n")
+            } else {
+              w <- exp(logw - lse)
+              w <- w / sum(w)
+            }
+            lp_ref <- lp_ref_new
+            cat("  [GSS] reference SNAPSHOT at lambda=", sprintf("%.3f", lambda), " (weights updated)\n")
+            if (freeze_transport_after_gss) transport_frozen <- TRUE
+          } else {
+            # refresh: exact corrective reweighting at fixed lambda
+            logw <- log(pmax(w, .Machine$double.eps)) + (1 - lambda) * (lp_ref_new - lp_ref)
+            lse <- logsumexp(logw)
+            if (!is.finite(lse)) {
+              w <- rep(1 / length(w), length(w))
+              cat("  [GSS Guard] Refresh normalization non-finite; reset weights.\n")
+            } else {
+              w <- exp(logw - lse)
+              w <- w / sum(w)
+            }
+            lp_ref <- lp_ref_new
+            cat("  [GSS] reference REFRESH at lambda=", sprintf("%.3f", lambda), " (weights corrected)\n")
+          }
         }
       } else if (!is.null(ref_mix) && is.null(lp_ref)) {
         # safety: if ref_mix was injected externally before entering loop
         lp_ref <- log_r_theta(Theta, Z, Tmap, ref_mix)
-        w <- w * exp((1 - lambda) * lp_ref)
-        w <- w / sum(w)
+        bad_ref <- !is.finite(lp_ref)
+        if (all(bad_ref)) {
+          cat("  [GSS] safety snapshot dropped (all lp_ref non-finite).\n")
+          ref_mix <- NULL
+          lp_ref <- NULL
+        } else {
+          if (any(bad_ref)) {
+            lp_ref[bad_ref] <- min(lp_ref[!bad_ref]) - 50
+            cat(sprintf("  [GSS Guard] Clamped %d non-finite safety lp_ref values.\n", sum(bad_ref)))
+          }
+          logw <- log(pmax(w, .Machine$double.eps)) + (1 - lambda) * lp_ref
+          lse <- logsumexp(logw)
+          if (!is.finite(lse)) {
+            w <- rep(1 / length(w), length(w))
+            cat("  [GSS Guard] Safety normalization non-finite; reset weights.\n")
+          } else {
+            w <- exp(logw - lse)
+            w <- w / sum(w)
+          }
+        }
       }
     }
 
@@ -1347,8 +1556,9 @@ enhanced_smc_elite <- function(data, loglik_fn, mu_ref, Sigma_ref,
 
     # --- DA screen (snapshot for this round) ---
     da_screen_mix <- if (da_enable) .build_da_screen_mix(elite_mix, hist_mix, ncol(Z)) else NULL
-    # Micro-calibration (tiny exact budget) to tighten stage-1
-    da_calib_info <- if (da_enable && !is.null(da_screen_mix)) {
+    da_calib_active <- da_enable && adapt_phase && !is.null(da_screen_mix)
+    # Micro-calibration (tiny exact budget) to tighten stage-1 (early adaptive phase only).
+    da_calib_info <- if (da_calib_active) {
       .calibrate_da_surrogate(Z, Theta, lpz, lambda, if (gss_enable) ref_mix else NULL,
                               da_screen_mix, data, loglik_fn, Tmap,
                               ll_cache = ll_cache,
@@ -1357,7 +1567,12 @@ enhanced_smc_elite <- function(data, loglik_fn, mu_ref, Sigma_ref,
                               lambda_floor = da_lambda_floor,
                               gate_lambda = da_lambda_floor,
                               n_cores = n_cores)
-    } else list(a = 0.0, b = 1.0, r2 = NA_real_, skipped = TRUE, reason = "DA off or no screen mix")
+    } else list(
+      a = 0.0, b = 1.0, r2 = NA_real_, skipped = TRUE,
+      reason = if (!da_enable) "DA off"
+               else if (!adapt_phase) "post-adaptation phase"
+               else "no screen mix"
+    )
     if (da_enable) {
       if (isTRUE(da_calib_info$skipped)) {
         cat(sprintf("  [DA] α=%.3f, calib=skipped (%s)\n", da_alpha, da_calib_info$reason))
@@ -1401,20 +1616,31 @@ enhanced_smc_elite <- function(data, loglik_fn, mu_ref, Sigma_ref,
       pcn_prob_eff <- 0.0
       id_prob_eff  <- 1 - rw_prob_eff
     }
-    ## --- Calmer, capped adaptive number of MCMC moves ---
-    ## Uses Δ, remaining difficulty, ESS, and *reduces* moves when acceptance is very low.
-    difficulty <- 1 - pred_rcess_full
-    sDelta <- .clamp(delta / 0.05, 0.6, 1.4)             # Δ-driven scaling
-    sDiff  <- 1 + .clamp(1.5 * difficulty, 0, 1.5)       # up to 2.5×
-    acc_proxy <- mean(c(last_rw_acc, last_pcn_acc), na.rm = TRUE)
-    if (!is.finite(acc_proxy)) acc_proxy <- 0.25
-    sAcc <- if (acc_proxy < 0.10) 0.80 else              # if proposals are failing, don't throw more moves at it
-            if (acc_proxy < 0.20) 0.90 else 1.00
-    base_moves <- n_mcmc_moves
-    floor_moves <- if (ess_frac < 0.40) 4L else if (ess_frac < 0.70) 3L else 2L
-    n_moves_eff <- as.integer(ceiling(base_moves * sDelta * sDiff * sAcc))
-    n_moves_eff <- max(floor_moves, min(n_moves_eff, moves_cap))
-    if (lambda > 0.90) n_moves_eff <- max(n_moves_eff, 3L)
+    ## --- Early adaptive phase vs fixed-kernel phase ---
+    if (adapt_phase) {
+      # Calmer, capped adaptive number of MCMC moves.
+      difficulty <- 1 - pred_rcess_full
+      sDelta <- .clamp(delta / 0.05, 0.6, 1.4)             # Δ-driven scaling
+      sDiff  <- 1 + .clamp(1.5 * difficulty, 0, 1.5)       # up to 2.5×
+      acc_proxy <- mean(c(last_rw_acc, last_pcn_acc), na.rm = TRUE)
+      if (!is.finite(acc_proxy)) acc_proxy <- 0.25
+      sAcc <- if (acc_proxy < 0.10) 0.80 else              # if proposals are failing, don't throw more moves at it
+              if (acc_proxy < 0.20) 0.90 else 1.00
+      base_moves <- n_mcmc_moves
+      floor_moves <- if (ess_frac < 0.40) 4L else if (ess_frac < 0.70) 3L else 2L
+      n_moves_eff <- as.integer(ceiling(base_moves * sDelta * sDiff * sAcc))
+      n_moves_eff <- max(floor_moves, min(n_moves_eff, moves_cap))
+      if (lambda > 0.90) n_moves_eff <- max(n_moves_eff, 3L)
+    } else {
+      # Fixed-kernel phase: freeze probabilities/scales/move count for stability.
+      pcn_prob_eff <- if (pcn_disabled) 0.0 else 0.20
+      rw_prob_eff  <- .clamp(rw_prob, 0.10, 0.75)
+      id_prob_eff  <- max(0, 1 - (pcn_prob_eff + rw_prob_eff))
+      if (id_prob_eff < 0.05) {
+        rw_prob_eff <- max(0.05, rw_prob_eff - (0.05 - id_prob_eff))
+      }
+      n_moves_eff <- as.integer(max(1L, post_adapt_n_mcmc_moves))
+    }
     # Make very-early rounds cheap: cap to 2 moves and remove ID mass.
     if (lambda < da_lambda_floor) {
       n_moves_eff <- min(n_moves_eff, 2L)
@@ -1453,11 +1679,13 @@ enhanced_smc_elite <- function(data, loglik_fn, mu_ref, Sigma_ref,
     if (gss_enable && !is.null(ref_mix)) {
       lp_ref <- log_r_theta(Theta, Z, Tmap, ref_mix)
     }
-    # Adapt RW scale and pCN beta via Robbins-Monro
-    log_rw_scale <- .clamp(log_rw_scale + rm_gain * (move$rw_accept_rate - target_acc_rw),
-                       log(0.05), log(1.5))
-    logit_pcn_beta <- .clamp(logit_pcn_beta + rm_gain_pcn * (move$pcn_accept_rate - target_acc_pcn),
-                             qlogis(0.05), qlogis(0.95))
+    # Adapt RW scale and pCN beta via Robbins-Monro (early adaptive phase only).
+    if (adapt_phase) {
+      log_rw_scale <- .clamp(log_rw_scale + rm_gain * (move$rw_accept_rate - target_acc_rw),
+                             log(0.05), log(1.5))
+      logit_pcn_beta <- .clamp(logit_pcn_beta + rm_gain_pcn * (move$pcn_accept_rate - target_acc_pcn),
+                               qlogis(0.05), qlogis(0.95))
+    }
     # Update rolling acceptance snapshots for the next round's adaptive n_moves
     last_rw_acc <- move$rw_accept_rate; last_pcn_acc <- move$pcn_accept_rate; last_id_acc <- move$indep_accept_rate
     # ---- DA diagnostics & α update ----
@@ -1475,11 +1703,13 @@ enhanced_smc_elite <- function(data, loglik_fn, mu_ref, Sigma_ref,
       saved_frac <- 1 - last_da_pass_rate
       cat(sprintf("  [DA] pass=%.2f (rw=%.2f, pcn=%.2f, id=%.2f) | cond=%.2f | saved≈%.0f%% | α=%.3f, b=%.3f\n",
                   last_da_pass_rate, pr_rw, pr_pcn, pr_id, cond_acc, 100*saved_frac, da_alpha, da_calib_info$b))
-      # RM update on log α (keep α within [0.6, 1.5])
-      log_alpha <- log(da_alpha)
-      log_alpha <- log_alpha + da_rm_gain * (da_target_pass - last_da_pass_rate)
-      da_alpha  <- exp(.clamp(log_alpha, log(0.6), log(1.5)))
-      cat(sprintf("  [DA] α tuned → %.3f\n", da_alpha))
+      if (adapt_phase) {
+        # RM update on log α (keep α within [0.6, 1.5])
+        log_alpha <- log(da_alpha)
+        log_alpha <- log_alpha + da_rm_gain * (da_target_pass - last_da_pass_rate)
+        da_alpha  <- exp(.clamp(log_alpha, log(0.6), log(1.5)))
+        cat(sprintf("  [DA] α tuned → %.3f\n", da_alpha))
+      }
     }
     # (1) Update pCN kill-switch streak
     if (!pcn_disabled) {

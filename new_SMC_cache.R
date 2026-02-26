@@ -210,7 +210,7 @@ if (file.exists(sc_path)) source(sc_path)
 # ------------------------ unified RQMC sampler (arm+comp) ----------------
 # Single Sobol net drives: arm (Normal vs t), component, chi^2 (for t), and d normals.
 # === PATCH: deterministic-mixture + stratified + power-of-two RQMC ========
-.sample_from_ri_rqmc <- function(M, ri, sobol_seed = NULL) {
+.sample_from_ri_rqmc <- function(M, ri, sobol_seed = NULL, deterministic_counts = FALSE) {
   d <- length(ri$mix_g$meansZ[[1]])
   if (M <= 0L) return(list(Theta = matrix(numeric(0), 0, d), Z = matrix(numeric(0), 0, d)))
 
@@ -223,14 +223,22 @@ if (file.exists(sc_path)) source(sc_path)
   w_comp <- exp(ri$mix_g$cache$logw); w_comp <- w_comp / sum(w_comp)
   G <- length(w_comp)
 
-  # deterministic counts for (normal arm, components) and (t arm, components)
+  # seeds per stratum (deterministic but subject/batch specific via sobol_seed)
+  base_seed <- if (!is.null(sobol_seed)) as.integer(sobol_seed) else 11L
+
+  # Counts for (normal arm, components) and (t arm, components).
+  # Default is randomized (strict correctness); deterministic is debug-only.
   target_counts <- c(p_n * w_comp, p_t * w_comp) * M
-  counts <- .fracs_to_counts(target_counts, total = M)  # length 2G
+  probs <- target_counts / sum(target_counts)
+  counts <- if (isTRUE(deterministic_counts)) {
+    .fracs_to_counts(target_counts, total = M)
+  } else {
+    set.seed(base_seed + 104729L)
+    as.integer(rmultinom(1L, size = M, prob = probs)[, 1L])
+  }
   n_ng <- counts[seq_len(G)]
   n_tg <- counts[G + seq_len(G)]
 
-  # seeds per stratum (deterministic but subject/batch specific via sobol_seed)
-  base_seed <- if (!is.null(sobol_seed)) as.integer(sobol_seed) else 11L
   chunk_id <- 0L
 
   Z_blocks <- vector("list", 2L * G)  # upper bound; we may store multiple chunks per stratum
@@ -302,7 +310,12 @@ if (file.exists(sc_path)) source(sc_path)
   }
   colnames(Z) <- names(ri$mix_g$meansZ[[1]])
   Theta <- ri$Tmap$inv(Z)
-  list(Theta = Theta, Z = Z)
+  list(
+    Theta = Theta,
+    Z = Z,
+    strata_counts = as.integer(counts),
+    strata_probs = as.numeric(probs)
+  )
 }
 
 # -------------------- Gaussian prior fast path (matrix interface) --------
@@ -353,6 +366,7 @@ build_subject_cache_from_smc <- function(
     blend_std_norm = 0.15,
     defensive_t_eps = 0.25,
     defensive_t_df = 3L,
+    deterministic_counts = FALSE, # debug mode; default randomized for strict correctness
     sobol_seed = NULL,          # <-- PATCH: allow NULL
     n_cores = 1L,
     # --- PATCH (4) new args for φ-aware surrogate:
@@ -386,7 +400,10 @@ build_subject_cache_from_smc <- function(
 
   batches <- vector("list", K_batches)
   for (k in seq_len(K_batches)) {
-    smp <- .sample_from_ri_rqmc(M_per, ri, sobol_seed = seeds[k])   # <-- uses stratified DM-MIS sampler
+    smp <- .sample_from_ri_rqmc(
+      M_per, ri, sobol_seed = seeds[k],
+      deterministic_counts = deterministic_counts
+    )   # <-- uses stratified DM-MIS sampler
     Theta_k <- smp$Theta; Z_k <- smp$Z
     colnames(Theta_k) <- colnames(smc_out$Theta)
     log_py_k <- ll_parallel(Theta_k, data, loglik_fn, n_cores)
@@ -414,7 +431,8 @@ build_subject_cache_from_smc <- function(
     meta = list(d = ncol(smc_out$Theta),
                 subj_id = subj_id,
                 phi_anchors = phi_anchors,
-                has_quad_site = !is.null(quad_site))
+                has_quad_site = !is.null(quad_site),
+                deterministic_counts = isTRUE(deterministic_counts))
   ), class = "subject_cache_smcK")
 }
 

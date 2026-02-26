@@ -186,6 +186,7 @@ create_phi_aware_cache <- function(
     quad_site,          # list(J, h) from fit_quadratic_site_diag_matrix
     M = 512L,
     K_batches = 4L,
+    deterministic_counts = FALSE,
     surr_n = 200L,
     surr_c = 1.6,
     surr_weight = 0.35,
@@ -199,6 +200,7 @@ create_phi_aware_cache <- function(
     loglik_fn        = loglik_fn,
     M                = M,
     K_batches        = K_batches,
+    deterministic_counts = deterministic_counts,
     subj_id          = subj_id_i,
     # φ-aware surrogate inputs (Patch 4):
     phi_anchors      = phi_anchors,
@@ -247,6 +249,7 @@ build_phi_aware_caches_from_base_proxy <- function(
     blend_std_norm = 0.15,
     defensive_t_eps = 0.25,
     defensive_t_df = 3L,
+    deterministic_counts = FALSE,
     # parallelism
     mc.cores = 1L,       # subjects-level parallelism
     n_cores_inner = 1L   # inner likelihood parallelism per subject (used by cache builder)
@@ -270,6 +273,7 @@ build_phi_aware_caches_from_base_proxy <- function(
         loglik_fn        = loglik_fn,
         M                = M_small,
         K_batches        = K_small,
+        deterministic_counts = deterministic_counts,
         subj_id          = subj_id_i,
         blend_std_norm   = blend_std_norm,
         defensive_t_eps  = defensive_t_eps,
@@ -326,6 +330,7 @@ build_phi_aware_caches_from_base_proxy <- function(
         quad_site       = quad_site_i,
         M               = M_final,
         K_batches       = K_final,
+        deterministic_counts = deterministic_counts,
         surr_n          = surr_n,
         surr_c          = surr_c,
         surr_weight     = surr_weight,

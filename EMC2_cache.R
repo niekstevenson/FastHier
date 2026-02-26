@@ -1,3 +1,6 @@
+# EMC2-specific pipeline is intentionally disabled while validating the
+# generic R-likelihood + Stan correctness path.
+if (FALSE) {
 rm(list = ls())
 library(EMC2)
 library(parallel)
@@ -16,7 +19,7 @@ source("SMC_super_fast.R")
 source("smc_diagnostics.R")
 
 smc <- mclapply(data, enhanced_smc_elite, loglik_fn = loglik_fn, mu_ref = mu_ref, Sigma_ref = Sigma_ref,
-                seed = 123, M = 5000, mc.cores = 12)
+                seed = 123, M = 5000, mc.cores = 1)
 
 
 for(i in 1:length(smc)){
@@ -148,3 +151,4 @@ for(i in 1:ncol(mu_draws)){
 # k_base <- pareto_k_from_base_proxy(cache_i, phi,
 #                                    log_prior_theta_given_phi_mat = function(Theta, phi, aux) .log_prior_gauss_mat(Theta, phi_to_gauss(phi))
 # )
+}

@@ -707,3 +707,151 @@ outer_smc_phi_batch <- function(
     )
   )
 }
+
+# ---------------------- Generic outer SMC (direct likelihood) -------------------
+.outer_eval_logprior_one <- function(theta_row, logprior_fn) {
+  val <- tryCatch(logprior_fn(theta_row), error = function(e) NULL)
+  if (is.null(val)) {
+    val <- tryCatch(
+      logprior_fn(matrix(theta_row, nrow = 1L)),
+      error = function(e) stop("logprior failed for both vector and 1-row matrix input.")
+    )
+  }
+  val <- as.numeric(val)
+  if (!length(val)) stop("logprior returned empty output for one-row input.")
+  val[1L]
+}
+
+.outer_eval_logprior_mat <- function(Theta, logprior_fn) {
+  out <- tryCatch(logprior_fn(Theta), error = function(e) NULL)
+  if (!is.null(out)) {
+    out <- as.numeric(out)
+    if (length(out) == nrow(Theta)) return(out)
+  }
+  vapply(seq_len(nrow(Theta)), function(i) .outer_eval_logprior_one(Theta[i, , drop = TRUE], logprior_fn), numeric(1))
+}
+
+outer_smc_direct <- function(
+    data,
+    rprior,                  # function(n) -> matrix(n x d)
+    logprior,                # function(theta_matrix_or_row) -> vector/scalar
+    loglik_fn,               # function(theta_matrix_or_row, data) -> vector/scalar
+    M = 2000L,
+    cess_target = 0.95,
+    resample_threshold = 0.5,
+    n_moves = 2L,
+    rw_scale_init = 1.0,
+    max_rounds = 200L,
+    n_cores_loglik = 1L,
+    seed = 123,
+    verbose = TRUE
+) {
+  set.seed(seed)
+
+  Theta <- rprior(M)
+  if (!is.matrix(Theta)) Theta <- matrix(Theta, nrow = M)
+  d <- ncol(Theta)
+
+  logprior_curr <- .outer_eval_logprior_mat(Theta, logprior)
+  loglik_curr <- ll_parallel(Theta, data, loglik_fn, n_cores = n_cores_loglik)
+  if (!all(is.finite(logprior_curr))) stop("Non-finite log prior at initialization.")
+  if (!any(is.finite(loglik_curr))) stop("All initial log-likelihood values are non-finite.")
+  loglik_curr[!is.finite(loglik_curr)] <- -Inf
+
+  lambda <- 0.0
+  w <- rep(1 / M, M)
+  logZ <- 0.0
+
+  lambda_hist <- lambda
+  ess_hist <- numeric()
+  acc_hist <- numeric()
+  logZ_increments <- numeric()
+  log_rw_scale <- log(rw_scale_init)
+
+  round <- 0L
+  while (lambda < 1 - 1e-12 && round < max_rounds) {
+    round <- round + 1L
+    lambda_new <- next_lambda_via_rCESS_stat(w, loglik_curr, lambda, target = cess_target)
+    delta <- lambda_new - lambda
+    if (!is.finite(delta) || delta <= 1e-8) {
+      delta <- min(1 - lambda, 1e-4)
+      lambda_new <- lambda + delta
+    }
+
+    m <- max(loglik_curr)
+    log_u <- delta * (loglik_curr - m)
+    logZ_inc <- logsumexp_w(log_u, w) + delta * m
+    if (!is.finite(logZ_inc)) stop("Non-finite log-evidence increment.")
+    logZ <- logZ + logZ_inc
+    logZ_increments <- c(logZ_increments, logZ_inc)
+
+    w <- w * exp(log_u)
+    sw <- sum(w)
+    if (!is.finite(sw) || sw <= 0) stop("Particle weights became invalid.")
+    w <- w / sw
+    ess_frac <- (1 / sum(w * w)) / M
+    ess_hist <- c(ess_hist, ess_frac)
+
+    if (verbose) {
+      cat(sprintf("[Outer Round %d] lambda %.4f -> %.4f | ESS/N=%.3f | logZ+=%.4f\n",
+                  round, lambda, lambda_new, ess_frac, logZ_inc))
+    }
+
+    if (ess_frac < resample_threshold) {
+      idx <- stratified_resample_sorted(w, deterministic = FALSE)
+      Theta <- Theta[idx, , drop = FALSE]
+      logprior_curr <- logprior_curr[idx]
+      loglik_curr <- loglik_curr[idx]
+      w <- rep(1 / M, M)
+    }
+
+    rw_scale <- exp(log_rw_scale)
+    S <- tryCatch(weighted_cov(Theta, w), error = function(e) stats::cov(Theta))
+    S <- as.matrix(S)
+    diag(S) <- pmax(diag(S), 1e-8)
+    L <- tryCatch(
+      chol((rw_scale^2 / max(d, 1L)) * S + diag(1e-10, d)),
+      error = function(e) chol((rw_scale^2 / max(d, 1L)) * (S + diag(1e-6, d)))
+    )
+
+    acc_total <- 0L
+    for (mv in seq_len(n_moves)) {
+      prop <- Theta + matrix(rnorm(M * d), M, d) %*% L
+      lp_prop <- .outer_eval_logprior_mat(prop, logprior)
+      ll_prop <- ll_parallel(prop, data, loglik_fn, n_cores = n_cores_loglik)
+      loga <- (lp_prop - logprior_curr) + lambda_new * (ll_prop - loglik_curr)
+      loga[!is.finite(loga)] <- -Inf
+      acc <- log(runif(M)) < pmin(0, loga)
+      if (any(acc)) {
+        Theta[acc, ] <- prop[acc, , drop = FALSE]
+        logprior_curr[acc] <- lp_prop[acc]
+        loglik_curr[acc] <- ll_prop[acc]
+      }
+      acc_total <- acc_total + sum(acc)
+    }
+
+    acc_rate <- acc_total / max(1L, M * n_moves)
+    acc_hist <- c(acc_hist, acc_rate)
+    log_rw_scale <- .clamp(log_rw_scale + 0.05 * (acc_rate - 0.234), log(0.02), log(3.0))
+
+    lambda <- lambda_new
+    lambda_hist <- c(lambda_hist, lambda)
+  }
+
+  list(
+    theta = Theta,
+    w = w,
+    loglik = loglik_curr,
+    logprior = logprior_curr,
+    log_evidence = logZ,
+    logZ_increments = logZ_increments,
+    meta = list(
+      lambda_hist = lambda_hist,
+      ess_hist = ess_hist,
+      acc_hist = acc_hist,
+      rw_scale_final = exp(log_rw_scale),
+      rounds = round,
+      final_lambda = lambda
+    )
+  )
+}

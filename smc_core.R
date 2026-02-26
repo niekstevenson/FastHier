@@ -487,19 +487,43 @@ stratified_resample_sorted <- function(w, deterministic = TRUE) {
 
 # ----------------------------- rCESS scheduling ---------------------------
 rCESS <- function(w, loglik, delta) {
-  w <- pmax(w, 0); w <- w / sum(w)
-  x <- loglik - max(loglik)
+  w <- as.numeric(w)
+  w[!is.finite(w) | w < 0] <- 0
+  sw <- sum(w)
+  if (!is.finite(sw) || sw <= 0) return(0)
+  w <- w / sw
+
+  x <- as.numeric(loglik)
+  ok <- is.finite(x)
+  if (!any(ok)) return(0)
+  x[!ok] <- min(x[ok])
+  x <- x - max(x)
+
   a1 <- logsumexp(log(w) + delta * x)
   a2 <- logsumexp(log(w) + 2 * delta * x)
-  exp(2 * a1 - a2)
+  val <- exp(2 * a1 - a2)
+  if (!is.finite(val)) return(0)
+  pmin(pmax(val, 0), 1)
 }
 
 rCESS_stat <- function(w, h, delta) {
-  w <- pmax(w, 0); w <- w / sum(w)
-  x <- h - max(h)
+  w <- as.numeric(w)
+  w[!is.finite(w) | w < 0] <- 0
+  sw <- sum(w)
+  if (!is.finite(sw) || sw <= 0) return(0)
+  w <- w / sw
+
+  x <- as.numeric(h)
+  ok <- is.finite(x)
+  if (!any(ok)) return(0)
+  x[!ok] <- min(x[ok])
+  x <- x - max(x)
+
   a1 <- logsumexp(log(w) + delta * x)
   a2 <- logsumexp(log(w) + 2 * delta * x)
-  exp(2 * a1 - a2)
+  val <- exp(2 * a1 - a2)
+  if (!is.finite(val)) return(0)
+  pmin(pmax(val, 0), 1)
 }
 
 cess_target_at_lambda <- function(lambda) {
@@ -514,11 +538,14 @@ next_lambda_via_rCESS <- function(w, loglik, lambda,
                                   itmax = 30) {
   if (lambda >= 1 - eps_stop) return(1.0)
   rem <- 1 - lambda
-  if (rCESS(w, loglik, rem) >= target) return(1.0)
+  r_full <- rCESS(w, loglik, rem)
+  if (is.finite(r_full) && r_full >= target) return(1.0)
   lo <- 0.0; hi <- rem
   for (it in 1:itmax) {
     mid <- 0.5 * (lo + hi)
-    if (rCESS(w, loglik, mid) >= target) lo <- mid else hi <- mid
+    r_mid <- rCESS(w, loglik, mid)
+    if (!is.finite(r_mid)) r_mid <- 0
+    if (r_mid >= target) lo <- mid else hi <- mid
     if ((hi - lo) <= max(1e-8, 0.02 * lo)) break
   }
   lambda + max(lo, min(hi, rem))
@@ -530,28 +557,53 @@ next_lambda_via_rCESS_stat <- function(w, h, lambda,
                                        itmax = 30) {
   if (lambda >= 1 - eps_stop) return(1.0)
   rem <- 1 - lambda
-  if (rCESS_stat(w, h, rem) >= target) return(1.0)
+  r_full <- rCESS_stat(w, h, rem)
+  if (is.finite(r_full) && r_full >= target) return(1.0)
   lo <- 0.0; hi <- rem
   for (it in 1:itmax) {
     mid <- 0.5 * (lo + hi)
-    if (rCESS_stat(w, h, mid) >= target) lo <- mid else hi <- mid
+    r_mid <- rCESS_stat(w, h, mid)
+    if (!is.finite(r_mid)) r_mid <- 0
+    if (r_mid >= target) lo <- mid else hi <- mid
     if ((hi - lo) <= max(1e-8, 0.02 * lo)) break
   }
   lambda + max(lo, min(hi, rem))
 }
 
 # --------------------------- likelihood batching --------------------------
-ll_parallel <- function(Theta, data, loglik_fn, n_cores = 1) {
-  n <- nrow(Theta)
-  if (!is.matrix(Theta)) stop("Theta must be a matrix.")
-  if (n == 0L || n_cores <= 1L) {
-    return(EMC2:::calc_ll_manager(Theta, data, loglik_fn))
+.ll_eval_one <- function(theta_row, data, loglik_fn) {
+  val <- tryCatch(loglik_fn(theta_row, data), error = function(e) NULL)
+  if (is.null(val)) {
+    val <- tryCatch(
+      loglik_fn(matrix(theta_row, nrow = 1L), data),
+      error = function(e) stop("loglik_fn failed for both vector and 1-row matrix input.")
+    )
   }
+  val <- as.numeric(val)
+  if (!length(val)) stop("loglik_fn returned empty output for one-row input.")
+  val[1L]
+}
+
+.ll_eval_block <- function(Theta, data, loglik_fn) {
+  out <- tryCatch(loglik_fn(Theta, data), error = function(e) NULL)
+  if (!is.null(out)) {
+    out <- as.numeric(out)
+    if (length(out) == nrow(Theta)) return(out)
+  }
+  vapply(seq_len(nrow(Theta)), function(i) .ll_eval_one(Theta[i, , drop = TRUE], data, loglik_fn), numeric(1))
+}
+
+ll_parallel <- function(Theta, data, loglik_fn, n_cores = 1) {
+  if (!is.matrix(Theta)) stop("Theta must be a matrix.")
+  if (!is.function(loglik_fn)) stop("loglik_fn must be an R function.")
+  n <- nrow(Theta)
+  if (n == 0L) return(numeric(0))
+  if (n_cores <= 1L || n < 2L) return(.ll_eval_block(Theta, data, loglik_fn))
   n_cores <- min(n_cores, parallel::detectCores(logical = TRUE), n)
   idx_list <- parallel::splitIndices(n, n_cores)
   parts <- parallel::mclapply(
     idx_list,
-    function(ii) EMC2:::calc_ll_manager(Theta[ii, , drop = FALSE], data, loglik_fn),
+    function(ii) .ll_eval_block(Theta[ii, , drop = FALSE], data, loglik_fn),
     mc.cores = n_cores
   )
   out <- numeric(n)
