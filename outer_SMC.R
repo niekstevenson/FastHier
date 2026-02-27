@@ -68,6 +68,83 @@ suppressPackageStartupMessages({
   s
 }
 
+.outer_loglik_hat_particles <- function(Phi, caches, b_state,
+                                        log_prior_theta_given_phi_mat = NULL,
+                                        gaussian_map_fn = NULL,
+                                        pm_mode = c("strict", "fast")) {
+  pm_mode <- match.arg(pm_mode)
+  Phi <- as.matrix(Phi)
+  N <- nrow(Phi)
+  if (N <= 0L) return(numeric(0))
+
+  if (pm_mode == "fast") {
+    stopifnot(is.vector(b_state), length(b_state) == length(caches))
+    return(apply(Phi, 1L, function(p)
+      .outer_loglik_hat_batch(p, caches, b_state,
+                              log_prior_theta_given_phi_mat, gaussian_map_fn)))
+  }
+
+  stopifnot(is.matrix(b_state), nrow(b_state) == N, ncol(b_state) == length(caches))
+  out <- numeric(N)
+  for (i in seq_len(N)) {
+    out[i] <- .outer_loglik_hat_batch(Phi[i, , drop = TRUE], caches, b_state[i, ],
+                                      log_prior_theta_given_phi_mat, gaussian_map_fn)
+  }
+  out
+}
+
+.init_aux_batch_state <- function(caches, M, pm_mode = c("strict", "fast")) {
+  pm_mode <- match.arg(pm_mode)
+  S <- length(caches)
+  if (pm_mode == "fast") {
+    return(vapply(caches, function(ci) sample.int(ci$K, 1L), integer(1)))
+  }
+  B <- matrix(0L, nrow = M, ncol = S)
+  for (j in seq_len(S)) {
+    B[, j] <- sample.int(caches[[j]]$K, M, replace = TRUE)
+  }
+  B
+}
+
+.probe_aux_row <- function(phi, w, logprior, loglik, lambda, b_state) {
+  idx <- which.max(logprior + lambda * loglik)
+  if (is.matrix(b_state)) b_state[idx, ] else b_state
+}
+
+.refresh_aux_state_block_mh <- function(phi, loglik, b_state, lambda,
+                                        caches,
+                                        log_prior_theta_given_phi_mat = NULL,
+                                        gaussian_map_fn = NULL,
+                                        frac = 0.10,
+                                        rng_seed = NULL) {
+  if (!is.matrix(b_state)) {
+    return(list(b_state = b_state, loglik = loglik, acc_rate = NA_real_))
+  }
+  if (!is.null(rng_seed)) set.seed(rng_seed)
+  frac <- .clamp(frac, 0, 1)
+  if (frac <= 0) return(list(b_state = b_state, loglik = loglik, acc_rate = 0))
+
+  N <- nrow(phi)
+  S <- ncol(b_state)
+  R <- max(1L, ceiling(frac * S))
+  nacc <- 0L
+  for (i in seq_len(N)) {
+    idx <- sample.int(S, R)
+    b_prop <- b_state[i, ]
+    for (j in idx) b_prop[j] <- sample.int(caches[[j]]$K, 1L)
+    ll_prop <- .outer_loglik_hat_batch(phi[i, , drop = TRUE], caches, b_prop,
+                                       log_prior_theta_given_phi_mat, gaussian_map_fn)
+    loga <- lambda * (ll_prop - loglik[i])
+    if (!is.finite(loga)) loga <- -Inf
+    if (log(runif(1)) < min(0, loga)) {
+      b_state[i, ] <- b_prop
+      loglik[i] <- ll_prop
+      nacc <- nacc + 1L
+    }
+  }
+  list(b_state = b_state, loglik = loglik, acc_rate = nacc / max(N, 1L))
+}
+
 # --------------- Per-subject IS diagnostics at a given φ ----------------
 .cache_logw_at_phi_batch <- function(cache, phi_row, b,
                                      log_prior_theta_given_phi_mat = NULL) {
@@ -161,9 +238,10 @@ if (!exists("refresh_batch_indices", mode = "function")) {
 # ------------------------------ Rejuvenation -----------------------------
 # One sweep of adaptive MH on φ with RW + independence mixture (correlated PM; b_idx fixed)
 .rejuvenate_rw_batch <- function(phi, loglik, logprior, w, lambda,
-                                 caches, b_idx, logprior_phi,
+                                 caches, b_state, logprior_phi,
                                  log_prior_theta_given_phi_mat = NULL,
                                  gaussian_map_fn = NULL,
+                                 pm_mode = c("strict", "fast"),
                                  n_moves = 2L,
                                  rw_scale = 1.0,
                                  weak_dim_idx = integer(0),
@@ -174,6 +252,7 @@ if (!exists("refresh_batch_indices", mode = "function")) {
                                  indep_t_df = 4L,
                                  indep_t_prob = 0.85,
                                  rng_seed = NULL) {
+  pm_mode <- match.arg(pm_mode)
   if (!is.null(rng_seed)) set.seed(rng_seed)
   N <- nrow(phi); d <- ncol(phi)
 
@@ -224,6 +303,17 @@ if (!exists("refresh_batch_indices", mode = "function")) {
   nacc_rw <- 0L; nacc_id <- 0L
   nprop_rw <- 0L; nprop_id <- 0L
 
+  eval_ll <- function(Phi, b_sub) {
+    .outer_loglik_hat_particles(
+      Phi = Phi,
+      caches = caches,
+      b_state = b_sub,
+      log_prior_theta_given_phi_mat = log_prior_theta_given_phi_mat,
+      gaussian_map_fn = gaussian_map_fn,
+      pm_mode = pm_mode
+    )
+  }
+
   for (m in seq_len(n_moves)) {
     choose_id <- runif(N) < indep_prob
     idx_id <- which(choose_id)
@@ -233,8 +323,8 @@ if (!exists("refresh_batch_indices", mode = "function")) {
     if (length(idx_id)) {
       prop_id <- sample_from_q_phi(length(idx_id), elite_mix, hist_mix, indep_t_prob, indep_t_df)
       lp_prop_id <- apply(prop_id, 1L, logprior_phi)
-      ll_prop_id <- apply(prop_id, 1L, function(p)
-        .outer_loglik_hat_batch(p, caches, b_idx, log_prior_theta_given_phi_mat, gaussian_map_fn))
+      b_id <- if (pm_mode == "strict") b_state[idx_id, , drop = FALSE] else b_state
+      ll_prop_id <- eval_ll(prop_id, b_id)
       lq_curr <- log_q_mixture(phi[idx_id, , drop = FALSE], elite_mix, hist_mix, indep_t_prob, indep_t_df)
       lq_prop <- log_q_mixture(prop_id, elite_mix, hist_mix, indep_t_prob, indep_t_df)
       a_id <- (lp_prop_id - logprior[idx_id]) + lambda * (ll_prop_id - loglik[idx_id]) + (lq_curr - lq_prop)
@@ -256,8 +346,8 @@ if (!exists("refresh_batch_indices", mode = "function")) {
       Z <- matrix(rnorm(length(idx_rw) * d), length(idx_rw), d)
       prop <- phi[idx_rw, , drop = FALSE] + Z %*% t(step)
       lp_prop <- apply(prop, 1L, logprior_phi)
-      ll_prop <- apply(prop, 1L, function(p)
-        .outer_loglik_hat_batch(p, caches, b_idx, log_prior_theta_given_phi_mat, gaussian_map_fn))
+      b_rw <- if (pm_mode == "strict") b_state[idx_rw, , drop = FALSE] else b_state
+      ll_prop <- eval_ll(prop, b_rw)
       a <- (lp_prop - logprior[idx_rw]) + lambda * (ll_prop - loglik[idx_rw])
       u <- log(runif(length(idx_rw)))
       acc <- (u < pmin(0, a))
@@ -273,7 +363,7 @@ if (!exists("refresh_batch_indices", mode = "function")) {
     }
   }
   total_props <- N * n_moves
-  list(phi = phi, loglik = loglik, logprior = logprior,
+  list(phi = phi, loglik = loglik, logprior = logprior, b_state = b_state,
        acc_rate = accepted / max(total_props, 1L),
        rw_accept_rate = if (nprop_rw>0) nacc_rw/nprop_rw else NA_real_,
        indep_accept_rate = if (nprop_id>0) nacc_id/nprop_id else NA_real_)
@@ -298,6 +388,7 @@ outer_smc_phi_batch <- function(
     resampling = c("systematic","multinomial"),
     n_moves = 2L,
     rw_scale_init = 1.3,
+    pm_mode = c("strict", "fast"),
     # Independence mixture kernel (new)
     indep_prob = 0.30,
     indep_t_df = 4L,
@@ -315,6 +406,8 @@ outer_smc_phi_batch <- function(
     refresh_batches_after_resample = FALSE,
     refresh_batches_each_round = FALSE,   # ### PATCH: default off to preserve CRNs
     refresh_batches_frac = 0.02,          # ### PATCH: gentler refresh if enabled
+    block_refresh_every = 5L,
+    block_refresh_frac = 0.10,
     # Diagnostics
     diag_enable = TRUE,
     diag_probe = c("wmean","best"),
@@ -335,6 +428,7 @@ outer_smc_phi_batch <- function(
 ) {
   resampling <- match.arg(resampling)
   diag_probe <- match.arg(diag_probe)
+  pm_mode <- match.arg(pm_mode)
   set.seed(seed)
 
   S <- length(caches)
@@ -364,8 +458,9 @@ outer_smc_phi_batch <- function(
     }
   }
 
-  # 0) Initialize batch indices (auxiliary PM state)
-  b_idx <- vapply(caches, function(ci) sample.int(ci$K, 1L), 1L)
+  # 0) Initialize auxiliary batch state
+  # fast: vector length S, strict: matrix M x S
+  b_state <- .init_aux_batch_state(caches, M = M, pm_mode = pm_mode)
 
   # 1) Initialize particles from prior
   phi <- rprior_phi(M)               # M x dphi
@@ -374,8 +469,12 @@ outer_smc_phi_batch <- function(
   logprior <- apply(phi, 1L, logprior_phi)
 
   # Initial loglik (batch-indexed)
-  loglik <- apply(phi, 1L, function(p)
-    .outer_loglik_hat_batch(p, caches, b_idx, log_prior_theta_given_phi_mat, gaussian_map_fn))
+  loglik <- .outer_loglik_hat_particles(
+    Phi = phi, caches = caches, b_state = b_state,
+    log_prior_theta_given_phi_mat = log_prior_theta_given_phi_mat,
+    gaussian_map_fn = gaussian_map_fn,
+    pm_mode = pm_mode
+  )
 
   # ### PATCH: sanity message for per-batch size on weakly ID params
   M_per_hint <- vapply(caches, function(ci) ci$batches[[1]]$M, numeric(1))
@@ -392,6 +491,7 @@ outer_smc_phi_batch <- function(
   w <- rep(1/M, M)
   logZ <- 0.0
   logZ_increments <- numeric()   # record per-round logZ increments
+  mcse_var_accum <- 0.0
 
   # Adaptive RW scale
   target_acc <- 0.234
@@ -406,7 +506,7 @@ outer_smc_phi_batch <- function(
 
   # Diagnostics store
   diag_list <- list()
-  logZ_increments <- numeric()   # already recorded; ensure exists
+  aux_refresh_acc_hist <- numeric()
 
   round <- 0L
   # rolling acceptances for adaptive n_moves
@@ -431,7 +531,14 @@ outer_smc_phi_batch <- function(
     logZ <- logZ + logZ_inc
     logZ_increments <- c(logZ_increments, logZ_inc)
 
+    # Delta-method MCSE accumulation for log evidence
     u <- exp(log_u)
+    mu1 <- sum(w * u)
+    mu2 <- sum(w * u * u)
+    Neff <- 1 / sum(w * w)
+    var_logZ_inc <- (mu2 - mu1^2) / (max(Neff, 1) * max(mu1^2, .Machine$double.eps))
+    mcse_var_accum <- mcse_var_accum + max(var_logZ_inc, 0)
+
     w <- w * u
     w <- w / sum(w)
     ess_frac <- 1 / sum(w * w) / M
@@ -464,8 +571,9 @@ outer_smc_phi_batch <- function(
         # weak dims for RW expansion in this sweep
         weak_idx_pre <- weak_dims_from_mat(phi, w, frac = 0.25, min_keep = 1L)
         pre_move <- .rejuvenate_rw_batch(phi, loglik, logprior, w, lambda_new,
-                                         caches, b_idx, logprior_phi,
+                                         caches, b_state, logprior_phi,
                                          log_prior_theta_given_phi_mat, gaussian_map_fn,
+                                         pm_mode = pm_mode,
                                          n_moves = 1L, rw_scale = 0.35,
                                          weak_dim_idx = weak_idx_pre, rw_expand_factor = 1.8,
                                          elite_mix = elite_mix_phi_pre,
@@ -476,6 +584,7 @@ outer_smc_phi_batch <- function(
         phi      <- pre_move$phi
         loglik   <- pre_move$loglik
         logprior <- pre_move$logprior
+        b_state  <- pre_move$b_state
       }
       idx <- if (resampling == "multinomial") {
         .resample_multinomial(w)
@@ -499,27 +608,43 @@ outer_smc_phi_batch <- function(
       phi      <- phi[idx, , drop = FALSE]
       loglik   <- loglik[idx]
       logprior <- logprior[idx]
+      if (is.matrix(b_state)) b_state <- b_state[idx, , drop = FALSE]
       w <- rep(1/M, M)
       resampled <- TRUE
       if (verbose) cat(sprintf("  Resampled (%s).\n", resampling))
 
       # Optional: refresh a small fraction of batch indices after resampling
       if (refresh_batches_after_resample) {
-        # All subjects share the same K? assume yes; else use ci$K per i.
-        K_all <- caches[[1]]$K
-        b_idx <- refresh_batch_indices(b_idx, K = K_all, frac = refresh_batches_frac)
-        # After changing b_idx, recompute the batch-indexed log-likelihood
-        # so that subsequent diagnostics and MH moves use a consistent baseline.
-        loglik <- apply(phi, 1L, function(p)
-          .outer_loglik_hat_batch(p, caches, b_idx,
-                                  log_prior_theta_given_phi_mat, gaussian_map_fn))
+        if (is.matrix(b_state)) {
+          ref <- .refresh_aux_state_block_mh(
+            phi = phi, loglik = loglik, b_state = b_state, lambda = lambda_new,
+            caches = caches,
+            log_prior_theta_given_phi_mat = log_prior_theta_given_phi_mat,
+            gaussian_map_fn = gaussian_map_fn,
+            frac = refresh_batches_frac,
+            rng_seed = seed + 1229L * round
+          )
+          b_state <- ref$b_state
+          loglik <- ref$loglik
+          aux_refresh_acc_hist <- c(aux_refresh_acc_hist, ref$acc_rate)
+        } else {
+          K_all <- caches[[1]]$K
+          b_state <- refresh_batch_indices(b_state, K = K_all, frac = refresh_batches_frac)
+          loglik <- .outer_loglik_hat_particles(
+            Phi = phi, caches = caches, b_state = b_state,
+            log_prior_theta_given_phi_mat = log_prior_theta_given_phi_mat,
+            gaussian_map_fn = gaussian_map_fn,
+            pm_mode = pm_mode
+          )
+        }
       }
     }
 
     # 5) Diagnostics at a probe φ (batch-aware; no model calls)
     if (diag_enable) {
       probe_phi <- .choose_probe_phi(phi, w, logprior, loglik, lambda_new, diag_probe)
-      is_df <- .is_diagnostics_batch(caches, probe_phi, b_idx, log_prior_theta_given_phi_mat)
+      probe_b <- .probe_aux_row(phi, w, logprior, loglik, lambda_new, b_state)
+      is_df <- .is_diagnostics_batch(caches, probe_phi, probe_b, log_prior_theta_given_phi_mat)
       ess_norm <- is_df$ess / is_df$M
       psis_k <- is_df$psis_k
       cat(sprintf("  [Diag] median ESS_i/M=%.2f | max k=%.2f | any ESS_i/M<0.10: %s\n",
@@ -590,8 +715,9 @@ outer_smc_phi_batch <- function(
     # 6) Rejuvenate (MH RW + independence; correlated PM via fixed b_idx inside the sweep)
     rw_scale <- exp(log_rw_scale)
     move <- .rejuvenate_rw_batch(phi, loglik, logprior, w, lambda_new,
-                                 caches, b_idx, logprior_phi,
+                                 caches, b_state, logprior_phi,
                                  log_prior_theta_given_phi_mat, gaussian_map_fn,
+                                 pm_mode = pm_mode,
                                  n_moves = n_moves_eff,
                                  rw_scale = rw_scale,
                                  weak_dim_idx = weak_idx,
@@ -605,6 +731,7 @@ outer_smc_phi_batch <- function(
     phi      <- move$phi
     loglik   <- move$loglik
     logprior <- move$logprior
+    b_state  <- move$b_state
     acc_hist <- c(acc_hist, move$acc_rate)
     # Adapt RW scale
     log_rw_scale <- .clamp(log_rw_scale + rm_gain * (move$acc_rate - target_acc),
@@ -617,6 +744,23 @@ outer_smc_phi_batch <- function(
 
     last_rw_acc <- move$rw_accept_rate
     last_id_acc <- move$indep_accept_rate
+
+    # Strict-mode auxiliary-state block refresh (MH-correct at fixed λ)
+    if (is.matrix(b_state) && block_refresh_every > 0L &&
+        (round %% as.integer(max(1L, block_refresh_every)) == 0L)) {
+      ref <- .refresh_aux_state_block_mh(
+        phi = phi, loglik = loglik, b_state = b_state, lambda = lambda_new,
+        caches = caches,
+        log_prior_theta_given_phi_mat = log_prior_theta_given_phi_mat,
+        gaussian_map_fn = gaussian_map_fn,
+        frac = block_refresh_frac,
+        rng_seed = seed + 7001L * round
+      )
+      b_state <- ref$b_state
+      loglik <- ref$loglik
+      aux_refresh_acc_hist <- c(aux_refresh_acc_hist, ref$acc_rate)
+      if (verbose) cat(sprintf("  Aux refresh acc=%.3f\n", ref$acc_rate))
+    }
 
     # update history store (keep last 6)
     if (!is.null(elite_mix_phi) && !.is_empty_mix(elite_mix_phi)) last_elite_mix_phi <- elite_mix_phi
@@ -631,7 +775,8 @@ outer_smc_phi_batch <- function(
       probe_phi <- .choose_probe_phi(phi, w, logprior, loglik, lambda_new, diag_probe)
       probe_phi_wmean <- .choose_probe_phi(phi, w, logprior, loglik, lambda_new, "wmean")
       probe_phi_best  <- .choose_probe_phi(phi, w, logprior, loglik, lambda_new, "best")
-      is_df <- .is_diagnostics_batch(caches, probe_phi, b_idx, log_prior_theta_given_phi_mat)
+      probe_b <- .probe_aux_row(phi, w, logprior, loglik, lambda_new, b_state)
+      is_df <- .is_diagnostics_batch(caches, probe_phi, probe_b, log_prior_theta_given_phi_mat)
       ess_norm <- is_df$ess / is_df$M
       psis_k <- is_df$psis_k
       bad_idx <- which( (ess_norm < auto_enrich_ess_thresh) |
@@ -650,7 +795,7 @@ outer_smc_phi_batch <- function(
           caches[[ii]] <- enrich_subject_cache_with_anchor_surgical(
             cache = caches[[ii]],
             phi_probe = probe_phi,
-            b = b_idx[ii],
+            b = probe_b[ii],
             log_prior_theta_given_phi_mat = log_prior_theta_given_phi_mat,
             gaussian_map_fn = if (!is.null(gaussian_map_fn)) function(phi, d) gaussian_map_fn(phi, d) else NULL,
             data = data_list[[ii]],
@@ -659,29 +804,48 @@ outer_smc_phi_batch <- function(
             weak_inflate_factor = weak_inflate_factor,
             elite_q = 0.4, G = 12L, cov_infl = 4.0,
             replace_frac = NULL,                      # adaptive replacement fraction
-            sobol_seed = caches[[ii]]$batches[[b_idx[ii]]]$sobol_seed + 1L,  # small shift only
+            sobol_seed = caches[[ii]]$batches[[probe_b[ii]]]$sobol_seed + 1L,  # small shift only
             n_cores = n_cores_inner,
             verbose = verbose,
             subj_id = ii,
             phi_panel = rbind(probe_phi_wmean, probe_phi_best)
           )
         }
-        # b_idx unchanged; correlation preserved for 70%+ of rows and all other batches
+        # Aux state unchanged; proposal correlation preserved.
       }
     }
 
-    loglik <- apply(phi, 1L, function(p)
-      .outer_loglik_hat_batch(p, caches, b_idx,
-                              log_prior_theta_given_phi_mat, gaussian_map_fn))
+    loglik <- .outer_loglik_hat_particles(
+      Phi = phi, caches = caches, b_state = b_state,
+      log_prior_theta_given_phi_mat = log_prior_theta_given_phi_mat,
+      gaussian_map_fn = gaussian_map_fn,
+      pm_mode = pm_mode
+    )
 
     # 8) Optional light batch-index refresh at the end of the round
     if (refresh_batches_each_round) {
-      K_all <- caches[[1]]$K
-      b_idx <- refresh_batch_indices(b_idx, K = K_all, frac = refresh_batches_frac)
-      # keep PM consistency for the next round:
-      loglik <- apply(phi, 1L, function(p)
-        .outer_loglik_hat_batch(p, caches, b_idx,
-                                log_prior_theta_given_phi_mat, gaussian_map_fn))
+      if (is.matrix(b_state)) {
+        ref <- .refresh_aux_state_block_mh(
+          phi = phi, loglik = loglik, b_state = b_state, lambda = lambda_new,
+          caches = caches,
+          log_prior_theta_given_phi_mat = log_prior_theta_given_phi_mat,
+          gaussian_map_fn = gaussian_map_fn,
+          frac = refresh_batches_frac,
+          rng_seed = seed + 9929L * round
+        )
+        b_state <- ref$b_state
+        loglik <- ref$loglik
+        aux_refresh_acc_hist <- c(aux_refresh_acc_hist, ref$acc_rate)
+      } else {
+        K_all <- caches[[1]]$K
+        b_state <- refresh_batch_indices(b_state, K = K_all, frac = refresh_batches_frac)
+        loglik <- .outer_loglik_hat_particles(
+          Phi = phi, caches = caches, b_state = b_state,
+          log_prior_theta_given_phi_mat = log_prior_theta_given_phi_mat,
+          gaussian_map_fn = gaussian_map_fn,
+          pm_mode = pm_mode
+        )
+      }
     }
 
     # Advance annealing
@@ -693,9 +857,12 @@ outer_smc_phi_batch <- function(
     phi = phi, w = w,
     loglik = loglik, logprior = logprior,
     log_evidence = logZ,
+    mcse_log_evidence = sqrt(mcse_var_accum),
     logZ_increments = logZ_increments,
-    b_idx = b_idx,
+    b_idx = if (!is.matrix(b_state)) b_state else NULL,
+    B_idx = if (is.matrix(b_state)) b_state else NULL,
     meta = list(
+      pm_mode = pm_mode,
       lambda_hist = lambda_hist,
       acc_hist = acc_hist,
       rw_scale_final = exp(log_rw_scale),
@@ -703,6 +870,9 @@ outer_smc_phi_batch <- function(
       refresh_batches_after_resample = refresh_batches_after_resample,
       refresh_batches_each_round = refresh_batches_each_round,
       refresh_batches_frac = refresh_batches_frac,
+      block_refresh_every = block_refresh_every,
+      block_refresh_frac = block_refresh_frac,
+      aux_refresh_acc_hist = aux_refresh_acc_hist,
       n_cores_inner = n_cores_inner
     )
   )
