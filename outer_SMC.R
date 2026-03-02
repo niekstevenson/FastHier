@@ -145,6 +145,322 @@ suppressPackageStartupMessages({
   list(b_state = b_state, loglik = loglik, acc_rate = nacc / max(N, 1L))
 }
 
+# ------------------------ Adaptive PM aux-state API ----------------------
+init_pm_aux_state <- function(M_particles, S_subjects, seed = 123L, M_default = 128L,
+                              pm_mode = c("strict", "fast")) {
+  pm_mode <- match.arg(pm_mode)
+  set.seed(as.integer(seed))
+  if (length(M_default) == 1L) M_default <- rep(as.integer(M_default), S_subjects)
+  M_default <- as.integer(M_default)
+  if (length(M_default) != S_subjects) stop("M_default must be scalar or length S_subjects.")
+
+  if (pm_mode == "strict") {
+    list(
+      seed = matrix(sample.int(.Machine$integer.max, M_particles * S_subjects, replace = TRUE),
+                    nrow = M_particles, ncol = S_subjects),
+      M_alloc = matrix(rep(M_default, each = M_particles), nrow = M_particles, ncol = S_subjects),
+      mode = pm_mode
+    )
+  } else {
+    list(
+      seed = as.integer(sample.int(.Machine$integer.max, S_subjects, replace = TRUE)),
+      M_alloc = as.integer(M_default),
+      mode = pm_mode
+    )
+  }
+}
+
+refresh_pm_aux_state <- function(aux_state, frac = 0.05, seed = NULL) {
+  frac <- .clamp(as.numeric(frac), 0, 1)
+  if (frac <= 0) return(aux_state)
+  if (!is.null(seed)) set.seed(as.integer(seed))
+
+  if (is.matrix(aux_state$seed)) {
+    n <- length(aux_state$seed)
+    R <- as.integer(max(1L, ceiling(frac * n)))
+    idx <- sample.int(n, R)
+    aux_state$seed[idx] <- sample.int(.Machine$integer.max, R, replace = TRUE)
+  } else {
+    n <- length(aux_state$seed)
+    R <- as.integer(max(1L, ceiling(frac * n)))
+    idx <- sample.int(n, R)
+    aux_state$seed[idx] <- sample.int(.Machine$integer.max, R, replace = TRUE)
+  }
+  aux_state
+}
+
+.pm_aux_subset <- function(aux_state, idx, pm_mode = c("strict", "fast")) {
+  pm_mode <- match.arg(pm_mode)
+  if (pm_mode == "strict") {
+    list(
+      seed = aux_state$seed[idx, , drop = FALSE],
+      M_alloc = aux_state$M_alloc[idx, , drop = FALSE],
+      mode = "strict"
+    )
+  } else {
+    aux_state
+  }
+}
+
+.pm_aux_probe_row <- function(phi, w, logprior, loglik, lambda, aux_state, pm_mode = c("strict", "fast")) {
+  pm_mode <- match.arg(pm_mode)
+  if (pm_mode == "fast") return(aux_state)
+  idx <- which.max(logprior + lambda * loglik)
+  list(
+    seed = aux_state$seed[idx, ],
+    M_alloc = aux_state$M_alloc[idx, ],
+    mode = "fast"
+  )
+}
+
+.pm_aux_apply_subject_M <- function(aux_state, subject_M, pm_mode = c("strict", "fast")) {
+  pm_mode <- match.arg(pm_mode)
+  subject_M <- as.integer(subject_M)
+  if (pm_mode == "strict") {
+    aux_state$M_alloc <- matrix(rep(subject_M, each = nrow(aux_state$M_alloc)),
+                                nrow = nrow(aux_state$M_alloc), ncol = ncol(aux_state$M_alloc))
+  } else {
+    aux_state$M_alloc <- subject_M
+  }
+  aux_state
+}
+
+.adaptive_pm_callbacks <- function(log_prior_theta_given_phi_mat = NULL, gaussian_map_fn = NULL,
+                                   rtheta_given_phi = NULL, data_list = NULL, loglik_fn = NULL) {
+  list(
+    log_prior_theta_given_phi_mat = log_prior_theta_given_phi_mat,
+    gaussian_map_fn = gaussian_map_fn,
+    rtheta_given_phi = rtheta_given_phi,
+    data_list = data_list,
+    loglik_fn = loglik_fn
+  )
+}
+
+.outer_loglik_hat_particles_adaptive_pm <- function(Phi, surrogates, aux_state, callbacks,
+                                                    control = list(),
+                                                    pm_mode = c("strict", "fast"),
+                                                    M_override = NULL) {
+  pm_mode <- match.arg(pm_mode)
+  Phi <- as.matrix(Phi)
+  N <- nrow(Phi)
+  S <- length(surrogates)
+  out <- numeric(N)
+  if (N <= 0L) return(out)
+
+  for (i in seq_len(N)) {
+    s <- 0.0
+    for (j in seq_len(S)) {
+      aux_ij <- if (pm_mode == "strict") {
+        list(seed = aux_state$seed[i, j], M = aux_state$M_alloc[i, j])
+      } else {
+        list(seed = aux_state$seed[j], M = aux_state$M_alloc[j])
+      }
+      cb <- callbacks
+      cb$data_i <- callbacks$data_list[[j]]
+      est <- estimate_log_marginal_subject_pm(
+        phi = Phi[i, , drop = TRUE],
+        surrogate = surrogates[[j]],
+        callbacks = cb,
+        aux_state_i = aux_ij,
+        control = modifyList(control, list(M_override = M_override))
+      )
+      s <- s + est$log_mhat
+    }
+    out[i] <- s
+  }
+  out
+}
+
+.adaptive_pm_probe_subject_diag <- function(phi_row, surrogates, aux_probe, callbacks, control = list()) {
+  S <- length(surrogates)
+  rows <- vector("list", S)
+  for (j in seq_len(S)) {
+    cb <- callbacks
+    cb$data_i <- callbacks$data_list[[j]]
+    aux_j <- list(seed = aux_probe$seed[j], M = aux_probe$M_alloc[j])
+    est <- estimate_log_marginal_subject_pm(
+      phi = phi_row,
+      surrogate = surrogates[[j]],
+      callbacks = cb,
+      aux_state_i = aux_j,
+      control = control
+    )
+    rows[[j]] <- data.frame(
+      i = j,
+      log_mhat = est$log_mhat,
+      ess_norm = est$ess_norm,
+      khat = est$khat,
+      var_proxy = est$var_proxy,
+      M_used = est$M_used,
+      stringsAsFactors = FALSE
+    )
+  }
+  do.call(rbind, rows)
+}
+
+.adaptive_pm_update_subject_M <- function(subject_M, subject_diag, control = list()) {
+  ctl <- modifyList(
+    list(
+      M_levels = c(64L, 128L, 256L, 512L),
+      ess_norm_threshold = 0.15,
+      khat_threshold = 0.80,
+      var_log_target_low = 0.30,
+      var_log_target_high = 1.00,
+      var_relax_ess = 0.35,
+      decrease_enabled = TRUE
+    ),
+    control
+  )
+  levels <- sort(unique(as.integer(ctl$M_levels)))
+  cur <- as.integer(subject_M)
+  out <- cur
+  for (j in seq_along(cur)) {
+    row <- subject_diag[subject_diag$i == j, , drop = FALSE]
+    if (!nrow(row)) next
+    ess_j <- as.numeric(row$ess_norm[1L])
+    kh_j <- as.numeric(row$khat[1L])
+    var_j <- as.numeric(row$var_proxy[1L])
+
+    pos <- which(levels <= cur[j])
+    pos <- if (length(pos)) max(pos) else 1L
+
+    bad <- (!is.finite(var_j) || var_j > ctl$var_log_target_high) ||
+      (is.finite(ess_j) && ess_j < ctl$ess_norm_threshold) ||
+      (is.finite(kh_j) && kh_j > ctl$khat_threshold)
+    if (bad) {
+      jump <- if (!is.finite(var_j) || (is.finite(var_j) && var_j > 2 * ctl$var_log_target_high)) 2L else 1L
+      pos_new <- min(length(levels), pos + jump)
+      out[j] <- levels[pos_new]
+      next
+    }
+
+    if (isTRUE(ctl$decrease_enabled)) {
+      low_var <- is.finite(var_j) && var_j < ctl$var_log_target_low
+      strong_ess <- is.finite(ess_j) && ess_j > ctl$var_relax_ess
+      ok_k <- !is.finite(kh_j) || kh_j < 0.60
+      if (low_var && strong_ess && ok_k) {
+        pos_new <- max(1L, pos - 1L)
+        out[j] <- levels[pos_new]
+      }
+    }
+  }
+  out
+}
+
+.rejuvenate_rw_adaptive_pm <- function(phi, loglik, logprior, w, lambda,
+                                       surrogates, aux_state, logprior_phi, callbacks,
+                                       control = list(),
+                                       pm_mode = c("strict", "fast"),
+                                       n_moves = 2L,
+                                       rw_scale = 1.0,
+                                       rng_seed = NULL) {
+  pm_mode <- match.arg(pm_mode)
+  if (!is.null(rng_seed)) set.seed(as.integer(rng_seed))
+  N <- nrow(phi)
+  d <- ncol(phi)
+
+  ctl <- modifyList(
+    list(
+      da_enable = FALSE,
+      da_M = 32L
+    ),
+    control
+  )
+
+  S <- weighted_cov(phi, w)
+  S <- as.matrix(Matrix::nearPD(S, conv.tol = 1e-7)$mat)
+  diag(S) <- pmax(diag(S), 1e-8)
+  ev <- eigen(S, symmetric = TRUE)
+  lamv <- pmax(ev$values, 1e-8)
+  Sprop <- ev$vectors %*% diag(lamv, d) %*% t(ev$vectors)
+  L <- tryCatch(chol(Sprop + diag(1e-8, d)), error = function(e) chol(Sprop + diag(1e-6, d)))
+  step <- (rw_scale / sqrt(max(d, 1))) * L
+
+  accepted <- 0L
+  nprop <- 0L
+
+  for (m in seq_len(n_moves)) {
+    Z <- matrix(rnorm(N * d), N, d)
+    prop <- phi + Z %*% t(step)
+    lp_prop <- apply(prop, 1L, logprior_phi)
+
+    if (isTRUE(ctl$da_enable)) {
+      ll1_curr <- .outer_loglik_hat_particles_adaptive_pm(
+        Phi = phi,
+        surrogates = surrogates,
+        aux_state = aux_state,
+        callbacks = callbacks,
+        control = control,
+        pm_mode = pm_mode,
+        M_override = as.integer(ctl$da_M)
+      )
+      ll1_prop <- .outer_loglik_hat_particles_adaptive_pm(
+        Phi = prop,
+        surrogates = surrogates,
+        aux_state = aux_state,
+        callbacks = callbacks,
+        control = control,
+        pm_mode = pm_mode,
+        M_override = as.integer(ctl$da_M)
+      )
+      loga1 <- (lp_prop - logprior) + lambda * (ll1_prop - ll1_curr)
+      u1 <- log(runif(N))
+      pass1 <- (u1 < pmin(0, loga1))
+      if (any(pass1)) {
+        idx <- which(pass1)
+        ll_prop_full <- .outer_loglik_hat_particles_adaptive_pm(
+          Phi = prop[idx, , drop = FALSE],
+          surrogates = surrogates,
+          aux_state = .pm_aux_subset(aux_state, idx, pm_mode = pm_mode),
+          callbacks = callbacks,
+          control = control,
+          pm_mode = pm_mode,
+          M_override = NULL
+        )
+        loga2 <- lambda * ((ll_prop_full - loglik[idx]) - (ll1_prop[idx] - ll1_curr[idx]))
+        u2 <- log(runif(length(idx)))
+        acc_idx <- idx[which(u2 < pmin(0, loga2))]
+        if (length(acc_idx)) {
+          phi[acc_idx, ] <- prop[acc_idx, , drop = FALSE]
+          logprior[acc_idx] <- lp_prop[acc_idx]
+          loglik[acc_idx] <- ll_prop_full[match(acc_idx, idx)]
+          accepted <- accepted + length(acc_idx)
+        }
+      }
+      nprop <- nprop + N
+    } else {
+      ll_prop <- .outer_loglik_hat_particles_adaptive_pm(
+        Phi = prop,
+        surrogates = surrogates,
+        aux_state = aux_state,
+        callbacks = callbacks,
+        control = control,
+        pm_mode = pm_mode
+      )
+      loga <- (lp_prop - logprior) + lambda * (ll_prop - loglik)
+      u <- log(runif(N))
+      acc <- (u < pmin(0, loga))
+      if (any(acc)) {
+        phi[acc, ] <- prop[acc, , drop = FALSE]
+        logprior[acc] <- lp_prop[acc]
+        loglik[acc] <- ll_prop[acc]
+        accepted <- accepted + sum(acc)
+      }
+      nprop <- nprop + N
+    }
+  }
+
+  list(
+    phi = phi,
+    loglik = loglik,
+    logprior = logprior,
+    aux_state = aux_state,
+    acc_rate = accepted / max(1L, nprop),
+    rw_accept_rate = accepted / max(1L, nprop),
+    indep_accept_rate = NA_real_
+  )
+}
+
 # --------------- Per-subject IS diagnostics at a given φ ----------------
 .cache_logw_at_phi_batch <- function(cache, phi_row, b,
                                      log_prior_theta_given_phi_mat = NULL) {
@@ -369,6 +685,459 @@ if (!exists("refresh_batch_indices", mode = "function")) {
        indep_accept_rate = if (nprop_id>0) nacc_id/nprop_id else NA_real_)
 }
 
+.outer_smc_phi_batch_adaptive_pm <- function(
+    surrogates,
+    rprior_phi,
+    logprior_phi,
+    log_prior_theta_given_phi_mat = NULL,
+    gaussian_map_fn = NULL,
+    rtheta_given_phi = NULL,
+    data_list = NULL,
+    loglik_fn = NULL,
+    M = 2000L,
+    cess_target = 0.95,
+    resample_threshold = 0.5,
+    resampling = c("systematic", "multinomial"),
+    n_moves = 2L,
+    rw_scale_init = 1.2,
+    pm_mode = c("strict", "fast"),
+    pm_aux_mode = c("rng_stream", "batch_idx"),
+    adaptive_pm_control = list(),
+    max_rounds = 200L,
+    refresh_batches_after_resample = FALSE,
+    refresh_batches_each_round = FALSE,
+    refresh_batches_frac = 0.02,
+    block_refresh_every = 5L,
+    block_refresh_frac = 0.10,
+    diag_enable = TRUE,
+    diag_probe = c("wmean", "best"),
+    collect_round_diagnostics = FALSE,
+    seed = 123,
+    verbose = TRUE
+) {
+  resampling <- match.arg(resampling)
+  diag_probe <- match.arg(diag_probe)
+  pm_mode <- match.arg(pm_mode)
+  pm_aux_mode <- match.arg(pm_aux_mode)
+  if (pm_aux_mode != "rng_stream" && verbose) {
+    message("[adaptive_pm] pm_aux_mode='", pm_aux_mode, "' requested; using RNG streams in adaptive PM mode.")
+  }
+  set.seed(as.integer(seed))
+  t_start <- proc.time()[3]
+
+  S <- length(surrogates)
+  if (S <= 0) stop("Empty 'surrogates' list.")
+  if (is.null(data_list) || is.null(loglik_fn)) {
+    stop("adaptive_pm mode requires data_list and loglik_fn.")
+  }
+  if (length(data_list) != S) {
+    stop("length(data_list) must equal number of surrogates S = ", S)
+  }
+  for (i in seq_len(S)) {
+    if (!inherits(surrogates[[i]], "subject_surrogate_pm")) {
+      stop("adaptive_pm mode expects surrogates of class 'subject_surrogate_pm'.")
+    }
+  }
+  if (is.null(gaussian_map_fn) && is.null(log_prior_theta_given_phi_mat)) {
+    stop("Provide either gaussian_map_fn or log_prior_theta_given_phi_mat.")
+  }
+  if (is.null(gaussian_map_fn) && is.null(rtheta_given_phi)) {
+    stop("adaptive_pm strict mode requires rtheta_given_phi or gaussian_map_fn.")
+  }
+
+  ctl <- modifyList(
+    list(
+      M_default = 128L,
+      initial_subject_M = NULL,
+      M_levels = c(64L, 128L, 256L, 512L),
+      ess_norm_threshold = 0.15,
+      khat_threshold = 0.80,
+      var_log_target_low = 0.30,
+      var_log_target_high = 1.00,
+      var_relax_ess = 0.35,
+      decrease_enabled = TRUE,
+      M_update_every = 1L,
+      adapt_until_round = Inf,
+      freeze_after_round = Inf,
+      da_enable = (pm_mode == "strict"),
+      da_M = 32L,
+      max_retries = 2L,
+      min_log_mhat = -1e12,
+      completion_mode = "default",  # "default" uses max_rounds; "lambda1" ignores max_rounds
+      max_wall_time_sec = Inf,      # watchdog (seconds), active for both completion modes
+      checkpoint_enable = FALSE,
+      checkpoint_path = NULL,
+      checkpoint_every_rounds = 5L,
+      checkpoint_include_state = FALSE
+    ),
+    adaptive_pm_control
+  )
+  completion_mode <- match.arg(as.character(ctl$completion_mode), c("default", "lambda1"))
+  max_wall_time_sec <- as.numeric(ctl$max_wall_time_sec)
+  if (!is.finite(max_wall_time_sec) || max_wall_time_sec <= 0) max_wall_time_sec <- Inf
+
+  adapt_until_round <- suppressWarnings(as.integer(ctl$adapt_until_round))
+  if (!is.finite(adapt_until_round) || is.na(adapt_until_round) || adapt_until_round < 1L) {
+    adapt_until_round <- .Machine$integer.max
+  }
+  freeze_after_round <- suppressWarnings(as.integer(ctl$freeze_after_round))
+  if (is.finite(freeze_after_round) && !is.na(freeze_after_round) && freeze_after_round >= 1L) {
+    adapt_until_round <- min(adapt_until_round, freeze_after_round)
+  }
+
+  if (!is.null(ctl$initial_subject_M)) {
+    init_M <- as.integer(ctl$initial_subject_M)
+    if (length(init_M) != S) {
+      stop("adaptive_pm_control$initial_subject_M must be length S (", S, ").")
+    }
+    subject_M <- pmax(16L, init_M)
+  } else {
+    subject_M <- rep(as.integer(ctl$M_default), S)
+  }
+  callbacks <- .adaptive_pm_callbacks(
+    log_prior_theta_given_phi_mat = log_prior_theta_given_phi_mat,
+    gaussian_map_fn = gaussian_map_fn,
+    rtheta_given_phi = rtheta_given_phi,
+    data_list = data_list,
+    loglik_fn = loglik_fn
+  )
+
+  aux_state <- init_pm_aux_state(
+    M_particles = as.integer(M),
+    S_subjects = S,
+    seed = as.integer(seed + 4049L),
+    M_default = subject_M,
+    pm_mode = pm_mode
+  )
+
+  phi <- rprior_phi(M)
+  if (!is.matrix(phi)) phi <- matrix(phi, nrow = M)
+  logprior <- apply(phi, 1L, logprior_phi)
+  loglik <- .outer_loglik_hat_particles_adaptive_pm(
+    Phi = phi,
+    surrogates = surrogates,
+    aux_state = aux_state,
+    callbacks = callbacks,
+    control = ctl,
+    pm_mode = pm_mode
+  )
+  if (!all(is.finite(logprior))) stop("Non-finite log prior at initialization (adaptive_pm).")
+  if (!all(is.finite(loglik))) stop("Non-finite inner likelihood at initialization (adaptive_pm).")
+
+  lambda <- 0.0
+  w <- rep(1 / M, M)
+  logZ <- 0.0
+  logZ_increments <- numeric()
+  mcse_var_accum <- 0.0
+
+  target_acc <- 0.234
+  log_rw_scale <- log(rw_scale_init)
+  rm_gain <- 0.05
+  lambda_hist <- lambda
+  acc_hist <- numeric()
+  round <- 0L
+  round_diag <- list()
+  termination_reason <- NA_character_
+  lambda_target_reached <- FALSE
+
+  .adaptive_pm_checkpoint <- function(tag = "round") {
+    if (!isTRUE(ctl$checkpoint_enable)) return(invisible(NULL))
+    path <- as.character(ctl$checkpoint_path %||% "")
+    if (!nzchar(path)) return(invisible(NULL))
+    ck <- list(
+      tag = tag,
+      timestamp = Sys.time(),
+      seed = as.integer(seed),
+      pm_mode = pm_mode,
+      completion_mode = completion_mode,
+      max_wall_time_sec = max_wall_time_sec,
+      round = as.integer(round),
+      lambda = as.numeric(lambda),
+      log_evidence = as.numeric(logZ),
+      mcse_log_evidence = sqrt(mcse_var_accum),
+      subject_M = as.integer(subject_M)
+    )
+    if (isTRUE(ctl$checkpoint_include_state)) {
+      ck$state <- list(
+        phi = phi,
+        w = w,
+        loglik = loglik,
+        logprior = logprior,
+        aux_state = aux_state,
+        log_rw_scale = as.numeric(log_rw_scale),
+        lambda_hist = lambda_hist,
+        acc_hist = acc_hist
+      )
+    }
+    tryCatch(
+      saveRDS(ck, path),
+      error = function(e) {
+        if (isTRUE(verbose)) message("[adaptive_pm] checkpoint write failed: ", conditionMessage(e))
+      }
+    )
+    invisible(NULL)
+  }
+
+  while (lambda < 1 - 1e-12 &&
+         (completion_mode == "lambda1" || round < max_rounds)) {
+    if ((proc.time()[3] - t_start) >= max_wall_time_sec) {
+      termination_reason <- "max_wall_time"
+      if (isTRUE(verbose)) cat("\n[adaptive_pm] stopping at watchdog limit (max_wall_time_sec).\n")
+      break
+    }
+    round <- round + 1L
+    t_round_start <- proc.time()[3]
+    if (verbose) cat(sprintf("\n[Round %d] λ=%.3f  ", round, lambda))
+
+    h <- loglik
+    target_cess <- cess_target_at_lambda(lambda)
+    delta <- next_lambda_via_rCESS_stat(w, h, lambda, target = target_cess) - lambda
+    if (!is.finite(delta)) delta <- min(1 - lambda, 1e-4)
+    if (delta <= 1e-8) delta <- min(1 - lambda, 1e-4)
+    lambda_new <- min(1.0, lambda + delta)
+
+    m <- max(h)
+    log_u <- delta * (h - m)
+    logZ_inc <- logsumexp_w(log_u, w) + delta * m
+    logZ <- logZ + logZ_inc
+    logZ_increments <- c(logZ_increments, logZ_inc)
+
+    u <- exp(log_u)
+    mu1 <- sum(w * u)
+    mu2 <- sum(w * u * u)
+    Neff <- 1 / sum(w * w)
+    var_logZ_inc <- (mu2 - mu1^2) / (max(Neff, 1) * max(mu1^2, .Machine$double.eps))
+    mcse_var_accum <- mcse_var_accum + max(var_logZ_inc, 0)
+
+    w <- w * u
+    w <- w / sum(w)
+    ess_frac <- 1 / sum(w * w) / M
+    if (verbose) cat(sprintf("Δ=%.4f | ESS/N=%.3f | logZ+=%.4f\n", delta, ess_frac, logZ_inc))
+
+    if (ess_frac < resample_threshold) {
+      idx <- if (resampling == "multinomial") .resample_multinomial(w) else {
+        set.seed(seed + 991 * round)
+        mu_phi <- colSums(phi * w)
+        Xc <- sweep(phi, 2L, mu_phi, `-`)
+        Sphi <- weighted_cov(phi, w)
+        Sphi <- as.matrix(Matrix::nearPD(Sphi, conv.tol = 1e-7)$mat)
+        diag(Sphi) <- pmax(diag(Sphi), 1e-10)
+        R <- tryCatch(chol(Sphi), error = function(e) chol(Sphi + diag(1e-8, ncol(Sphi))))
+        Zphi <- t(backsolve(R, t(Xc), transpose = TRUE))
+        ord_h <- hilbert_sort_order(Zphi, bits = 16L)
+        ws <- w[ord_h]
+        sel_sorted <- stratified_resample_sorted(ws, deterministic = FALSE)
+        ord_h[sel_sorted]
+      }
+      phi <- phi[idx, , drop = FALSE]
+      loglik <- loglik[idx]
+      logprior <- logprior[idx]
+      if (pm_mode == "strict") {
+        aux_state$seed <- aux_state$seed[idx, , drop = FALSE]
+        aux_state$M_alloc <- aux_state$M_alloc[idx, , drop = FALSE]
+      }
+      w <- rep(1 / M, M)
+      if (verbose) cat(sprintf("  Resampled (%s).\n", resampling))
+
+      if (refresh_batches_after_resample) {
+        aux_state <- refresh_pm_aux_state(
+          aux_state,
+          frac = refresh_batches_frac,
+          seed = as.integer(seed + 1229L * round)
+        )
+        loglik <- .outer_loglik_hat_particles_adaptive_pm(
+          Phi = phi,
+          surrogates = surrogates,
+          aux_state = aux_state,
+          callbacks = callbacks,
+          control = ctl,
+          pm_mode = pm_mode
+        )
+      }
+    }
+
+    diag_median_ess_norm <- NA_real_
+    diag_max_psis_k <- NA_real_
+    diag_median_var_proxy <- NA_real_
+    diag_sum_sd2 <- NA_real_
+    diag_n_offenders <- NA_integer_
+    need_m_update <- (round <= adapt_until_round) &&
+      (round %% as.integer(max(1L, ctl$M_update_every)) == 0L)
+    need_probe <- isTRUE(diag_enable) || need_m_update
+    sdiag <- NULL
+    if (need_probe) {
+      probe_phi <- .choose_probe_phi(phi, w, logprior, loglik, lambda_new, diag_probe)
+      probe_aux <- .pm_aux_probe_row(phi, w, logprior, loglik, lambda_new, aux_state, pm_mode)
+      sdiag <- .adaptive_pm_probe_subject_diag(probe_phi, surrogates, probe_aux, callbacks, ctl)
+      if (is.data.frame(sdiag) && nrow(sdiag) > 0L) {
+        diag_median_ess_norm <- suppressWarnings(stats::median(sdiag$ess_norm, na.rm = TRUE))
+        diag_max_psis_k <- suppressWarnings(max(sdiag$khat, na.rm = TRUE))
+        diag_median_var_proxy <- suppressWarnings(
+          stats::median(sdiag$var_proxy[is.finite(sdiag$var_proxy)], na.rm = TRUE)
+        )
+        diag_sum_sd2 <- suppressWarnings(sum(sdiag$var_proxy[is.finite(sdiag$var_proxy)]))
+        bad <- which((is.finite(sdiag$ess_norm) & sdiag$ess_norm < ctl$ess_norm_threshold) |
+                       (is.finite(sdiag$khat) & sdiag$khat > ctl$khat_threshold) |
+                       (!is.finite(sdiag$var_proxy) | sdiag$var_proxy > ctl$var_log_target_high))
+        diag_n_offenders <- as.integer(length(bad))
+      }
+      if (isTRUE(diag_enable) && verbose) {
+        cat(sprintf("  [AdaptivePM] median ESS_i/M=%.2f | median var=%.2f | max k=%.2f | offenders=%d\n",
+                    diag_median_ess_norm, diag_median_var_proxy, diag_max_psis_k, diag_n_offenders))
+      }
+      if (need_m_update && is.data.frame(sdiag) && nrow(sdiag) > 0L) {
+        subject_M_new <- as.integer(.adaptive_pm_update_subject_M(subject_M, sdiag, ctl))
+        if (length(subject_M_new) == length(subject_M) && any(subject_M_new != subject_M)) {
+          subject_M <- subject_M_new
+          aux_state <- .pm_aux_apply_subject_M(aux_state, subject_M, pm_mode = pm_mode)
+          # Keep MH target consistent after changing the PM estimator definition.
+          loglik <- .outer_loglik_hat_particles_adaptive_pm(
+            Phi = phi,
+            surrogates = surrogates,
+            aux_state = aux_state,
+            callbacks = callbacks,
+            control = ctl,
+            pm_mode = pm_mode
+          )
+        } else {
+          subject_M <- subject_M_new
+        }
+      }
+    }
+
+    move <- .rejuvenate_rw_adaptive_pm(
+      phi = phi,
+      loglik = loglik,
+      logprior = logprior,
+      w = w,
+      lambda = lambda_new,
+      surrogates = surrogates,
+      aux_state = aux_state,
+      logprior_phi = logprior_phi,
+      callbacks = callbacks,
+      control = ctl,
+      pm_mode = pm_mode,
+      n_moves = n_moves,
+      rw_scale = exp(log_rw_scale),
+      rng_seed = as.integer(seed + 97L * round)
+    )
+    phi <- move$phi
+    loglik <- move$loglik
+    logprior <- move$logprior
+    aux_state <- move$aux_state
+    acc_hist <- c(acc_hist, move$acc_rate)
+    log_rw_scale <- .clamp(log_rw_scale + rm_gain * (move$acc_rate - target_acc), log(0.05), log(2.5))
+    if (verbose) {
+      cat(sprintf("  MH acc=%.3f | rw_scale=%.3f\n", move$acc_rate, exp(log_rw_scale)))
+    }
+
+    if (refresh_batches_each_round) {
+      aux_state <- refresh_pm_aux_state(
+        aux_state,
+        frac = refresh_batches_frac,
+        seed = as.integer(seed + 9929L * round)
+      )
+      loglik <- .outer_loglik_hat_particles_adaptive_pm(
+        Phi = phi,
+        surrogates = surrogates,
+        aux_state = aux_state,
+        callbacks = callbacks,
+        control = ctl,
+        pm_mode = pm_mode
+      )
+    }
+
+    if (pm_mode == "strict" && block_refresh_every > 0L &&
+        (round %% as.integer(max(1L, block_refresh_every)) == 0L)) {
+      aux_state <- refresh_pm_aux_state(
+        aux_state,
+        frac = block_refresh_frac,
+        seed = as.integer(seed + 7001L * round)
+      )
+      loglik <- .outer_loglik_hat_particles_adaptive_pm(
+        Phi = phi,
+        surrogates = surrogates,
+        aux_state = aux_state,
+        callbacks = callbacks,
+        control = ctl,
+        pm_mode = pm_mode
+      )
+    }
+
+    lambda <- lambda_new
+    lambda_hist <- c(lambda_hist, lambda)
+
+    if (isTRUE(ctl$checkpoint_enable) &&
+        isTRUE(round %% as.integer(max(1L, ctl$checkpoint_every_rounds)) == 0L)) {
+      .adaptive_pm_checkpoint(tag = "round")
+    }
+
+    if (isTRUE(collect_round_diagnostics)) {
+      round_diag[[length(round_diag) + 1L]] <- list(
+        round = round,
+        elapsed_sec = as.numeric(proc.time()[3] - t_round_start),
+        lambda = lambda,
+        delta = delta,
+        ess_frac = ess_frac,
+        logZ_inc = logZ_inc,
+        mh_acc = move$acc_rate,
+        diag_median_ess_norm = diag_median_ess_norm,
+        diag_median_var_proxy = diag_median_var_proxy,
+        diag_max_psis_k = diag_max_psis_k,
+        diag_sum_sd2 = diag_sum_sd2,
+        diag_n_offenders = diag_n_offenders
+      )
+    }
+  }
+
+  if (lambda >= 1 - 1e-12) {
+    lambda_target_reached <- TRUE
+    if (is.na(termination_reason)) termination_reason <- "lambda_reached"
+  } else if (is.na(termination_reason)) {
+    termination_reason <- if (completion_mode == "default" && round >= max_rounds) "max_rounds" else "stopped_early"
+  }
+  .adaptive_pm_checkpoint(tag = paste0("final_", termination_reason))
+
+  list(
+    phi = phi,
+    w = w,
+    loglik = loglik,
+    logprior = logprior,
+    log_evidence = logZ,
+    mcse_log_evidence = sqrt(mcse_var_accum),
+    logZ_increments = logZ_increments,
+    b_idx = NULL,
+    B_idx = NULL,
+    aux_state = aux_state,
+    meta = list(
+      pm_mode = pm_mode,
+      pm_aux_mode = "rng_stream",
+      inner_ll_mode = "adaptive_pm",
+      lambda_hist = lambda_hist,
+      acc_hist = acc_hist,
+      rw_scale_final = exp(log_rw_scale),
+      resampling = resampling,
+      refresh_batches_after_resample = refresh_batches_after_resample,
+      refresh_batches_each_round = refresh_batches_each_round,
+      refresh_batches_frac = refresh_batches_frac,
+      block_refresh_every = block_refresh_every,
+      block_refresh_frac = block_refresh_frac,
+      subject_M_final = subject_M,
+      adaptive_pm_control = ctl,
+      adapt_until_round = as.integer(adapt_until_round),
+      completion_mode = completion_mode,
+      max_wall_time_sec = max_wall_time_sec,
+      completion_reason = termination_reason,
+      lambda_target_reached = lambda_target_reached,
+      rounds_completed = as.integer(round),
+      checkpoint_enable = isTRUE(ctl$checkpoint_enable),
+      checkpoint_path = ctl$checkpoint_path %||% NULL,
+      elapsed_sec = as.numeric(proc.time()[3] - t_start),
+      round_diagnostics = round_diag
+    )
+  )
+}
+
 # ------------------------------- Outer SMC -------------------------------
 outer_smc_phi_batch <- function(
     caches,                                  # list of subject caches (length S)
@@ -378,6 +1147,7 @@ outer_smc_phi_batch <- function(
     log_prior_theta_given_phi_mat = NULL,    # function(Theta, phi, aux) -> length M_b
     # Or provide the Gaussian fast-path mapper:
     gaussian_map_fn = NULL,                  # function(phi, dθ) -> list(mu, Sigma_inv, logdet, const)
+    rtheta_given_phi = NULL,                 # optional draw callback: function(phi, n, aux=NULL)
     # --- NEW: needed for enrichment / cache rebuilds ---
     data_list = NULL,                        # list of per-subject data (length S)
     loglik_fn = NULL,                        # function(Theta_block, data_i) -> vector log p(y_i|θ)
@@ -389,6 +1159,9 @@ outer_smc_phi_batch <- function(
     n_moves = 2L,
     rw_scale_init = 1.3,
     pm_mode = c("strict", "fast"),
+    inner_ll_mode = c("fixed_cache", "adaptive_pm"),
+    pm_aux_mode = c("batch_idx", "rng_stream"),
+    adaptive_pm_control = list(),
     # Independence mixture kernel (new)
     indep_prob = 0.30,
     indep_t_df = 4L,
@@ -422,6 +1195,7 @@ outer_smc_phi_batch <- function(
     auto_enrich_max_units  = 2L,     # ### PATCH: safer default
     eps_prior_anchor = 0.03,         # ### PATCH: base; will adapt per-batch
     weak_inflate_factor = 3.0,       # ### PATCH: toned down
+    collect_round_diagnostics = FALSE,
     # Seeding
     seed = 123,
     verbose = TRUE
@@ -429,7 +1203,44 @@ outer_smc_phi_batch <- function(
   resampling <- match.arg(resampling)
   diag_probe <- match.arg(diag_probe)
   pm_mode <- match.arg(pm_mode)
+  inner_ll_mode <- match.arg(inner_ll_mode)
+  pm_aux_mode <- match.arg(pm_aux_mode)
+
+  if (inner_ll_mode == "adaptive_pm") {
+    return(.outer_smc_phi_batch_adaptive_pm(
+      surrogates = caches,
+      rprior_phi = rprior_phi,
+      logprior_phi = logprior_phi,
+      log_prior_theta_given_phi_mat = log_prior_theta_given_phi_mat,
+      gaussian_map_fn = gaussian_map_fn,
+      rtheta_given_phi = rtheta_given_phi,
+      data_list = data_list,
+      loglik_fn = loglik_fn,
+      M = M,
+      cess_target = cess_target,
+      resample_threshold = resample_threshold,
+      resampling = resampling,
+      n_moves = n_moves,
+      rw_scale_init = rw_scale_init,
+      pm_mode = pm_mode,
+      pm_aux_mode = pm_aux_mode,
+      adaptive_pm_control = adaptive_pm_control,
+      max_rounds = max_rounds,
+      refresh_batches_after_resample = refresh_batches_after_resample,
+      refresh_batches_each_round = refresh_batches_each_round,
+      refresh_batches_frac = refresh_batches_frac,
+      block_refresh_every = block_refresh_every,
+      block_refresh_frac = block_refresh_frac,
+      diag_enable = diag_enable,
+      diag_probe = diag_probe,
+      collect_round_diagnostics = collect_round_diagnostics,
+      seed = seed,
+      verbose = verbose
+    ))
+  }
+
   set.seed(seed)
+  t_start <- proc.time()[3]
 
   S <- length(caches)
   if (S <= 0) stop("Empty 'caches' list.")
@@ -515,6 +1326,7 @@ outer_smc_phi_batch <- function(
   moves_cap <- 8L
   while (lambda < 1 - 1e-12 && round < max_rounds) {
     round <- round + 1L
+    t_round_start <- proc.time()[3]
     if (verbose) cat(sprintf("\n[Round %d] λ=%.3f  ", round, lambda))
 
     # 2) Choose δ via rCESS (from smc_core)
@@ -661,6 +1473,7 @@ outer_smc_phi_batch <- function(
         # --- NEW: variance budget log (Fix #4)
         sum_sd2 <- sum(rsd[is.finite(rsd)]^2)
         cat(sprintf("  [VarBudget] sum_i SD_over_batches(logZ_i)^2 = %.3f (target ≈ 1–2)\n", sum_sd2))
+        diag_sum_sd2 <- sum_sd2
       }
       # --- NEW: print top offenders (Fix #4)
       bad_idx <- which( (ess_norm < auto_enrich_ess_thresh) |
@@ -672,6 +1485,9 @@ outer_smc_phi_batch <- function(
         msg <- paste(sprintf("#%d ESS/M=%.2f k=%.2f", show, ess_norm[show], psis_k[show]), collapse = " | ")
         cat("  [Diag] Offenders:", msg, "\n")
       }
+      diag_median_ess_norm <- stats::median(ess_norm, na.rm = TRUE)
+      diag_max_psis_k <- if (all(is.na(psis_k))) NA_real_ else max(psis_k, na.rm = TRUE)
+      diag_n_offenders <- length(bad_idx)
     }
 
     # Build elite mixture on φ for independence proposals (with tiny base mass)
@@ -851,6 +1667,25 @@ outer_smc_phi_batch <- function(
     # Advance annealing
     lambda <- lambda_new
     lambda_hist <- c(lambda_hist, lambda)
+
+    if (isTRUE(collect_round_diagnostics)) {
+      rd <- list(
+        round = round,
+        elapsed_sec = as.numeric(proc.time()[3] - t_round_start),
+        lambda = lambda,
+        delta = delta,
+        ess_frac = ess_frac,
+        logZ_inc = logZ_inc,
+        mh_acc = move$acc_rate,
+        rw_acc = move$rw_accept_rate %||% NA_real_,
+        indep_acc = move$indep_accept_rate %||% NA_real_,
+        diag_median_ess_norm = diag_median_ess_norm,
+        diag_max_psis_k = diag_max_psis_k,
+        diag_sum_sd2 = diag_sum_sd2,
+        diag_n_offenders = diag_n_offenders
+      )
+      diag_list[[length(diag_list) + 1L]] <- rd
+    }
   }
 
   list(
@@ -873,7 +1708,9 @@ outer_smc_phi_batch <- function(
       block_refresh_every = block_refresh_every,
       block_refresh_frac = block_refresh_frac,
       aux_refresh_acc_hist = aux_refresh_acc_hist,
-      n_cores_inner = n_cores_inner
+      n_cores_inner = n_cores_inner,
+      elapsed_sec = as.numeric(proc.time()[3] - t_start),
+      round_diagnostics = diag_list
     )
   )
 }
@@ -1025,3 +1862,7 @@ outer_smc_direct <- function(
     )
   )
 }
+    diag_median_ess_norm <- NA_real_
+    diag_max_psis_k <- NA_real_
+    diag_sum_sd2 <- NA_real_
+    diag_n_offenders <- 0L

@@ -1438,11 +1438,23 @@ enhanced_smc_elite <- function(data, loglik_fn, mu_ref, Sigma_ref,
     cov_inflation_eff <- max(4.0, 3.0 + 2.0 * (1 - lambda))   # Keep minimum 4.0 late in annealing
     # (2,4) Early rounds: broaden elite/history mixtures (+25% inflation before λ≈0.3)
     if (lambda < 0.30) cov_inflation_eff <- cov_inflation_eff * 1.25
-    elite_mix <- fit_elite_mixture_Z(Z, w_fit, elite_quantile = elite_q_eff, G = G_eff,
-                              cov_inflation = cov_inflation_eff, warm_start_mixZ = last_elite_mix,
-                                     em_itmax = 8, housekeeping = TRUE, min_G_keep = 2,
-                                     merge_thresh = merge_thresh_eff, verbose = FALSE,
-                                     lambda = lambda)  # Pass lambda to control min eigenvalue
+    elite_mix <- tryCatch(
+      fit_elite_mixture_Z(Z, w_fit, elite_quantile = elite_q_eff, G = G_eff,
+                          cov_inflation = cov_inflation_eff, warm_start_mixZ = last_elite_mix,
+                          em_itmax = 8, housekeeping = TRUE, min_G_keep = 2,
+                          merge_thresh = merge_thresh_eff, verbose = FALSE,
+                          lambda = lambda),  # Pass lambda to control min eigenvalue
+      error = function(e) NULL
+    )
+    if (is.null(elite_mix) || .is_empty_mix(elite_mix)) {
+      mu <- colSums(Z * w_fit)
+      Zc <- sweep(Z, 2L, mu, `-`)
+      Sig <- t(Zc) %*% (Zc * w_fit)
+      Sig <- as.matrix((Sig + t(Sig)) / 2)
+      Sig <- as.matrix(Matrix::nearPD(Sig, conv.tol = 1e-7)$mat)
+      elite_mix <- list(meansZ = list(as.numeric(mu)), covsZ = list(Sig), wZ = 1)
+      elite_mix$cache <- prep_mix_cache(elite_mix$meansZ, elite_mix$covsZ, elite_mix$wZ)
+    }
     last_elite_mix <- elite_mix
 
     # History mixture
