@@ -701,6 +701,159 @@ build_subject_surrogate_from_outer <- function(
   )
 }
 
+.normalize_working_prior_gaussian <- function(working_prior, d_theta = NULL) {
+  if (is.null(working_prior)) stop("working_prior must not be NULL.")
+  mu <- as.numeric(working_prior$mu %||% working_prior$mean)
+  if (!length(mu)) stop("working_prior must contain 'mu' or 'mean'.")
+  if (!is.null(d_theta) && length(mu) != d_theta) {
+    stop("working_prior mean length does not match d_theta.")
+  }
+
+  Sigma <- working_prior$Sigma
+  Sigma_inv <- working_prior$Sigma_inv
+  if (is.null(Sigma) && is.null(Sigma_inv)) {
+    stop("working_prior must contain either 'Sigma' or 'Sigma_inv'.")
+  }
+
+  if (is.null(Sigma)) {
+    Sigma_inv <- as.matrix(Sigma_inv)
+    L <- tryCatch(chol(Sigma_inv), error = function(e) NULL)
+    if (is.null(L)) stop("working_prior$Sigma_inv is not SPD.")
+    Sigma <- chol2inv(L)
+  } else {
+    Sigma <- .regularize_cov_safe(Sigma)
+  }
+
+  if (is.null(Sigma_inv)) {
+    L <- tryCatch(chol(Sigma), error = function(e) NULL)
+    if (is.null(L)) stop("working_prior$Sigma is not SPD.")
+    Sigma_inv <- chol2inv(L)
+  } else {
+    Sigma_inv <- as.matrix(Sigma_inv)
+  }
+
+  logdet <- as.numeric(working_prior$logdet %||% determinant(Sigma, logarithm = TRUE)$modulus)
+  structure(
+    list(
+      mu = mu,
+      Sigma = Sigma,
+      Sigma_inv = Sigma_inv,
+      logdet = logdet,
+      phi_anchor = working_prior$phi_anchor %||% NULL
+    ),
+    class = "working_prior_gaussian"
+  )
+}
+
+.draw_from_working_prior_gaussian <- function(n, working_prior) {
+  wp <- .normalize_working_prior_gaussian(working_prior)
+  mvtnorm::rmvnorm(as.integer(n), mean = wp$mu, sigma = wp$Sigma)
+}
+
+log_working_prior_gaussian_mat <- function(Theta, working_prior) {
+  wp <- .normalize_working_prior_gaussian(working_prior, d_theta = ncol(as.matrix(Theta)))
+  .log_prior_gauss_mat(Theta, wp)
+}
+
+build_subject_exact_local_from_outer <- function(
+    smc_out,
+    data = NULL,
+    subj_id = NA_integer_,
+    loglik_fn = NULL,
+    working_prior = NULL,
+    base_seed = NULL,
+    ...
+) {
+  surrogate <- build_subject_surrogate_from_outer(
+    smc_out = smc_out,
+    data = data,
+    subj_id = subj_id,
+    loglik_fn = loglik_fn,
+    base_seed = base_seed,
+    ...
+  )
+  working_prior_use <- working_prior %||% smc_out$working_prior
+  if (is.null(working_prior_use)) {
+    stop("build_subject_exact_local_from_outer requires a working_prior or smc_out$working_prior.")
+  }
+  wp <- .normalize_working_prior_gaussian(working_prior_use, d_theta = surrogate$d_theta)
+
+  structure(
+    list(
+      subj_id = as.integer(subj_id),
+      surrogate = surrogate,
+      working_prior = wp,
+      data = data %||% surrogate$data,
+      loglik_fn = loglik_fn %||% surrogate$loglik_fn,
+      base_seed = as.integer(base_seed %||% surrogate$base_seed),
+      d_theta = surrogate$d_theta,
+      outer_theta = as.matrix(smc_out$Theta),
+      outer_w = {
+        w <- pmax(as.numeric(smc_out$w), 0)
+        sw <- sum(w)
+        if (!is.finite(sw) || sw <= 0) rep(1 / nrow(as.matrix(smc_out$Theta)), nrow(as.matrix(smc_out$Theta))) else w / sw
+      }
+    ),
+    class = "subject_exact_local"
+  )
+}
+
+make_theta_proposal_exact_init <- function(local_obj, init_ctl = list()) {
+  stopifnot(inherits(local_obj, "subject_exact_local"))
+  ctl <- modifyList(
+    list(
+      w_local = 0.90,
+      w_phi_anchor = 0.00,
+      w_defensive = 0.10,
+      defensive_df = 3L,
+      anchor_n = 32L,
+      anchor_cov_inflation = 1.0
+    ),
+    init_ctl
+  )
+  callbacks <- list(
+    rtheta_given_phi = function(phi, n, aux = NULL) {
+      .draw_from_working_prior_gaussian(n, local_obj$working_prior)
+    }
+  )
+  phi_stub <- local_obj$working_prior$phi_anchor %||% local_obj$working_prior$mu
+  make_theta_proposal_adaptive(
+    phi = phi_stub,
+    surrogate = local_obj$surrogate,
+    adaptive_pm_control = ctl,
+    callbacks = callbacks
+  )
+}
+
+make_theta_proposal_exact_refresh <- function(phi, local_obj, refresh_ctl = list(), callbacks = list()) {
+  stopifnot(inherits(local_obj, "subject_exact_local"))
+  ctl <- modifyList(
+    list(
+      w_local = 0.60,
+      w_phi_anchor = 0.30,
+      w_defensive = 0.10,
+      defensive_df = 3L,
+      anchor_n = 96L,
+      anchor_cov_inflation = 1.5
+    ),
+    refresh_ctl
+  )
+  cb <- modifyList(
+    list(
+      rtheta_given_phi = function(phi, n, aux = NULL) {
+        .draw_from_working_prior_gaussian(n, local_obj$working_prior)
+      }
+    ),
+    callbacks
+  )
+  make_theta_proposal_adaptive(
+    phi = phi,
+    surrogate = local_obj$surrogate,
+    adaptive_pm_control = ctl,
+    callbacks = cb
+  )
+}
+
 make_theta_proposal_adaptive <- function(phi, surrogate, adaptive_pm_control = list(), callbacks = list()) {
   stopifnot(inherits(surrogate, "subject_surrogate_pm"))
   ctl <- modifyList(

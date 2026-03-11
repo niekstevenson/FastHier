@@ -1138,6 +1138,609 @@ if (!exists("refresh_batch_indices", mode = "function")) {
   )
 }
 
+materialize_alpha_from_indices <- function(alpha_bank, index_mat) {
+  alpha_bank <- as.matrix(alpha_bank)
+  index_mat <- as.matrix(index_mat)
+  N <- nrow(index_mat)
+  S <- ncol(index_mat)
+  d <- ncol(alpha_bank)
+  out <- array(NA_real_, dim = c(N, S, d))
+  for (i in seq_len(S)) {
+    out[, i, ] <- alpha_bank[index_mat[, i], , drop = FALSE]
+  }
+  out
+}
+
+refresh_alpha_indices_exact <- function(index_mat, n_bank, frac = 0.10, seed = NULL) {
+  if (!is.null(seed)) set.seed(as.integer(seed))
+  index_mat <- as.matrix(index_mat)
+  frac <- .clamp(as.numeric(frac), 0, 1)
+  if (frac <= 0) return(index_mat)
+  N <- nrow(index_mat)
+  S <- ncol(index_mat)
+  R <- max(1L, ceiling(frac * S))
+  for (n in seq_len(N)) {
+    idx <- sample.int(S, R)
+    index_mat[n, idx] <- sample.int(as.integer(n_bank), length(idx), replace = TRUE)
+  }
+  index_mat
+}
+
+compute_alpha_suff_stats <- function(alpha_state, X_list = NULL) {
+  alpha_state <- array(alpha_state, dim = dim(alpha_state))
+  d <- dim(alpha_state)[3L]
+  if (!is.null(X_list)) {
+    stop("compute_alpha_suff_stats only supports intercept-only form in the current skeleton.")
+  }
+  sum_alpha <- apply(alpha_state, c(1L, 3L), sum)
+  if (!is.matrix(sum_alpha)) sum_alpha <- matrix(sum_alpha, ncol = d)
+  N <- dim(alpha_state)[1L]
+  sum_cross <- array(0, dim = c(N, d, d))
+  for (n in seq_len(N)) {
+    A <- alpha_state[n, , , drop = FALSE]
+    A <- matrix(A, ncol = d)
+    sum_cross[n, , ] <- crossprod(A)
+  }
+  list(sum_alpha = sum_alpha, sum_cross = sum_cross, d = d, n_particles = N)
+}
+
+update_alpha_suff_stats_one <- function(stats_obj, alpha_old, alpha_new, x_i = NULL) {
+  if (!is.null(x_i)) {
+    stop("update_alpha_suff_stats_one only supports intercept-only form in the current skeleton.")
+  }
+  alpha_old <- as.numeric(alpha_old)
+  alpha_new <- as.numeric(alpha_new)
+  if (!all(c("sum_alpha", "sum_cross") %in% names(stats_obj))) {
+    stop("stats_obj must contain sum_alpha and sum_cross.")
+  }
+  stats_obj$sum_alpha <- stats_obj$sum_alpha + (alpha_new - alpha_old)
+  stats_obj$sum_cross <- stats_obj$sum_cross +
+    tcrossprod(alpha_new) - tcrossprod(alpha_old)
+  stats_obj
+}
+
+log_tempered_hier_contrib <- function(phi_row, alpha_mat, beta, gaussian_map_fn, working_priors) {
+  alpha_mat <- as.matrix(alpha_mat)
+  S <- nrow(alpha_mat)
+  if (length(working_priors) != S) {
+    stop("length(working_priors) must match nrow(alpha_mat).")
+  }
+  pars <- gaussian_map_fn(phi_row, ncol(alpha_mat))
+  lp_phi <- .log_prior_gauss_mat(alpha_mat, pars)
+  lp_g <- numeric(S)
+  for (i in seq_len(S)) {
+    lp_g[i] <- log_working_prior_gaussian_mat(alpha_mat[i, , drop = FALSE], working_priors[[i]])
+  }
+  sum((1 - beta) * lp_g + beta * lp_phi)
+}
+
+.log_alpha_given_phi_sum_mat <- function(Phi, alpha_state, gaussian_map_fn) {
+  Phi <- as.matrix(Phi)
+  N <- nrow(Phi)
+  d_theta <- dim(alpha_state)[3L]
+  out <- numeric(N)
+  for (n in seq_len(N)) {
+    pars <- gaussian_map_fn(Phi[n, , drop = TRUE], d_theta)
+    A <- matrix(alpha_state[n, , , drop = FALSE], ncol = d_theta)
+    out[n] <- sum(.log_prior_gauss_mat(A, pars))
+  }
+  out
+}
+
+init_extended_exact_particles <- function(local_objs, phi_particles, phi_anchor = NULL, init_ctl = list()) {
+  phi_particles <- as.matrix(phi_particles)
+  N <- nrow(phi_particles)
+  S <- length(local_objs)
+  if (S <= 0L) stop("local_objs must not be empty.")
+  d_theta <- local_objs[[1L]]$d_theta
+  ctl <- modifyList(
+    list(
+      seed = NULL,
+      mode = "surrogate_is",
+      proposal_control = list()
+    ),
+    init_ctl
+  )
+  if (!is.null(ctl$seed)) set.seed(as.integer(ctl$seed))
+  init_mode <- match.arg(
+    as.character(ctl$mode),
+    c("surrogate_is", "outer_resample")
+  )
+  use_init_is_weights <- identical(init_mode, "surrogate_is")
+
+  alpha_state <- array(NA_real_, dim = c(N, S, d_theta))
+  subject_loglik <- matrix(NA_real_, nrow = N, ncol = S)
+  subject_logg <- matrix(NA_real_, nrow = N, ncol = S)
+  subject_logq <- matrix(NA_real_, nrow = N, ncol = S)
+
+  for (j in seq_len(S)) {
+    loc <- local_objs[[j]]
+    seed_j <- as.integer((ctl$seed %||% loc$base_seed) + 1049L * j)
+    prop <- NULL
+    if (identical(init_mode, "surrogate_is")) {
+      prop <- make_theta_proposal_exact_init(loc, init_ctl = ctl$proposal_control)
+      Theta_j <- prop$draw(N, seed = seed_j)
+      Theta_j <- as.matrix(Theta_j)
+      if (nrow(Theta_j) != N) stop("Initialization proposal returned wrong number of draws.")
+    } else {
+      set.seed(seed_j)
+      idx <- sample.int(nrow(loc$outer_theta), size = N, replace = TRUE, prob = loc$outer_w)
+      Theta_j <- as.matrix(loc$outer_theta[idx, , drop = FALSE])
+    }
+    alpha_state[, j, ] <- Theta_j
+    subject_loglik[, j] <- ll_parallel(Theta_j, loc$data, loc$loglik_fn, n_cores = 1L)
+    subject_logg[, j] <- log_working_prior_gaussian_mat(Theta_j, loc$working_prior)
+    if (identical(init_mode, "surrogate_is")) {
+      subject_logq[, j] <- prop$log_q(Theta_j)
+    } else {
+      subject_logq[, j] <- 0
+    }
+  }
+
+  if (use_init_is_weights) {
+    logw_init <- rowSums(subject_loglik + subject_logg - subject_logq)
+    lw_shift <- logw_init - max(logw_init)
+    w <- exp(lw_shift)
+    w <- w / sum(w)
+  } else {
+    logw_init <- rep(0, N)
+    w <- rep(1 / N, N)
+  }
+  ess_init <- 1 / sum(w * w)
+  ess_init_frac <- ess_init / max(N, 1L)
+  max_weight_init <- max(w)
+
+  list(
+    alpha_state = alpha_state,
+    subject_loglik = subject_loglik,
+    subject_logg = subject_logg,
+    subject_logq = subject_logq,
+    log_weight = logw_init,
+    w = w,
+    init_mode = init_mode,
+    ess_init = as.numeric(ess_init),
+    ess_init_frac = as.numeric(ess_init_frac),
+    max_weight_init = as.numeric(max_weight_init),
+    suff_stats = compute_alpha_suff_stats(alpha_state),
+    n_exact_loglik_init = as.integer(N * S),
+    phi_anchor = phi_anchor
+  )
+}
+
+rejuvenate_phi_given_alpha_exact <- function(phi, alpha_state, logprior, w, lambda,
+                                             logprior_phi, gaussian_map_fn,
+                                             rw_scale = 1.0,
+                                             n_moves = 2L,
+                                             log_alpha_given_phi_sum = NULL,
+                                             rng_seed = NULL) {
+  if (!is.null(rng_seed)) set.seed(as.integer(rng_seed))
+  phi <- as.matrix(phi)
+  N <- nrow(phi)
+  d <- ncol(phi)
+  if (is.null(log_alpha_given_phi_sum)) {
+    log_alpha_given_phi_sum <- .log_alpha_given_phi_sum_mat(phi, alpha_state, gaussian_map_fn)
+  }
+
+  S <- tryCatch(weighted_cov(phi, w), error = function(e) stats::cov(phi))
+  S <- as.matrix(Matrix::nearPD(S, conv.tol = 1e-7)$mat)
+  diag(S) <- pmax(diag(S), 1e-8)
+  L <- tryCatch(
+    chol((rw_scale^2 / max(d, 1L)) * S + diag(1e-10, d)),
+    error = function(e) chol((rw_scale^2 / max(d, 1L)) * (S + diag(1e-6, d)))
+  )
+
+  accepted <- 0L
+  for (mv in seq_len(n_moves)) {
+    prop <- phi + matrix(rnorm(N * d), N, d) %*% L
+    lp_prop <- apply(prop, 1L, logprior_phi)
+    loga_prop <- .log_alpha_given_phi_sum_mat(prop, alpha_state, gaussian_map_fn)
+    loga <- (lp_prop - logprior) + lambda * (loga_prop - log_alpha_given_phi_sum)
+    loga[!is.finite(loga)] <- -Inf
+    acc <- log(runif(N)) < pmin(0, loga)
+    if (any(acc)) {
+      phi[acc, ] <- prop[acc, , drop = FALSE]
+      logprior[acc] <- lp_prop[acc]
+      log_alpha_given_phi_sum[acc] <- loga_prop[acc]
+      accepted <- accepted + sum(acc)
+    }
+  }
+
+  list(
+    phi = phi,
+    logprior = logprior,
+    log_alpha_given_phi_sum = log_alpha_given_phi_sum,
+    acc_rate = accepted / max(1L, N * n_moves)
+  )
+}
+
+refresh_alpha_block_exact <- function(phi, alpha_state, local_objs, beta,
+                                      refresh_frac = 0.05,
+                                      delayed_accept = TRUE,
+                                      refresh_ctl = list(),
+                                      subject_loglik = NULL,
+                                      subject_logg = NULL,
+                                      gaussian_map_fn = NULL,
+                                      seed = NULL) {
+  if (!is.null(seed)) set.seed(as.integer(seed))
+  phi <- as.matrix(phi)
+  N <- nrow(phi)
+  S <- length(local_objs)
+  d_theta <- dim(alpha_state)[3L]
+  R <- max(1L, ceiling(.clamp(as.numeric(refresh_frac), 0, 1) * S))
+
+  if (is.null(subject_loglik)) subject_loglik <- matrix(NA_real_, nrow = N, ncol = S)
+  if (is.null(subject_logg)) subject_logg <- matrix(NA_real_, nrow = N, ncol = S)
+
+  n_screen_pass <- 0L
+  n_final_acc <- 0L
+  n_exact_loglik <- 0L
+
+  for (n in seq_len(N)) {
+    subj_idx <- sample.int(S, R)
+    pars_n <- if (!is.null(gaussian_map_fn)) gaussian_map_fn(phi[n, , drop = TRUE], d_theta) else NULL
+    for (j in subj_idx) {
+      loc <- local_objs[[j]]
+      curr <- matrix(alpha_state[n, j, ], nrow = 1L)
+      if (!is.finite(subject_loglik[n, j])) {
+        subject_loglik[n, j] <- ll_parallel(curr, loc$data, loc$loglik_fn, n_cores = 1L)
+      }
+      if (!is.finite(subject_logg[n, j])) {
+        subject_logg[n, j] <- log_working_prior_gaussian_mat(curr, loc$working_prior)
+      }
+
+      prop <- make_theta_proposal_exact_refresh(
+        phi = phi[n, , drop = TRUE],
+        local_obj = loc,
+        refresh_ctl = refresh_ctl,
+        callbacks = list(gaussian_map_fn = gaussian_map_fn)
+      )
+      cand <- prop$draw(1L, seed = as.integer((seed %||% loc$base_seed) + 1009L * n + 31L * j))
+      cand <- as.matrix(cand)
+      q_curr <- prop$log_q(curr)
+      q_cand <- prop$log_q(cand)
+      logg_curr <- subject_logg[n, j]
+      logg_cand <- log_working_prior_gaussian_mat(cand, loc$working_prior)
+
+      if (is.null(pars_n)) {
+        stop("refresh_alpha_block_exact requires gaussian_map_fn in the current skeleton.")
+      }
+      logp_curr <- .log_prior_gauss_mat(curr, pars_n)
+      logp_cand <- .log_prior_gauss_mat(cand, pars_n)
+
+      screen_loga <- (1 - beta) * (logg_cand - logg_curr) +
+        beta * (logp_cand - logp_curr) +
+        (q_curr - q_cand)
+
+      if (!delayed_accept) {
+        loglik_cand <- ll_parallel(cand, loc$data, loc$loglik_fn, n_cores = 1L)
+        n_exact_loglik <- n_exact_loglik + 1L
+        full_loga <- screen_loga + (loglik_cand - subject_loglik[n, j])
+        if (is.finite(full_loga) && log(runif(1L)) < min(0, full_loga)) {
+          alpha_state[n, j, ] <- cand[1L, ]
+          subject_loglik[n, j] <- loglik_cand
+          subject_logg[n, j] <- logg_cand
+          n_final_acc <- n_final_acc + 1L
+        }
+        next
+      }
+
+      if (!is.finite(screen_loga) || log(runif(1L)) >= min(0, screen_loga)) next
+      n_screen_pass <- n_screen_pass + 1L
+
+      loglik_cand <- ll_parallel(cand, loc$data, loc$loglik_fn, n_cores = 1L)
+      n_exact_loglik <- n_exact_loglik + 1L
+      final_loga <- loglik_cand - subject_loglik[n, j]
+      if (is.finite(final_loga) && log(runif(1L)) < min(0, final_loga)) {
+        alpha_state[n, j, ] <- cand[1L, ]
+        subject_loglik[n, j] <- loglik_cand
+        subject_logg[n, j] <- logg_cand
+        n_final_acc <- n_final_acc + 1L
+      }
+    }
+  }
+
+  list(
+    alpha_state = alpha_state,
+    subject_loglik = subject_loglik,
+    subject_logg = subject_logg,
+    n_refresh = as.integer(N * R),
+    n_screen_pass = as.integer(n_screen_pass),
+    n_final_accept = as.integer(n_final_acc),
+    n_exact_loglik = as.integer(n_exact_loglik)
+  )
+}
+
+outer_smc_phi_extended_exact <- function(
+    local_objs,
+    rprior_phi,
+    logprior_phi,
+    gaussian_map_fn,
+    data_list = NULL,
+    loglik_fn = NULL,
+    M = 1200L,
+    cess_target = 0.95,
+    resample_threshold = 0.5,
+    resampling = c("systematic", "multinomial"),
+    n_moves = 2L,
+    rw_scale_init = 1.2,
+    max_rounds = 200L,
+    refresh_frac = 0.05,
+    delayed_accept = TRUE,
+    init_control = list(),
+    seed = 123L,
+    verbose = TRUE
+) {
+  resampling <- match.arg(resampling)
+  set.seed(as.integer(seed))
+  if (!length(local_objs)) stop("local_objs must not be empty.")
+  if (!all(vapply(local_objs, inherits, logical(1), what = "subject_exact_local"))) {
+    stop("outer_smc_phi_extended_exact expects local_objs of class 'subject_exact_local'.")
+  }
+
+  init_ctl <- modifyList(
+    list(
+      mode = "surrogate_is",
+      phi_mode = "prior",
+      phi_center = NULL,
+      phi_sd = NULL,
+      proposal_control = list()
+    ),
+    init_control
+  )
+  phi_mode <- match.arg(as.character(init_ctl$phi_mode), c("prior", "centered"))
+  logq_phi <- NULL
+  if (identical(phi_mode, "centered")) {
+    center <- as.numeric(init_ctl$phi_center)
+    if (!length(center)) stop("init_control$phi_center must be provided when phi_mode='centered'.")
+    d_phi <- length(center)
+    sd_phi <- as.numeric(init_ctl$phi_sd %||% rep(0.10, d_phi))
+    if (length(sd_phi) == 1L) sd_phi <- rep(sd_phi, d_phi)
+    phi <- matrix(rnorm(M * d_phi), nrow = M, ncol = d_phi)
+    phi <- sweep(phi, 2L, sd_phi, `*`)
+    phi <- sweep(phi, 2L, center, `+`)
+    logq_phi <- Reduce(
+      `+`,
+      lapply(seq_len(d_phi), function(j) {
+        stats::dnorm(phi[, j], mean = center[j], sd = sd_phi[j], log = TRUE)
+      })
+    )
+  } else {
+    phi <- rprior_phi(M)
+  }
+  if (!is.matrix(phi)) phi <- matrix(phi, nrow = M)
+  init <- init_extended_exact_particles(
+    local_objs = local_objs,
+    phi_particles = phi,
+    init_ctl = modifyList(
+      init_ctl,
+      list(seed = as.integer(seed + 101L))
+    )
+  )
+
+  alpha_state <- init$alpha_state
+  subject_loglik <- init$subject_loglik
+  subject_logg <- init$subject_logg
+  logprior <- apply(phi, 1L, logprior_phi)
+  log_alpha_given_phi_sum <- .log_alpha_given_phi_sum_mat(phi, alpha_state, gaussian_map_fn)
+  logg_sum <- rowSums(subject_logg)
+
+  logw_init <- init$log_weight
+  if (!is.null(logq_phi)) {
+    logw_init <- logw_init + (logprior - logq_phi)
+  }
+  logw <- logw_init - max(logw_init)
+  w <- exp(logw)
+  w <- w / sum(w)
+  ess_init <- 1 / sum(w * w)
+  ess_init_frac <- ess_init / max(M, 1L)
+  max_weight_init <- max(w)
+  logZ <- logsumexp(logw_init) - log(M)
+  lambda <- 0.0
+  lambda_hist <- lambda
+  acc_hist <- numeric()
+  ess_hist <- numeric()
+  logZ_increments <- numeric()
+  log_rw_scale <- log(rw_scale_init)
+  round_diag <- list()
+    total_exact_loglik <- as.integer(init$n_exact_loglik_init)
+  init_diag <- list(
+      init_mode = init$init_mode,
+      phi_mode = phi_mode,
+      ess_init = as.numeric(ess_init),
+      ess_init_frac = as.numeric(ess_init_frac),
+      max_weight_init = as.numeric(max_weight_init),
+      n_exact_loglik_init = as.integer(init$n_exact_loglik_init)
+    )
+
+  round <- 0L
+  while (lambda < 1 - 1e-12 && round < max_rounds) {
+    round <- round + 1L
+    target_cess <- cess_target_at_lambda(lambda)
+
+    # Match the maintained outer SMC paths: normalize/repair weights before
+    # solving the next tempering step, because rCESS is defined on normalized w.
+    w[!is.finite(w) | w < 0] <- 0
+    sw <- sum(w)
+    if (!is.finite(sw) || sw <= 0) {
+      w <- rep(1 / M, M)
+    } else {
+      w <- w / sw
+    }
+
+    h <- log_alpha_given_phi_sum - logg_sum
+    if (!all(is.finite(h))) {
+      bad <- !is.finite(h)
+      finite_h <- h[!bad]
+      if (!length(finite_h)) stop("All X1 tempering statistics are non-finite; cannot continue.")
+      h[bad] <- min(finite_h)
+    }
+
+    lambda_new <- min(
+      next_lambda_via_rCESS_stat(w, h, lambda, target = target_cess),
+      1.0
+    )
+    if (!is.finite(lambda_new) || lambda_new <= lambda) {
+      delta <- min(1 - lambda, 1e-4)
+      lambda_new <- lambda + delta
+    } else {
+      delta <- lambda_new - lambda
+    }
+
+    m <- max(h)
+    log_u <- delta * (h - m)
+    logZ_inc <- logsumexp_w(log_u, w) + delta * m
+    logZ <- logZ + logZ_inc
+    logZ_increments <- c(logZ_increments, logZ_inc)
+
+    logw_new_raw <- log(pmax(w, .Machine$double.eps)) + log_u
+    lse_new <- logsumexp(logw_new_raw)
+    if (!is.finite(lse_new)) {
+      w <- rep(1 / M, M)
+    } else {
+      logw_new <- logw_new_raw - lse_new
+      w <- exp(logw_new)
+      sw <- sum(w)
+      if (!all(is.finite(w)) || !is.finite(sw) || sw <= 0) {
+        w <- rep(1 / M, M)
+      } else {
+        w <- w / sw
+      }
+    }
+    ess_frac <- (1 / sum(w * w)) / M
+    ess_hist <- c(ess_hist, ess_frac)
+    if (verbose) {
+      cat(sprintf("[ExtendedExact Round %d] lambda %.4f -> %.4f | ESS/N=%.3f | logZ+=%.4f\n",
+                  round, lambda, lambda_new, ess_frac, logZ_inc))
+    }
+
+    if (ess_frac < resample_threshold) {
+      idx <- if (resampling == "multinomial") {
+        sample.int(M, size = M, replace = TRUE, prob = w)
+      } else {
+        stratified_resample_sorted(w, deterministic = FALSE)
+      }
+      phi <- phi[idx, , drop = FALSE]
+      alpha_state <- alpha_state[idx, , , drop = FALSE]
+      subject_loglik <- subject_loglik[idx, , drop = FALSE]
+      subject_logg <- subject_logg[idx, , drop = FALSE]
+      logprior <- logprior[idx]
+      log_alpha_given_phi_sum <- log_alpha_given_phi_sum[idx]
+      logg_sum <- logg_sum[idx]
+      w <- rep(1 / M, M)
+    }
+
+    move <- rejuvenate_phi_given_alpha_exact(
+      phi = phi,
+      alpha_state = alpha_state,
+      logprior = logprior,
+      w = w,
+      lambda = lambda_new,
+      logprior_phi = logprior_phi,
+      gaussian_map_fn = gaussian_map_fn,
+      rw_scale = exp(log_rw_scale),
+      n_moves = n_moves,
+      log_alpha_given_phi_sum = log_alpha_given_phi_sum,
+      rng_seed = as.integer(seed + 97L * round)
+    )
+    phi <- move$phi
+    logprior <- move$logprior
+    log_alpha_given_phi_sum <- move$log_alpha_given_phi_sum
+    acc_hist <- c(acc_hist, move$acc_rate)
+    log_rw_scale <- .clamp(log_rw_scale + 0.05 * (move$acc_rate - 0.234), log(0.05), log(2.5))
+
+    refresh <- refresh_alpha_block_exact(
+      phi = phi,
+      alpha_state = alpha_state,
+      local_objs = local_objs,
+      beta = lambda_new,
+      refresh_frac = refresh_frac,
+      delayed_accept = delayed_accept,
+      refresh_ctl = list(),
+      subject_loglik = subject_loglik,
+      subject_logg = subject_logg,
+      gaussian_map_fn = gaussian_map_fn,
+      seed = as.integer(seed + 701L * round)
+    )
+    alpha_state <- refresh$alpha_state
+    subject_loglik <- refresh$subject_loglik
+    subject_logg <- refresh$subject_logg
+    logg_sum <- rowSums(subject_logg)
+    log_alpha_given_phi_sum <- .log_alpha_given_phi_sum_mat(phi, alpha_state, gaussian_map_fn)
+    total_exact_loglik <- total_exact_loglik + refresh$n_exact_loglik
+
+    lambda <- lambda_new
+    lambda_hist <- c(lambda_hist, lambda)
+    screen_pass_rate <- refresh$n_screen_pass / max(refresh$n_refresh, 1L)
+    final_accept_rate <- refresh$n_final_accept / max(refresh$n_refresh, 1L)
+    final_accept_given_screen <- refresh$n_final_accept / max(refresh$n_screen_pass, 1L)
+    exact_loglik_rate <- refresh$n_exact_loglik / max(refresh$n_refresh, 1L)
+    round_diag[[length(round_diag) + 1L]] <- list(
+      round = round,
+      lambda = lambda,
+      delta = delta,
+      target_cess = target_cess,
+      ess_frac = ess_frac,
+      logZ_inc = logZ_inc,
+      phi_acc = move$acc_rate,
+      n_refresh = refresh$n_refresh,
+      n_screen_pass = refresh$n_screen_pass,
+      n_final_accept = refresh$n_final_accept,
+      n_exact_loglik = refresh$n_exact_loglik,
+      da_screen_pass_rate = screen_pass_rate,
+      da_final_accept_rate = final_accept_rate,
+      da_final_accept_given_screen = final_accept_given_screen,
+      exact_loglik_rate = exact_loglik_rate
+    )
+  }
+
+  da_screen_pass_rate_mean <- if (length(round_diag)) {
+    mean(vapply(round_diag, `[[`, numeric(1), "da_screen_pass_rate"))
+  } else {
+    NA_real_
+  }
+  da_final_accept_rate_mean <- if (length(round_diag)) {
+    mean(vapply(round_diag, `[[`, numeric(1), "da_final_accept_rate"))
+  } else {
+    NA_real_
+  }
+  da_final_accept_given_screen_mean <- if (length(round_diag)) {
+    mean(vapply(round_diag, `[[`, numeric(1), "da_final_accept_given_screen"))
+  } else {
+    NA_real_
+  }
+
+  list(
+    phi = phi,
+    w = w,
+    alpha_state = alpha_state,
+    subject_loglik = subject_loglik,
+    logprior = logprior,
+    log_alpha_given_phi_sum = log_alpha_given_phi_sum,
+    log_evidence = logZ,
+    mcse_log_evidence = NA_real_,
+    logZ_increments = logZ_increments,
+    meta = list(
+      inner_ll_mode = "extended_exact",
+      lambda_hist = lambda_hist,
+      ess_hist = ess_hist,
+      acc_hist = acc_hist,
+      rw_scale_final = exp(log_rw_scale),
+      final_lambda = lambda,
+      lambda_final = lambda,
+      rounds = round,
+      rounds_completed = as.integer(round),
+      init_diagnostics = init_diag,
+      exact_loglik_calls = total_exact_loglik,
+      refresh_frac = refresh_frac,
+      delayed_accept = delayed_accept,
+      da_screen_pass_rate_mean = da_screen_pass_rate_mean,
+      da_final_accept_rate_mean = da_final_accept_rate_mean,
+      da_final_accept_given_screen_mean = da_final_accept_given_screen_mean,
+      round_diagnostics = round_diag
+    )
+  )
+}
+
 # ------------------------------- Outer SMC -------------------------------
 outer_smc_phi_batch <- function(
     caches,                                  # list of subject caches (length S)

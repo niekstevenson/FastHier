@@ -161,7 +161,10 @@ fit_copula_transform <- function(X, w, ngrid = 400, tail = 1e-3,
   Yc  <- sweep(Y0, 2L, muY, `-`)
   S   <- t(Yc) %*% (Yc * w)  # weighted Cov(Y)
   S[!is.finite(S)] <- 0; diag(S) <- pmax(diag(S), 1e-12)
-  D <- diag(diag(S))
+  # `diag(diag(S))` breaks in 1D because `diag()` on a length-1 numeric
+  # is interpreted as an identity-matrix size request. Build the diagonal
+  # matrix explicitly so both 1D and higher-dimensional cases work.
+  D <- diag(as.numeric(diag(S)), nrow = ncol(S), ncol = ncol(S))
   Tmat <- (1 - corr_shrink) * D + corr_shrink * S
   Tmat <- as.matrix(Matrix::nearPD(Tmat, conv.tol = 1e-6)$mat)
   U <- tryCatch(chol(Tmat), error = function(e) chol(Tmat + diag(1e-8, ncol(S))))

@@ -151,6 +151,10 @@ base_config <- list(
     resample_threshold = 0.5,
     n_moves = 2L,
     rw_scale_init = 1.2,
+    exact_refresh_frac = 0.05,
+    exact_init_mode = "surrogate_is",
+    exact_init_phi_mode = "prior",
+    exact_init_phi_sd = 0.10,
     block_refresh_every = 5L,
     block_refresh_frac = 0.10,
     max_rounds = 200L,
@@ -185,7 +189,8 @@ base_config <- list(
 )
 experiment_grid <- list(
   E4 = list(mode = "fixed_cache"),
-  H1 = list(mode = "adaptive_pm")
+  H1 = list(mode = "adaptive_pm"),
+  X1 = list(mode = "extended_exact")
 )
 
 if (!single_experiment_id %in% names(experiment_grid)) {
@@ -472,6 +477,8 @@ run_outer_subjects <- function(
   colnames(Sigma_ref) <- rownames(Sigma_ref) <- theta_names
   Sigma_ref <- as.matrix(Matrix::nearPD(Sigma_ref, conv.tol = 1e-7)$mat)
   diag(Sigma_ref) <- pmax(diag(Sigma_ref), 1e-8)
+  Sigma_ref_inv <- chol2inv(chol(Sigma_ref))
+  Sigma_ref_logdet <- as.numeric(determinant(Sigma_ref, logarithm = TRUE)$modulus)
 
   M_default <- as.integer(M_subject_override$default %||% outer_cfg$M_subject_default)
   M_hard <- as.integer(M_subject_override$hard %||% outer_cfg$M_subject_hard)
@@ -485,7 +492,7 @@ run_outer_subjects <- function(
     seq_len(S),
     function(i) {
       is_hard <- i %in% hard_idx
-      enhanced_smc_elite(
+      out <- enhanced_smc_elite(
         data = data_list[[i]],
         loglik_fn = loglik_shifted_gamma,
         mu_ref = mu_ref,
@@ -503,6 +510,13 @@ run_outer_subjects <- function(
         seed = as.integer(seed_run + 1000L + 31L * phase_offset + i),
         verbose = FALSE
       )
+      out$working_prior <- list(
+        mu = as.numeric(mu_ref),
+        Sigma = Sigma_ref,
+        Sigma_inv = Sigma_ref_inv,
+        logdet = Sigma_ref_logdet
+      )
+      out
     },
     mc.cores = 1L
   )
@@ -560,6 +574,24 @@ build_surrogates <- function(outer_subject, data_list, loglik_fn, seed_base = 12
         data = data_list[[i]],
         subj_id = i,
         loglik_fn = loglik_fn,
+        base_seed = as.integer(seed_base + 1009L * i)
+      )
+    },
+    mc.cores = 1L
+  )
+}
+
+build_exact_local_objects <- function(outer_subject, data_list, loglik_fn, seed_base = 12345L) {
+  S <- length(outer_subject)
+  mclapply(
+    seq_len(S),
+    function(i) {
+      build_subject_exact_local_from_outer(
+        smc_out = outer_subject[[i]],
+        data = data_list[[i]],
+        subj_id = i,
+        loglik_fn = loglik_fn,
+        working_prior = outer_subject[[i]]$working_prior %||% NULL,
         base_seed = as.integer(seed_base + 1009L * i)
       )
     },
@@ -863,6 +895,38 @@ run_inner <- function(caches, prior, gaussian_map_fn, inner_cfg, seed_run,
   )
 }
 
+run_inner_extended_exact <- function(local_objs, prior, gaussian_map_fn, inner_cfg, seed_run,
+                                     phi_anchor = NULL) {
+  phi_init_center <- NULL
+  if (identical(inner_cfg$exact_init_phi_mode %||% "prior", "anchor") && !is.null(phi_anchor)) {
+    phi_init_center <- as.numeric(phi_anchor)
+  }
+  outer_smc_phi_extended_exact(
+    local_objs = local_objs,
+    rprior_phi = prior$rprior,
+    logprior_phi = prior$lprior,
+    gaussian_map_fn = gaussian_map_fn,
+    data_list = lapply(local_objs, `[[`, "data"),
+    loglik_fn = loglik_shifted_gamma,
+    M = inner_cfg$M,
+    cess_target = inner_cfg$cess_target,
+    resample_threshold = inner_cfg$resample_threshold,
+    n_moves = inner_cfg$n_moves,
+    rw_scale_init = inner_cfg$rw_scale_init,
+    max_rounds = inner_cfg$max_rounds,
+    refresh_frac = inner_cfg$exact_refresh_frac %||% 0.05,
+    delayed_accept = TRUE,
+    init_control = list(
+      mode = inner_cfg$exact_init_mode %||% "surrogate_is",
+      phi_mode = if (is.null(phi_init_center)) "prior" else "centered",
+      phi_center = phi_init_center,
+      phi_sd = inner_cfg$exact_init_phi_sd %||% 0.10
+    ),
+    seed = seed_run,
+    verbose = FALSE
+  )
+}
+
 summarize_cache_quality <- function(caches, phi_anchor) {
   phi_anchor <- as.numeric(phi_anchor)
   subject_rows <- vector("list", length(caches))
@@ -988,7 +1052,7 @@ run_single_experiment <- function(experiment_id, toggles, seed_run, base_cfg,
   cfg$experiment_id <- experiment_id
   cfg$seed <- seed_run
   mode <- as.character(toggles$mode %||% "")
-  if (!mode %in% c("fixed_cache", "adaptive_pm")) {
+  if (!mode %in% c("fixed_cache", "adaptive_pm", "extended_exact")) {
     stop("Unsupported experiment mode: ", mode)
   }
   if (mode == "fixed_cache") {
@@ -1006,6 +1070,9 @@ run_single_experiment <- function(experiment_id, toggles, seed_run, base_cfg,
     cfg$inner$inner_ll_mode <- "adaptive_pm"
     cfg$inner$pm_aux_mode <- "rng_stream"
     cfg$outer_escalation$enable <- TRUE
+    if (mode == "extended_exact") {
+      cfg$inner$inner_ll_mode <- "extended_exact"
+    }
   }
 
   cat(sprintf("\n=== %s | seed %d ===\n", experiment_id, seed_run))
@@ -1033,7 +1100,8 @@ run_single_experiment <- function(experiment_id, toggles, seed_run, base_cfg,
   elapsed_cache_final <- 0
   elapsed_gate <- 0
 
-  if (identical(cfg$inner$inner_ll_mode, "adaptive_pm")) {
+  if (identical(cfg$inner$inner_ll_mode, "adaptive_pm") ||
+      identical(cfg$inner$inner_ll_mode, "extended_exact")) {
     t0_outer <- proc.time()[3]
     pilot_idx <- select_pilot_subjects(data_list, cfg$pilot_strategy, seed_run)
     pilot_data <- data_list[pilot_idx]
@@ -1116,94 +1184,134 @@ run_single_experiment <- function(experiment_id, toggles, seed_run, base_cfg,
       stop("Strict outer gate failed: subjects not converged to lambda gate: ", paste(bad_outer, collapse = ","))
     }
 
-    t0_cache_pilot <- proc.time()[3]
-    pilot_caches <- build_surrogates(
-      outer_subject = outer_subject,
-      data_list = data_list,
-      loglik_fn = loglik_shifted_gamma,
-      seed_base = as.integer(seed_run + 40000L)
-    )
-    elapsed_cache_pilot <- as.numeric(proc.time()[3] - t0_cache_pilot)
+    if (identical(cfg$inner$inner_ll_mode, "adaptive_pm")) {
+      t0_cache_pilot <- proc.time()[3]
+      pilot_caches <- build_surrogates(
+        outer_subject = outer_subject,
+        data_list = data_list,
+        loglik_fn = loglik_shifted_gamma,
+        seed_base = as.integer(seed_run + 40000L)
+      )
+      elapsed_cache_pilot <- as.numeric(proc.time()[3] - t0_cache_pilot)
 
-    t0_cache_final <- proc.time()[3]
-    final_caches <- pilot_caches
-    gate_res$caches <- final_caches
-    gate_res$final <- pilot_cache_quality
-    elapsed_cache_final <- as.numeric(proc.time()[3] - t0_cache_final)
+      t0_cache_final <- proc.time()[3]
+      final_caches <- pilot_caches
+      gate_res$caches <- final_caches
+      gate_res$final <- pilot_cache_quality
+      elapsed_cache_final <- as.numeric(proc.time()[3] - t0_cache_final)
 
-    t0_gate <- proc.time()[3]
-    pm_gate <- pm_quality_gate_surrogates(
-      outer_subject = outer_subject,
-      surrogates = final_caches,
-      data_list = data_list,
-      phi_anchor = phi_anchor,
-      gaussian_map_fn = gaussian_map_fn,
-      adaptive_ctl = cfg$adaptive_pm,
-      gate_cfg = cfg$pm_quality_gate,
-      seed_run = seed_run,
-      outer_cfg = cfg$outer_escalation,
-      mu_ref_anchor = mu_ref_anchor,
-      Sigma_ref_anchor = Sigma_ref_anchor,
-      outer_ref_cfg = cfg$outer_refinement
-    )
-    outer_subject <- pm_gate$outer_subject
-    final_caches <- pm_gate$surrogates
-    elapsed_gate <- as.numeric(proc.time()[3] - t0_gate)
+      t0_gate <- proc.time()[3]
+      pm_gate <- pm_quality_gate_surrogates(
+        outer_subject = outer_subject,
+        surrogates = final_caches,
+        data_list = data_list,
+        phi_anchor = phi_anchor,
+        gaussian_map_fn = gaussian_map_fn,
+        adaptive_ctl = cfg$adaptive_pm,
+        gate_cfg = cfg$pm_quality_gate,
+        seed_run = seed_run,
+        outer_cfg = cfg$outer_escalation,
+        mu_ref_anchor = mu_ref_anchor,
+        Sigma_ref_anchor = Sigma_ref_anchor,
+        outer_ref_cfg = cfg$outer_refinement
+      )
+      outer_subject <- pm_gate$outer_subject
+      final_caches <- pm_gate$surrogates
+      elapsed_gate <- as.numeric(proc.time()[3] - t0_gate)
 
-    adaptive_ctl_inner <- pm_gate$adaptive_ctl
-    adaptive_ctl_inner$initial_subject_M <- as.integer(pm_gate$M_by_subject)
-    adaptive_ctl_inner$completion_mode <- cfg$inner_strict$completion_mode %||% adaptive_ctl_inner$completion_mode
-    adaptive_ctl_inner$adapt_until_round <- as.integer(cfg$inner_strict$adapt_until_round %||% adaptive_ctl_inner$adapt_until_round)
-    adaptive_ctl_inner$freeze_after_round <- as.integer(cfg$inner_strict$freeze_after_round %||% adaptive_ctl_inner$freeze_after_round)
+      adaptive_ctl_inner <- pm_gate$adaptive_ctl
+      adaptive_ctl_inner$initial_subject_M <- as.integer(pm_gate$M_by_subject)
+      adaptive_ctl_inner$completion_mode <- cfg$inner_strict$completion_mode %||% adaptive_ctl_inner$completion_mode
+      adaptive_ctl_inner$adapt_until_round <- as.integer(cfg$inner_strict$adapt_until_round %||% adaptive_ctl_inner$adapt_until_round)
+      adaptive_ctl_inner$freeze_after_round <- as.integer(cfg$inner_strict$freeze_after_round %||% adaptive_ctl_inner$freeze_after_round)
 
-    if (isTRUE(cfg$outer_refinement$strict_require_lambda1) && !isTRUE(pm_gate$global_ok)) {
-      stop(
-        sprintf(
-          "Strict PM quality gate failed: median ESS_abs=%.2f, q90 var=%.3f (q90 khat=%.3f).",
-          pm_gate$median_ess, pm_gate$q90_var, pm_gate$q90_khat
+      if (isTRUE(cfg$outer_refinement$strict_require_lambda1) && !isTRUE(pm_gate$global_ok)) {
+        stop(
+          sprintf(
+            "Strict PM quality gate failed: median ESS_abs=%.2f, q90 var=%.3f (q90 khat=%.3f).",
+            pm_gate$median_ess, pm_gate$q90_var, pm_gate$q90_khat
+          )
+        )
+      }
+
+      t0_inner <- proc.time()[3]
+      inner_fit <- run_inner(
+        caches = final_caches,
+        prior = prior,
+        gaussian_map_fn = gaussian_map_fn,
+        inner_cfg = cfg$inner,
+        seed_run = seed_run,
+        data_list = data_list,
+        inner_ll_mode = "adaptive_pm",
+        pm_aux_mode = cfg$inner$pm_aux_mode,
+        adaptive_pm_control = adaptive_ctl_inner,
+        rtheta_given_phi = rtheta_given_phi_fn
+      )
+      elapsed_inner <- as.numeric(proc.time()[3] - t0_inner)
+
+      final_lambda_inner <- suppressWarnings(as.numeric(tail(inner_fit$meta$lambda_hist %||% numeric(0), 1L)))
+      if (isTRUE(cfg$inner_strict$strict_require_lambda1) &&
+          (!is.finite(final_lambda_inner) || final_lambda_inner < as.numeric(cfg$inner_strict$lambda_strict_threshold %||% 0.9999))) {
+        stop("Strict inner gate failed: final lambda did not reach strict threshold.")
+      }
+
+      gate_res <- list(
+        caches = final_caches,
+        diag_history = pm_gate$diag_history,
+        actions = list(),
+        final = list(
+          global = list(
+            median_ess_abs = pm_gate$median_ess,
+            median_ess_norm = NA_real_,
+            sum_sd2 = NA_real_
+          ),
+          pm_probe = pm_gate$probe_final,
+          pm_gate_ok = pm_gate$global_ok,
+          pm_q90_var = pm_gate$q90_var,
+          pm_q90_khat = pm_gate$q90_khat,
+          pm_fail_subjects = pm_gate$fail_subjects,
+          rerun_info = pm_gate$rerun_info
         )
       )
-    }
-
-    t0_inner <- proc.time()[3]
-    inner_fit <- run_inner(
-      caches = final_caches,
-      prior = prior,
-      gaussian_map_fn = gaussian_map_fn,
-      inner_cfg = cfg$inner,
-      seed_run = seed_run,
-      data_list = data_list,
-      inner_ll_mode = "adaptive_pm",
-      pm_aux_mode = cfg$inner$pm_aux_mode,
-      adaptive_pm_control = adaptive_ctl_inner,
-      rtheta_given_phi = rtheta_given_phi_fn
-    )
-    elapsed_inner <- as.numeric(proc.time()[3] - t0_inner)
-
-    final_lambda_inner <- suppressWarnings(as.numeric(tail(inner_fit$meta$lambda_hist %||% numeric(0), 1L)))
-    if (isTRUE(cfg$inner_strict$strict_require_lambda1) &&
-        (!is.finite(final_lambda_inner) || final_lambda_inner < as.numeric(cfg$inner_strict$lambda_strict_threshold %||% 0.9999))) {
-      stop("Strict inner gate failed: final lambda did not reach strict threshold.")
-    }
-
-    gate_res <- list(
-      caches = final_caches,
-      diag_history = pm_gate$diag_history,
-      actions = list(),
-      final = list(
-        global = list(
-          median_ess_abs = pm_gate$median_ess,
-          median_ess_norm = NA_real_,
-          sum_sd2 = NA_real_
-        ),
-        pm_probe = pm_gate$probe_final,
-        pm_gate_ok = pm_gate$global_ok,
-        pm_q90_var = pm_gate$q90_var,
-        pm_q90_khat = pm_gate$q90_khat,
-        pm_fail_subjects = pm_gate$fail_subjects,
-        rerun_info = pm_gate$rerun_info
+    } else {
+      t0_cache_pilot <- proc.time()[3]
+      pilot_caches <- build_exact_local_objects(
+        outer_subject = outer_subject,
+        data_list = data_list,
+        loglik_fn = loglik_shifted_gamma,
+        seed_base = as.integer(seed_run + 40000L)
       )
-    )
+      elapsed_cache_pilot <- as.numeric(proc.time()[3] - t0_cache_pilot)
+
+      final_caches <- pilot_caches
+      elapsed_cache_final <- 0
+      elapsed_gate <- 0
+      gate_res <- list(
+        caches = final_caches,
+        diag_history = list(),
+        actions = list(),
+        final = list(
+          global = list(median_ess_abs = NA_real_, median_ess_norm = NA_real_, sum_sd2 = NA_real_)
+        )
+      )
+
+      t0_inner <- proc.time()[3]
+      inner_fit <- run_inner_extended_exact(
+        local_objs = final_caches,
+        prior = prior,
+        gaussian_map_fn = gaussian_map_fn,
+        inner_cfg = cfg$inner,
+        seed_run = seed_run,
+        phi_anchor = phi_anchor
+      )
+      elapsed_inner <- as.numeric(proc.time()[3] - t0_inner)
+
+      final_lambda_inner <- suppressWarnings(as.numeric(tail(inner_fit$meta$lambda_hist %||% numeric(0), 1L)))
+      if (isTRUE(cfg$inner_strict$strict_require_lambda1) &&
+          (!is.finite(final_lambda_inner) || final_lambda_inner < as.numeric(cfg$inner_strict$lambda_strict_threshold %||% 0.9999))) {
+        stop("Strict inner gate failed: final lambda did not reach strict threshold.")
+      }
+    }
   } else {
     t0_outer <- proc.time()[3]
     outer_subject <- run_outer_subjects(

@@ -18,7 +18,13 @@ suppressPackageStartupMessages({
 
 # ----------------------------- log-sum-exp utils ---------------------------
 logsumexp <- function(x) { m <- max(x); m + log(sum(exp(x - m))) }
-logsumexp_w <- function(x, w) { m <- max(x); m + log(sum(w * exp(x - m))) }
+logsumexp_w <- function(x, w) {
+  x <- as.numeric(x)
+  w <- as.numeric(w)
+  ok <- is.finite(x) & is.finite(w) & (w > 0)
+  if (!any(ok)) return(-Inf)
+  logsumexp(log(w[ok]) + x[ok])
+}
 .rowLogSumExp <- function(M) matrixStats::rowLogSumExps(M)
 rlogsumexp2 <- function(a, b) { m <- pmax(a, b); m + log(exp(a - m) + exp(b - m)) }
 
