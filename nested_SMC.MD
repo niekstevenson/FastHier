@@ -67,6 +67,36 @@ Something does **not** count as complete if it is only:
 - an optional mode that is not used
 - a partial implementation that cannot run end-to-end
 
+### Optimize the metric that matters
+
+The main efficiency metric is:
+
+- total number of local-level likelihood evaluations
+
+That means evaluations of terms of the form:
+
+\[
+\log p(y_i \mid \alpha)
+\]
+
+inside local modules, including:
+
+- initialization
+- bridge updates
+- local rejuvenation
+- population-proposal refreshes
+
+This is the number to drive down over time.
+
+Other metrics still matter, but they are secondary:
+
+- wall-clock time
+- number of bridge rounds
+- number of population resamples
+- number of population MH proposals
+
+A method does not count as better just because it uses fewer bridge rounds if it uses more local likelihood evaluations.
+
 ### Keep the repository tidy
 
 Core modules should stay in the main folder.
@@ -773,9 +803,17 @@ Need to store:
 - number of local resamples
 - number of local rejuvenation moves
 - number of population acceptances
-- total exact likelihood evaluations
+- total local-level likelihood evaluations
+- local-level likelihood evaluations split by source:
+  initialization, bridge updates, local rejuvenation, population-proposal refreshes
 
 This is necessary for tuning and for comparing against the old workflow.
+
+The primary efficiency report for any run should include:
+
+- total local-level likelihood evaluations
+- local-level likelihood evaluations per completed run to `lambda = 1`
+- local-level likelihood evaluations by phase of the algorithm
 
 ---
 
@@ -798,6 +836,19 @@ Current status, without inflation:
 - adaptive population bridge stepping driven by local-module predictions
 - a module-level population resampling mechanism
 - a correct end-to-end nested benchmark
+
+### What the main score should be
+
+For this project, the main score is not just:
+
+- number of bridge rounds
+- number of refresh events
+
+The main score is:
+
+- total local-level likelihood evaluations needed to reach `lambda = 1`
+
+That is the quantity future changes should be judged against.
 
 ### What should not be overstated
 
@@ -912,6 +963,7 @@ These are the standards for claiming that a phase is done.
 - population resampling duplicates full modules correctly
 - local modules persist across bridge steps rather than being thrown away each time
 - population mutation is wired into the maintained path
+- the run reports total local-level likelihood evaluations
 
 Phase 1 does **not** count as complete if there is only:
 
@@ -939,7 +991,7 @@ Phase 3 does **not** count as complete if local modules are effectively rebuilt 
 ### Phase 4 counts as complete only if
 
 - the simple population mutation baseline already works
-- the improved mutation is shown to help mixing or cost in a reproducible check
+- the improved mutation is shown to help the total local-level likelihood evaluation count, or at least wall-clock time without increasing that count badly, in a reproducible check
 - the added complexity is kept in the maintained path only if it earns its keep
 
 Phase 4 does **not** count as complete if it only adds knobs, modes, or proposal variants without evidence.
@@ -1053,4 +1105,4 @@ What it does **not** yet have is the actual nested algorithm:
 - consistent module resampling
 - a full continuously evolving nested SMC driver
 
-So the immediate task is not to redesign everything. It is to build the smallest correct nested implementation around a thin `population_driver` and a rich mutable `local_module`, in the intercept-only case first.
+So the immediate task is not to redesign everything. It is to build the smallest correct nested implementation around a thin `population_driver` and a rich mutable `local_module`, in the intercept-only case first, and then measure it primarily by total local-level likelihood evaluations.

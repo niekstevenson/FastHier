@@ -391,3 +391,7 @@ make_local_theta_proposal <- function(phi, surrogate, proposal_control = list(),
     mix_def = mix_def
   )
 }
+
+# Legacy benchmark-facing names retained as thin aliases.
+build_subject_surrogate_from_outer <- build_local_exact_object
+build_subject_exact_local_from_outer <- build_local_exact_object
