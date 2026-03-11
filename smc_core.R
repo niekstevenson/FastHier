@@ -591,13 +591,46 @@ next_lambda_via_rCESS_stat <- function(w, h, lambda,
   val[1L]
 }
 
+.ll_eval_counter_state <- local({
+  env <- new.env(parent = emptyenv())
+  env$enabled <- FALSE
+  env$total <- 0L
+  env
+})
+
+ll_eval_counter_reset <- function(enabled = TRUE) {
+  .ll_eval_counter_state$enabled <- isTRUE(enabled)
+  .ll_eval_counter_state$total <- 0L
+  invisible(.ll_eval_counter_state$total)
+}
+
+ll_eval_counter_get <- function() {
+  as.integer(.ll_eval_counter_state$total %||% 0L)
+}
+
+ll_eval_counter_disable <- function() {
+  .ll_eval_counter_state$enabled <- FALSE
+  invisible(NULL)
+}
+
+.ll_eval_counter_add <- function(n) {
+  if (!isTRUE(.ll_eval_counter_state$enabled)) return(invisible(NULL))
+  .ll_eval_counter_state$total <- as.integer(.ll_eval_counter_state$total + as.integer(n))
+  invisible(NULL)
+}
+
 .ll_eval_block <- function(Theta, data, loglik_fn) {
   out <- tryCatch(loglik_fn(Theta, data), error = function(e) NULL)
   if (!is.null(out)) {
     out <- as.numeric(out)
-    if (length(out) == nrow(Theta)) return(out)
+    if (length(out) == nrow(Theta)) {
+      .ll_eval_counter_add(nrow(Theta))
+      return(out)
+    }
   }
-  vapply(seq_len(nrow(Theta)), function(i) .ll_eval_one(Theta[i, , drop = TRUE], data, loglik_fn), numeric(1))
+  vals <- vapply(seq_len(nrow(Theta)), function(i) .ll_eval_one(Theta[i, , drop = TRUE], data, loglik_fn), numeric(1))
+  .ll_eval_counter_add(nrow(Theta))
+  vals
 }
 
 ll_parallel <- function(Theta, data, loglik_fn, n_cores = 1) {

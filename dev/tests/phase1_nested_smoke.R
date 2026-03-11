@@ -94,7 +94,7 @@ fit <- nested_population_smc(
   rho_res = 0.5,
   rho_local = 0.5,
   n_population_moves = 1L,
-  n_local_moves = 1L,
+  n_local_moves = 0L,
   n_population_refresh_moves = 0L,
   max_rounds = 10L,
   seed = 77L,
@@ -107,11 +107,12 @@ stopifnot(is.finite(lambda_final), lambda_final >= 1 - 1e-8)
 stopifnot(all(is.finite(fit$phi)))
 stopifnot(all(is.finite(fit$w)))
 stopifnot(abs(sum(fit$w) - 1) < 1e-8)
-stopifnot(eval_counts["local_rejuvenation"] > 0L)
+stopifnot(identical(fit$meta$implementation, "shared_local_banks_baseline"))
 stopifnot(eval_counts["total"] >= eval_counts["initialization"])
+stopifnot(eval_counts["enrichment"] == 0L)
 
 cat("PHASE1_NESTED_SMOKE_OK\n")
 cat(sprintf("lambda_final=%.6f\n", lambda_final))
 cat(sprintf("rounds=%d\n", fit$meta$rounds))
 cat(sprintf("local_loglik_total=%d\n", eval_counts["total"]))
-cat(sprintf("local_loglik_rejuvenation=%d\n", eval_counts["local_rejuvenation"]))
+cat(sprintf("local_loglik_enrichment=%d\n", eval_counts["enrichment"]))

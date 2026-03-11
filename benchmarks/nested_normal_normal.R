@@ -36,7 +36,7 @@ data_list <- lapply(seq_len(S), function(i) as.numeric(y[i, ]))
 local_particles <- 1000L
 local_rounds <- 200L
 population_particles <- 1000L
-local_module_particles <- 64L
+local_bank_particles <- 64L
 population_rounds <- 50L
 mc_cores <- 1L
 
@@ -63,6 +63,7 @@ Sigma_ref <- matrix(tau2_true, nrow = 1L, ncol = 1L, dimnames = list("alpha", "a
 Sigma_ref_inv <- chol2inv(chol(Sigma_ref))
 Sigma_ref_logdet <- as.numeric(determinant(Sigma_ref, logarithm = TRUE)$modulus)
 
+ll_eval_counter_reset()
 local_fits <- parallel::mclapply(
   seq_len(S),
   function(i) {
@@ -86,6 +87,8 @@ local_fits <- parallel::mclapply(
   },
   mc.cores = mc_cores
 )
+local_prefit_loglik <- ll_eval_counter_get()
+ll_eval_counter_disable()
 
 local_objs <- lapply(
   seq_len(S),
@@ -114,12 +117,12 @@ nested_fit <- nested_population_smc(
   logprior_phi = prior$lprior,
   gaussian_map_fn = gaussian_map_fn,
   N = population_particles,
-  M_local = local_module_particles,
+  M_local = local_bank_particles,
   rho_step = 0.4,
   rho_res = 0.5,
   rho_local = 0.5,
   n_population_moves = 1L,
-  n_local_moves = 1L,
+  n_local_moves = 0L,
   n_population_refresh_moves = 0L,
   max_rounds = population_rounds,
   seed = 123L,
@@ -159,7 +162,7 @@ results <- list(
     local_particles = local_particles,
     local_rounds = local_rounds,
     population_particles = population_particles,
-    local_module_particles = local_module_particles,
+    local_bank_particles = local_bank_particles,
     population_rounds = population_rounds,
     mc_cores = mc_cores
   )
@@ -169,6 +172,7 @@ outfile <- file.path("samples", "nested_normal_normal_results.rds")
 saveRDS(results, outfile)
 
 eval_counts <- nested_fit$meta$local_loglik_evals
+local_end_to_end <- as.integer(local_prefit_loglik + eval_counts["total"])
 
 cat("NESTED_NORMAL_NORMAL_OK\n")
 cat(sprintf("stan_results=%s\n", stan_results_file))
@@ -176,10 +180,12 @@ cat(sprintf("results=%s\n", outfile))
 cat(sprintf("plot=%s\n", plot_file))
 cat(sprintf("population_final_lambda=%.4f\n", tail(nested_fit$meta$lambda_hist, 1L)))
 cat(sprintf("population_rounds=%d\n", nested_fit$meta$rounds))
-cat(sprintf("local_loglik_total=%d\n", eval_counts["total"]))
-cat(sprintf("local_loglik_init=%d\n", eval_counts["initialization"]))
-cat(sprintf("local_loglik_bridge=%d\n", eval_counts["bridge_updates"]))
-cat(sprintf("local_loglik_rejuvenation=%d\n", eval_counts["local_rejuvenation"]))
-cat(sprintf("local_loglik_population_refresh=%d\n", eval_counts["population_refreshes"]))
+cat(sprintf("implementation=%s\n", nested_fit$meta$implementation))
+cat(sprintf("local_loglik_prefit=%d\n", local_prefit_loglik))
+cat(sprintf("local_loglik_nested_total=%d\n", eval_counts["total"]))
+cat(sprintf("local_loglik_nested_init=%d\n", eval_counts["initialization"]))
+cat(sprintf("local_loglik_nested_enrichment=%d\n", eval_counts["enrichment"]))
+cat(sprintf("local_loglik_nested_population_refresh=%d\n", eval_counts["population_refreshes"]))
+cat(sprintf("local_loglik_end_to_end=%d\n", local_end_to_end))
 cat(sprintf("mu_mean_stan=%.6f mu_mean_nested=%.6f\n", mean(stan_mu), sum(nested_mu * nested_w)))
 cat(sprintf("tau2_mean_stan=%.6f tau2_mean_nested=%.6f\n", mean(stan_tau2), sum(nested_tau2 * nested_w)))

@@ -221,6 +221,7 @@ build_local_exact_object <- function(
       base_seed = as.integer(base_seed %||% surrogate$base_seed),
       d_theta = surrogate$d_theta,
       theta_bank = as.matrix(smc_out$Theta),
+      theta_bank_loglik = if (!is.null(smc_out$loglik)) as.numeric(smc_out$loglik) else NULL,
       theta_bank_w = {
         w <- pmax(as.numeric(smc_out$w), 0)
         sw <- sum(w)
