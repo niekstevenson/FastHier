@@ -2,7 +2,8 @@
 # ============================================================================
 # SMC Core Utilities
 # - Shared numerics, rCESS scheduling, resampling, and likelihood helpers
-# - Consolidates functionality used by both inner and outer SMC implementations
+# - Consolidates functionality used by the maintained local SMC and the
+#   retained hierarchical-state helper code
 # ============================================================================
 
 suppressPackageStartupMessages({

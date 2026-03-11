@@ -1,13 +1,18 @@
 # ========================================================================
-# Enhanced SMC Sampler with Transport Maps and Adaptive Mixture Proposals
+# Per-group / local SMC sampler
+#
+# Historical note:
+# - This is the maintained local SMC, despite older benchmark scripts using
+#   different stage labels.
+# - It runs one group at a time and produces the local particle system,
+#   transport map, and proposal objects reused later.
 #
 # This implementation provides:
 # - Adaptive SMC with temperature schedule based on conditional ESS (CESS)
 # - Gaussian-copula transport for parameter space whitening and tail protection
-# - Rejuvenation using mixture of elite and historical components (Gaussian and t-distributions)
-# - Vectorized MCMC moves (random-walk and independence proposals)
+# - Rejuvenation using mixture of elite and historical components
+# - Vectorized MCMC moves
 # - Robust safeguards including restart, repopulation, and covariance regularization
-#
 # ========================================================================
 
 suppressPackageStartupMessages({
