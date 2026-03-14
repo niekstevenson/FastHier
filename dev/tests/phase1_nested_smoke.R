@@ -90,7 +90,7 @@ fit <- nested_population_smc(
   gaussian_map_fn = gaussian_map_fn,
   N = 48L,
   M_local = 64L,
-  rho_step = 0.4,
+  rho_step = NULL,
   rho_res = 0.5,
   rho_local = 0.5,
   n_population_moves = 1L,

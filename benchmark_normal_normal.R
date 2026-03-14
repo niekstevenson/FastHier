@@ -19,6 +19,10 @@ mu_true <- stan_res$simulation$mu_true
 tau2_true <- stan_res$simulation$tau2_true
 y <- stan_res$data$y
 data_list <- lapply(seq_len(S), function(i) as.numeric(y[i, ]))
+prior_m0 <- as.numeric(stan_res$prior$m0)
+prior_s0 <- as.numeric(stan_res$prior$s0)
+prior_a0 <- as.numeric(stan_res$prior$a0)
+prior_b0 <- as.numeric(stan_res$prior$b0)
 
 outer_particles <- 1000L
 outer_rounds <- 200L
@@ -52,8 +56,9 @@ rtheta_given_phi <- function(phi, n, aux = NULL) {
 }
 
 # 1. Run the outers.
-mu_ref <- setNames(mu_true, "alpha")
-Sigma_ref <- matrix(tau2_true, nrow = 1L, ncol = 1L, dimnames = list("alpha", "alpha"))
+alpha_ref_mean <- setNames(prior_m0, "alpha")
+alpha_ref_var <- prior_s0 + prior_b0 / (prior_a0 - 1.0)
+Sigma_ref <- matrix(alpha_ref_var, nrow = 1L, ncol = 1L, dimnames = list("alpha", "alpha"))
 Sigma_ref_inv <- chol2inv(chol(Sigma_ref))
 Sigma_ref_logdet <- as.numeric(determinant(Sigma_ref, logarithm = TRUE)$modulus)
 
@@ -63,7 +68,7 @@ outer_subject <- parallel::mclapply(
     out <- enhanced_smc_elite(
       data = data_list[[i]],
       loglik_fn = loglik_fn,
-      mu_ref = mu_ref,
+      mu_ref = alpha_ref_mean,
       Sigma_ref = Sigma_ref,
       M = outer_particles,
       max_rounds = outer_rounds,
@@ -71,7 +76,7 @@ outer_subject <- parallel::mclapply(
       verbose = FALSE
     )
     out$working_prior <- list(
-      mu = as.numeric(mu_ref),
+      mu = as.numeric(alpha_ref_mean),
       Sigma = Sigma_ref,
       Sigma_inv = Sigma_ref_inv,
       logdet = Sigma_ref_logdet
@@ -96,10 +101,10 @@ surrogates <- lapply(
 
 # 2. Run the inner.
 prior <- make_prior_phi_diag(
-  m0 = stan_res$prior$m0,
-  s0 = stan_res$prior$s0,
-  a = stan_res$prior$a0,
-  b = stan_res$prior$b0,
+  m0 = prior_m0,
+  s0 = prior_s0,
+  a = prior_a0,
+  b = prior_b0,
   d = 1L
 )
 
@@ -175,4 +180,3 @@ cat(sprintf("plot=%s\n", plot_file))
 cat(sprintf("inner_final_lambda=%.4f\n", tail(inner$meta$lambda_hist, 1L)))
 cat(sprintf("mu_mean_stan=%.6f mu_mean_framework=%.6f\n", mean(stan_mu), sum(smc_mu * smc_w)))
 cat(sprintf("tau2_mean_stan=%.6f tau2_mean_framework=%.6f\n", mean(stan_tau2), sum(smc_tau2 * smc_w)))
-

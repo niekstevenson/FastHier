@@ -36,16 +36,17 @@ outer_smc_phi_batch <- function(caches,
     gaussian_map_fn = gaussian_map_fn,
     N = as.integer(M),
     M_local = M_local,
-    rho_step = 0.4,
+    rho_step = NULL,
     rho_res = 0.5,
     rho_local = 0.5,
     n_population_moves = 1L,
     n_local_moves = 1L,
     n_population_refresh_moves = 0L,
     max_rounds = as.integer(max_rounds),
+    max_bank_topups = 3L,
+    bank_split_tol = 0.01,
     seed = as.integer(seed),
     verbose = verbose,
     ...
   )
 }
-

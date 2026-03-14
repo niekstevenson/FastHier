@@ -4,7 +4,7 @@ file_arg <- grep("^--file=", commandArgs(trailingOnly = FALSE), value = TRUE)
 script_path <- if (length(file_arg)) {
   normalizePath(sub("^--file=", "", file_arg[1L]))
 } else {
-  normalizePath("benchmarks/nested_normal_normal.R")
+  normalizePath("benchmarks/nested_hierarchical_shifted_gamma.R")
 }
 repo_dir <- dirname(dirname(script_path))
 setwd(repo_dir)
@@ -18,53 +18,57 @@ source("make_prior.R")
 dir.create("benchmarks", showWarnings = FALSE, recursive = TRUE)
 dir.create("samples", showWarnings = FALSE, recursive = TRUE)
 
-stan_results_file <- file.path("samples", "normal_normal_stan_results.rds")
+stan_results_file <- file.path("samples", "stan_full_results.rds")
 if (!file.exists(stan_results_file)) {
-  stop("Missing Stan results. Run `Rscript run_stan_normal_normal.R` first.")
+  stop("Missing Stan results. Run `Rscript run_stan.R` first.")
 }
 
 stan_res <- readRDS(stan_results_file)
 
-S <- stan_res$simulation$S
-N_obs <- stan_res$simulation$N
-sigma_y <- stan_res$simulation$sigma_y
-mu_true <- stan_res$simulation$mu_true
-tau2_true <- stan_res$simulation$tau2_true
+S <- as.integer(stan_res$config$S)
+P <- as.integer(stan_res$config$P)
 y <- stan_res$data$y
 data_list <- lapply(seq_len(S), function(i) as.numeric(y[i, ]))
-prior_m0 <- as.numeric(stan_res$prior$m0)
-prior_s0 <- as.numeric(stan_res$prior$s0)
-prior_a0 <- as.numeric(stan_res$prior$a0)
-prior_b0 <- as.numeric(stan_res$prior$b0)
 
-local_particles <- 1000L
-local_rounds <- 200L
-population_particles <- 3000L
+prior_m0 <- as.numeric(stan_res$priors$m0)
+prior_s0 <- as.numeric(stan_res$priors$s0)
+prior_a0 <- as.numeric(stan_res$priors$a0)
+prior_b0 <- as.numeric(stan_res$priors$b0)
+
+local_particles <- 800L
+local_rounds <- 180L
+population_particles <- 1000L
 local_bank_particles <- 64L
 population_rounds <- 50L
 mc_cores <- 1L
 
-loglik_fn <- function(Theta, y_i) {
+theta_names <- c("eta_shape", "eta_scale", "eta_shift")
+mu_names <- c("mu_shape", "mu_scale", "mu_shift")
+sigma2_names <- c("sigma2_shape", "sigma2_scale", "sigma2_shift")
+
+loglik_shifted_gamma <- function(Theta, y_i) {
   Theta <- as.matrix(Theta)
-  alpha <- Theta[, 1L]
-  vapply(alpha, function(a) sum(dnorm(y_i, mean = a, sd = sigma_y, log = TRUE)), numeric(1L))
+  eps <- 1e-9
+  shape <- exp(Theta[, 1L]) + eps
+  scale <- exp(Theta[, 2L]) + eps
+  shift <- exp(Theta[, 3L]) + eps
+  out <- rep(-1e12, nrow(Theta))
+  min_y <- min(y_i)
+  ok <- shift < min_y
+  if (!any(ok)) return(out)
+  for (j in which(ok)) {
+    out[j] <- sum(dgamma(y_i - shift[j], shape = shape[j], scale = scale[j], log = TRUE))
+  }
+  out[!is.finite(out)] <- -1e12
+  out
 }
 
-gaussian_map_fn <- function(phi, d = 1L) {
-  if (!is.null(d) && as.integer(d) != 1L) stop("This benchmark expects d = 1.")
-  mu <- as.numeric(phi[1L])
-  tau2 <- exp(as.numeric(phi[2L]))
-  list(
-    mu = mu,
-    Sigma_inv = matrix(1 / tau2, nrow = 1L, ncol = 1L),
-    logdet = log(tau2),
-    const = NULL
-  )
-}
+gaussian_map_fn <- phi_to_gaussian_params_diag_factory()
 
-alpha_ref_mean <- setNames(prior_m0, "alpha")
+alpha_ref_mean <- setNames(prior_m0, theta_names)
 alpha_ref_var <- prior_s0 + prior_b0 / (prior_a0 - 1.0)
-Sigma_ref <- matrix(alpha_ref_var, nrow = 1L, ncol = 1L, dimnames = list("alpha", "alpha"))
+Sigma_ref <- diag(alpha_ref_var, P)
+colnames(Sigma_ref) <- rownames(Sigma_ref) <- theta_names
 Sigma_ref_inv <- chol2inv(chol(Sigma_ref))
 Sigma_ref_logdet <- as.numeric(determinant(Sigma_ref, logarithm = TRUE)$modulus)
 
@@ -74,11 +78,19 @@ local_fits <- parallel::mclapply(
   function(i) {
     out <- enhanced_smc_elite(
       data = data_list[[i]],
-      loglik_fn = loglik_fn,
+      loglik_fn = loglik_shifted_gamma,
       mu_ref = alpha_ref_mean,
       Sigma_ref = Sigma_ref,
       M = local_particles,
+      resample_threshold = 0.6,
+      n_mcmc_moves = 3L,
       max_rounds = local_rounds,
+      G_mix = 8L,
+      da_enable = TRUE,
+      gss_enable = TRUE,
+      ll_cache_enable = TRUE,
+      deterministic_resampling = FALSE,
+      n_cores = 1L,
       seed = as.integer(1123L + 31L * i),
       verbose = FALSE
     )
@@ -102,7 +114,7 @@ local_objs <- lapply(
       smc_out = local_fits[[i]],
       data = data_list[[i]],
       subj_id = i,
-      loglik_fn = loglik_fn,
+      loglik_fn = loglik_shifted_gamma,
       base_seed = as.integer(40000L + 1009L * i)
     )
   }
@@ -113,7 +125,7 @@ prior <- make_prior_phi_diag(
   s0 = prior_s0,
   a = prior_a0,
   b = prior_b0,
-  d = 1L
+  d = P
 )
 
 nested_fit <- nested_population_smc(
@@ -135,28 +147,54 @@ nested_fit <- nested_population_smc(
   verbose = TRUE
 )
 
-stan_mu <- stan_res$stan$mu
-stan_tau2 <- stan_res$stan$tau2
+stan_mu <- as.matrix(stan_res$draws$mu)
+stan_sigma2 <- as.matrix(stan_res$draws$sigma2)
+colnames(stan_mu) <- mu_names
+colnames(stan_sigma2) <- sigma2_names
 
 nested_phi <- as.matrix(nested_fit$phi)
 nested_w <- pmax(as.numeric(nested_fit$w), 0)
 nested_w <- nested_w / sum(nested_w)
-nested_mu <- nested_phi[, 1L]
-nested_tau2 <- exp(nested_phi[, 2L])
+nested_mu <- nested_phi[, seq_len(P), drop = FALSE]
+nested_sigma2 <- exp(nested_phi[, P + seq_len(P), drop = FALSE])
+colnames(nested_mu) <- mu_names
+colnames(nested_sigma2) <- sigma2_names
 
 set.seed(123L)
-nested_mu_draws <- sample(nested_mu, size = 4000L, replace = TRUE, prob = nested_w)
-nested_tau2_draws <- sample(nested_tau2, size = 4000L, replace = TRUE, prob = nested_w)
+draw_idx <- sample.int(nrow(nested_phi), size = 4000L, replace = TRUE, prob = nested_w)
+nested_mu_draws <- nested_mu[draw_idx, , drop = FALSE]
+nested_sigma2_draws <- nested_sigma2[draw_idx, , drop = FALSE]
 
-plot_file <- file.path("benchmarks", "nested_normal_normal_posteriors.png")
-png(plot_file, width = 900, height = 420)
-par(mfrow = c(1, 2), mar = c(4, 4, 3, 1))
-plot(density(stan_mu), main = "Posterior of mu", xlab = "mu", ylab = "Density", lwd = 2, col = "black")
-lines(density(nested_mu_draws), lwd = 2, col = "red3")
-legend("topright", legend = c("Stan", "Nested SMC"), col = c("black", "red3"), lwd = 2, bty = "n")
-plot(density(stan_tau2), main = "Posterior of tau2", xlab = "tau2", ylab = "Density", lwd = 2, col = "black")
-lines(density(nested_tau2_draws), lwd = 2, col = "red3")
-legend("topright", legend = c("Stan", "Nested SMC"), col = c("black", "red3"), lwd = 2, bty = "n")
+plot_file <- file.path("benchmarks", "nested_hierarchical_shifted_gamma_posteriors.png")
+png(plot_file, width = 1200, height = 800, res = 120)
+par(mfrow = c(2, 3), mar = c(4, 4, 3, 1))
+
+for (j in seq_len(P)) {
+  plot(
+    density(stan_mu[, j]),
+    main = mu_names[j],
+    xlab = mu_names[j],
+    ylab = "Density",
+    lwd = 2,
+    col = "black"
+  )
+  lines(density(nested_mu_draws[, j]), lwd = 2, col = "red3")
+  legend("topright", legend = c("Stan", "Nested SMC"), col = c("black", "red3"), lwd = 2, bty = "n")
+}
+
+for (j in seq_len(P)) {
+  plot(
+    density(stan_sigma2[, j]),
+    main = sigma2_names[j],
+    xlab = sigma2_names[j],
+    ylab = "Density",
+    lwd = 2,
+    col = "black"
+  )
+  lines(density(nested_sigma2_draws[, j]), lwd = 2, col = "red3")
+  legend("topright", legend = c("Stan", "Nested SMC"), col = c("black", "red3"), lwd = 2, bty = "n")
+}
+
 dev.off()
 
 results <- list(
@@ -171,20 +209,25 @@ results <- list(
     local_bank_particles = local_bank_particles,
     population_rounds = population_rounds,
     alpha_ref_mean = unname(alpha_ref_mean),
-    alpha_ref_var = alpha_ref_var,
+    alpha_ref_var = unname(alpha_ref_var),
     max_bank_topups = 3L,
     bank_split_tol = 0.01,
     mc_cores = mc_cores
   )
 )
 
-outfile <- file.path("samples", "nested_normal_normal_results.rds")
+outfile <- file.path("samples", "nested_hierarchical_shifted_gamma_results.rds")
 saveRDS(results, outfile)
 
 eval_counts <- nested_fit$meta$local_loglik_evals
 local_end_to_end <- as.integer(local_prefit_loglik + eval_counts["total"])
 
-cat("NESTED_NORMAL_NORMAL_OK\n")
+stan_mu_mean <- colMeans(stan_mu)
+stan_sigma2_mean <- colMeans(stan_sigma2)
+nested_mu_mean <- colSums(nested_mu * nested_w)
+nested_sigma2_mean <- colSums(nested_sigma2 * nested_w)
+
+cat("NESTED_HIERARCHICAL_SHIFTED_GAMMA_OK\n")
 cat(sprintf("stan_results=%s\n", stan_results_file))
 cat(sprintf("results=%s\n", outfile))
 cat(sprintf("plot=%s\n", plot_file))
@@ -199,5 +242,9 @@ cat(sprintf("local_loglik_nested_init=%d\n", eval_counts["initialization"]))
 cat(sprintf("local_loglik_nested_enrichment=%d\n", eval_counts["enrichment"]))
 cat(sprintf("local_loglik_nested_population_refresh=%d\n", eval_counts["population_refreshes"]))
 cat(sprintf("local_loglik_end_to_end=%d\n", local_end_to_end))
-cat(sprintf("mu_mean_stan=%.6f mu_mean_nested=%.6f\n", mean(stan_mu), sum(nested_mu * nested_w)))
-cat(sprintf("tau2_mean_stan=%.6f tau2_mean_nested=%.6f\n", mean(stan_tau2), sum(nested_tau2 * nested_w)))
+for (j in seq_len(P)) {
+  cat(sprintf("%s_mean_stan=%.6f %s_mean_nested=%.6f\n", mu_names[j], stan_mu_mean[j], mu_names[j], nested_mu_mean[j]))
+}
+for (j in seq_len(P)) {
+  cat(sprintf("%s_mean_stan=%.6f %s_mean_nested=%.6f\n", sigma2_names[j], stan_sigma2_mean[j], sigma2_names[j], nested_sigma2_mean[j]))
+}

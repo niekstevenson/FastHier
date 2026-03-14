@@ -57,6 +57,13 @@ if (file.exists(sc_path)) source(sc_path)
   Theta <- as.matrix(Theta)
   mu <- as.numeric(pars$mu)
   K <- as.matrix(pars$Sigma_inv)
+  if (ncol(Theta) == 1L && length(mu) == 1L && nrow(K) == 1L && ncol(K) == 1L) {
+    lt1 <- Theta[, 1L] - mu[1L]
+    q <- as.numeric(K[1L, 1L]) * lt1 * lt1
+    out <- -0.5 * (q + pars$logdet + log(2 * pi))
+    if (!is.null(pars$const)) out <- out + pars$const
+    return(as.numeric(out))
+  }
   lt <- sweep(Theta, 2L, mu, `-`)
   q <- rowSums((lt %*% K) * lt)
   out <- -0.5 * (q + pars$logdet + ncol(Theta) * log(2 * pi))
