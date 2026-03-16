@@ -1002,6 +1002,36 @@ maybe_update_ref_mix <- function(lambda, elite_mix, hist_mix,
 
 # Removed unused helper: grow_particles_keep (was never called)
 
+.normalize_checkpoint_lambdas <- function(checkpoint_lambdas, lambda_target) {
+  cp <- sort(unique(as.numeric(checkpoint_lambdas %||% numeric(0))))
+  cp <- cp[is.finite(cp) & cp > 0 & cp <= as.numeric(lambda_target)]
+  if (!length(cp)) {
+    return(numeric(0))
+  }
+  if (abs(tail(cp, 1L) - as.numeric(lambda_target)) > 1e-12) {
+    cp <- c(cp, as.numeric(lambda_target))
+  }
+  cp
+}
+
+.seed_plan_block <- function(seed_plan, block, round = NULL, default = NULL) {
+  if (is.null(seed_plan)) {
+    return(as.integer(default))
+  }
+  if (is.null(round)) {
+    val <- seed_plan[[block]] %||% default
+  } else {
+    round_tbl <- seed_plan$round %||% NULL
+    if (is.null(round_tbl) || NROW(round_tbl) < as.integer(round) || !(block %in% colnames(round_tbl))) {
+      val <- default
+    } else {
+      val <- round_tbl[as.integer(round), block]
+    }
+  }
+  val <- as.integer(val %||% default)
+  if (!is.finite(val)) as.integer(default) else val
+}
+
 # Main Enhanced SMC Sampler Function
 # Adaptive SMC with transport maps, elite mixtures, and robust rejuvenation
 # Args:
@@ -1031,6 +1061,8 @@ enhanced_smc_elite <- function(data, loglik_fn, mu_ref, Sigma_ref,
                                resample_threshold = 0.6,
                                n_mcmc_moves = 3L,
                                max_rounds = 200L,
+                               lambda_target = 1.0,
+                               checkpoint_lambdas = NULL,
                                G_mix = 16L,
                                gamma_sharp = 0.7,
                                refit_every = 2L,   # kept for compatibility; now advisory
@@ -1067,29 +1099,101 @@ enhanced_smc_elite <- function(data, loglik_fn, mu_ref, Sigma_ref,
                                ll_cache_enable = TRUE,
                                ll_cache_digits = 8L,
                                ll_cache_cap = 100000L,
+                               seed_plan = NULL,
+                               warm_start_fit = NULL,
+                               warm_start_use_transport = TRUE,
+                               warm_start_use_mixture = TRUE,
+                               warm_start_max_particles = 2000L,
                                n_cores = 1,                   # <— NEW: number of cores for parallel likelihood
                                seed = 123,
                                verbose = TRUE) {
   vcat <- function(...) { if (verbose) base::cat(...) }
   cat <- vcat
-  set.seed(seed)
+  set.seed(.seed_plan_block(seed_plan, "global", default = seed))
   resample_sort_mode <- match.arg(resample_sort_mode)
   post_adapt_n_mcmc_moves <- as.integer(max(1L, post_adapt_n_mcmc_moves))
+  lambda_target <- as.numeric(lambda_target)
+  if (!is.finite(lambda_target) || lambda_target <= 0 || lambda_target > 1) {
+    stop("lambda_target must be in (0, 1].")
+  }
+  checkpoint_lambdas <- .normalize_checkpoint_lambdas(checkpoint_lambdas, lambda_target = lambda_target)
+  checkpoint_log_evidence <- numeric(length(checkpoint_lambdas))
+  checkpoint_log_increments <- numeric(length(checkpoint_lambdas))
+  checkpoint_ptr <- 1L
   param_names <- names(mu_ref)
   prior_L <- tryCatch(chol(Sigma_ref), error = function(e) chol(Matrix::nearPD(Sigma_ref)$mat))
   # Build likelihood cache (persists across rounds; valid in θ-space)
   ll_cache <- if (ll_cache_enable) .ll_cache_make(digits = ll_cache_digits, cap = ll_cache_cap) else NULL
   cat("Stage 1: sample prior & build transport...\n")
+  set.seed(.seed_plan_block(seed_plan, "init", default = seed))
   Theta <- mvtnorm::rmvnorm(M, mu_ref, Sigma_ref); colnames(Theta) <- param_names
   # No cache benefit on the very first batch
   loglik <- ll_parallel(Theta, data, loglik_fn, n_cores)
-  # Initial transport with safe defaults + diagnostics
-  Tmap <- build_transport(
-    Theta, rep(1/M, M),
-    mu_ref = mu_ref, Sigma_ref = Sigma_ref,
-    lambda = 0,                    # <— schedule: low shrink at start
-    verbose = verbose
-  )
+  warm_theta <- NULL
+  warm_w <- NULL
+  warm_mix_seed <- NULL
+  if (!is.null(warm_start_fit) &&
+      !is.null(warm_start_fit$Theta) &&
+      ncol(as.matrix(warm_start_fit$Theta)) == ncol(Theta)) {
+    warm_theta <- as.matrix(warm_start_fit$Theta)
+    if (nrow(warm_theta) > as.integer(warm_start_max_particles)) {
+      warm_idx <- seq_len(nrow(warm_theta))
+      warm_w_in <- pmax(as.numeric(warm_start_fit$w %||% rep(1 / nrow(warm_theta), nrow(warm_theta))), 0)
+      sw_warm <- sum(warm_w_in)
+      if (!is.finite(sw_warm) || sw_warm <= 0) {
+        warm_w_in <- rep(1 / nrow(warm_theta), nrow(warm_theta))
+      } else {
+        warm_w_in <- warm_w_in / sw_warm
+      }
+      set.seed(.seed_plan_block(seed_plan, "warm_subsample", default = seed + 1L))
+      warm_idx <- sample.int(
+        nrow(warm_theta),
+        size = as.integer(warm_start_max_particles),
+        replace = FALSE,
+        prob = warm_w_in
+      )
+      warm_theta <- warm_theta[warm_idx, , drop = FALSE]
+      warm_w <- warm_w_in[warm_idx]
+    } else {
+      warm_w <- pmax(as.numeric(warm_start_fit$w %||% rep(1 / nrow(warm_theta), nrow(warm_theta))), 0)
+    }
+    sw_warm <- sum(warm_w)
+    if (!is.finite(sw_warm) || sw_warm <= 0) {
+      warm_w <- rep(1 / nrow(warm_theta), nrow(warm_theta))
+    } else {
+      warm_w <- warm_w / sw_warm
+    }
+    warm_mix_seed <- warm_start_fit$elite_mix_final %||% NULL
+  }
+  # Initial transport with safe defaults + diagnostics. If a nearby local fit is
+  # available, reuse its particle cloud only to initialize proposal geometry.
+  Tmap <- NULL
+  if (isTRUE(warm_start_use_transport) && !is.null(warm_theta)) {
+    warm_lambda <- as.numeric(warm_start_fit$final_lambda %||% lambda_target %||% 1.0)
+    warm_lambda <- min(max(warm_lambda, 0), 1)
+    Tmap <- tryCatch(
+      build_transport(
+        warm_theta,
+        warm_w,
+        mu_ref = mu_ref,
+        Sigma_ref = Sigma_ref,
+        lambda = warm_lambda,
+        verbose = FALSE
+      ),
+      error = function(e) NULL
+    )
+    if (!is.null(Tmap) && isTRUE(verbose)) {
+      cat("  Warm-start transport accepted.\n")
+    }
+  }
+  if (is.null(Tmap)) {
+    Tmap <- build_transport(
+      Theta, rep(1 / M, M),
+      mu_ref = mu_ref, Sigma_ref = Sigma_ref,
+      lambda = 0,
+      verbose = verbose
+    )
+  }
   Z <- Tmap$fwd(Theta)
   lpz <- as.numeric(dmvnorm_chol_log(Theta, mu_ref, prior_L) - Tmap$log_jac(Theta))
   w <- rep(1/M, M); lambda <- 0; round <- 0L
@@ -1104,6 +1208,37 @@ enhanced_smc_elite <- function(data, loglik_fn, mu_ref, Sigma_ref,
   rm_gain_pcn    <- 0.05
   last_elite_mix <- NULL
   elite_history <- list()
+  if (isTRUE(warm_start_use_mixture) && !is.null(warm_theta)) {
+    Zw <- tryCatch(Tmap$fwd(warm_theta), error = function(e) NULL)
+    if (!is.null(Zw) && nrow(Zw) >= max(10L, min(50L, ncol(Zw) * 2L))) {
+      warm_G <- if (!is.null(warm_mix_seed) && !is.null(warm_mix_seed$meansZ)) {
+        length(warm_mix_seed$meansZ)
+      } else {
+        min(as.integer(G_mix), max(2L, floor(sqrt(nrow(Zw)))))
+      }
+      set.seed(.seed_plan_block(seed_plan, "warm_elite_fit", default = seed + 2L))
+      last_elite_mix <- tryCatch(
+        fit_elite_mixture_Z(
+          Zw,
+          warm_w,
+          elite_quantile = 0.4,
+          G = as.integer(min(G_mix, warm_G)),
+          cov_inflation = 4.0,
+          warm_start_mixZ = warm_mix_seed,
+          em_itmax = 6,
+          housekeeping = TRUE,
+          min_G_keep = 2,
+          merge_thresh = 0.10,
+          verbose = FALSE,
+          lambda = min(max(as.numeric(lambda_target), 0), 1)
+        ),
+        error = function(e) NULL
+      )
+      if (!is.null(last_elite_mix) && isTRUE(verbose)) {
+        cat("  Warm-start elite mixture accepted.\n")
+      }
+    }
+  }
   # --- pCN kill-switch state (rolling) ---
   # Rolling acceptance snapshots (used for adaptive n_moves and routing probs)
   last_rw_acc  <- NA_real_
@@ -1129,7 +1264,7 @@ enhanced_smc_elite <- function(data, loglik_fn, mu_ref, Sigma_ref,
   # Transport refit state
   tr_state <- NULL  # Will be initialized by maybe_refit_transport
 
-  while (lambda < 1 - 1e-12 && round < max_rounds) {
+  while (lambda < lambda_target - 1e-12 && round < max_rounds) {
     round <- round + 1L
     cat(sprintf("\nRound %d: λ=%.3f -> ", round, lambda))
     resampled <- FALSE
@@ -1159,13 +1294,14 @@ enhanced_smc_elite <- function(data, loglik_fn, mu_ref, Sigma_ref,
     }
 
     next_lambda <- if (gss_enable && !is.null(ref_mix) && !is.null(lp_ref)) {
-      next_lambda_via_rCESS_stat(w, h_step, lambda, target = cess_target)
+      next_lambda_via_rCESS_stat(w, h_step, lambda, target = cess_target, lambda_target = lambda_target)
     } else {
-      next_lambda_via_rCESS(w, h_step, lambda, target = cess_target)
+      next_lambda_via_rCESS(w, h_step, lambda, target = cess_target, lambda_target = lambda_target)
     }
-    lambda_new  <- min(next_lambda, 1.0)
+    next_checkpoint <- if (checkpoint_ptr <= length(checkpoint_lambdas)) checkpoint_lambdas[checkpoint_ptr] else Inf
+    lambda_new  <- min(next_lambda, lambda_target, next_checkpoint)
     if (lambda_new <= lambda) {
-      delta_floor <- min(1e-4, 1 - lambda)
+      delta_floor <- min(1e-4, lambda_target - lambda)
       lambda_new <- lambda + delta_floor
       cat(sprintf("  [Guard] Applied lambda step floor (Δ=%.4g).\n", delta_floor))
     }
@@ -1211,7 +1347,7 @@ enhanced_smc_elite <- function(data, loglik_fn, mu_ref, Sigma_ref,
     ess_frac <- ess / length(w_new)
     if (!is.finite(ess_frac)) ess_frac <- 0
     log_evidence <- log_evidence + logZ_inc
-    pred_rcess_full <- rCESS_stat(w, h_step, 1 - lambda)
+    pred_rcess_full <- rCESS_stat(w, h_step, lambda_target - lambda)
     cat(sprintf("  rCESS(remain)=%.3f | target=%.3f\n", pred_rcess_full, cess_target))
     cat(sprintf("  ESS(pre)=%.3f | logZ += %.4f -> %.4f\n", ess_frac, logZ_inc, log_evidence))
     if (ess_frac < resample_threshold) {
@@ -1233,7 +1369,7 @@ enhanced_smc_elite <- function(data, loglik_fn, mu_ref, Sigma_ref,
           rw_prob = 0.40, rw_scale = 0.35,
           pcn_prob = 0.60, pcn_beta = pcn_beta_curr,
           indep_t_df = indep_t_df, indep_t_prob = indep_t_prob,
-          seed = seed + round * 19L,
+          seed = .seed_plan_block(seed_plan, "pre_move", round = round, default = seed + round * 19L),
           param_names = param_names,
           weak_dim_idx = integer(0), rw_expand_factor = 1.0,
           resampled = FALSE,
@@ -1266,6 +1402,9 @@ enhanced_smc_elite <- function(data, loglik_fn, mu_ref, Sigma_ref,
         }
       }
       cat(sprintf("  Resampling (sorted stratified, order=%s)...\n", sort_used))
+      if (!isTRUE(deterministic_resampling)) {
+        set.seed(.seed_plan_block(seed_plan, "resample", round = round, default = seed + round * 23L))
+      }
       # Stratified resampling on chosen ordering, then map back to original indices.
       # Stratified resampling on sorted weights, then map back
       idx_sorted <- stratified_resample_sorted(
@@ -1299,7 +1438,7 @@ enhanced_smc_elite <- function(data, loglik_fn, mu_ref, Sigma_ref,
           rw_prob = 1, rw_scale = 0.35,
           pcn_prob = 0, pcn_beta = plogis(logit_pcn_beta),
           indep_t_df = indep_t_df, indep_t_prob = 0,
-          seed = seed + round * 37L,
+          seed = .seed_plan_block(seed_plan, "jitter1", round = round, default = seed + round * 37L),
           param_names = param_names,
           weak_dim_idx = integer(0), rw_expand_factor = 1.0,
           resampled = TRUE,
@@ -1321,7 +1460,7 @@ enhanced_smc_elite <- function(data, loglik_fn, mu_ref, Sigma_ref,
             rw_prob = 0, rw_scale = 0.5,
             pcn_prob = 1, pcn_beta = plogis(logit_pcn_beta),
             indep_t_df = indep_t_df, indep_t_prob = 0,
-            seed = seed + round * 31L,
+            seed = .seed_plan_block(seed_plan, "jitter2", round = round, default = seed + round * 31L),
             param_names = param_names,
             weak_dim_idx = integer(0), rw_expand_factor = 1.0,
             resampled = TRUE,
@@ -1345,7 +1484,7 @@ enhanced_smc_elite <- function(data, loglik_fn, mu_ref, Sigma_ref,
           rw_prob = 0, rw_scale = 0.5,
           pcn_prob = 1, pcn_beta = plogis(logit_pcn_beta),
           indep_t_df = indep_t_df, indep_t_prob = 0,
-          seed = seed + round * 31L,
+          seed = .seed_plan_block(seed_plan, "jitter1", round = round, default = seed + round * 31L),
           param_names = param_names,
           weak_dim_idx = integer(0), rw_expand_factor = 1.0,
           resampled = TRUE,
@@ -1360,7 +1499,7 @@ enhanced_smc_elite <- function(data, loglik_fn, mu_ref, Sigma_ref,
         if (do_rw_jitter) {
           cat(sprintf("  Pre-move jitter (RW second)... [pcn_acc=%.3f, dup1=%.1f%%]\n",
                       movej$pcn_accept_rate, 100*dup1))
-                  mover <- mcmc_moves_z_mix_batched(
+          mover <- mcmc_moves_z_mix_batched(
           Z, loglik, lpz, Tmap, lambda,
           mu_ref, prior_L, w,
           elite_mix = .default_std_normal_mix(ncol(Z)), hist_mix = NULL,
@@ -1369,7 +1508,7 @@ enhanced_smc_elite <- function(data, loglik_fn, mu_ref, Sigma_ref,
           rw_prob = 1, rw_scale = 0.35,
           pcn_prob = 0, pcn_beta = plogis(logit_pcn_beta),
           indep_t_df = indep_t_df, indep_t_prob = 0,
-          seed = seed + round * 37L,
+          seed = .seed_plan_block(seed_plan, "jitter2", round = round, default = seed + round * 37L),
           param_names = param_names,
           weak_dim_idx = integer(0), rw_expand_factor = 1.0,
           resampled = TRUE,
@@ -1446,6 +1585,7 @@ enhanced_smc_elite <- function(data, loglik_fn, mu_ref, Sigma_ref,
     cov_inflation_eff <- max(4.0, 3.0 + 2.0 * (1 - lambda))   # Keep minimum 4.0 late in annealing
     # (2,4) Early rounds: broaden elite/history mixtures (+25% inflation before λ≈0.3)
     if (lambda < 0.30) cov_inflation_eff <- cov_inflation_eff * 1.25
+    set.seed(.seed_plan_block(seed_plan, "elite_fit", round = round, default = seed + round * 29L))
     elite_mix <- tryCatch(
       fit_elite_mixture_Z(Z, w_fit, elite_quantile = elite_q_eff, G = G_eff,
                           cov_inflation = cov_inflation_eff, warm_start_mixZ = last_elite_mix,
@@ -1582,7 +1722,8 @@ enhanced_smc_elite <- function(data, loglik_fn, mu_ref, Sigma_ref,
       .calibrate_da_surrogate(Z, Theta, lpz, lambda, if (gss_enable) ref_mix else NULL,
                               da_screen_mix, data, loglik_fn, Tmap,
                               ll_cache = ll_cache,
-                              n = da_calibrate_n, seed = seed + 7L * round,
+                              n = da_calibrate_n,
+                              seed = .seed_plan_block(seed_plan, "da_calib", round = round, default = seed + 7L * round),
                               alpha = da_alpha,
                               lambda_floor = da_lambda_floor,
                               gate_lambda = da_lambda_floor,
@@ -1679,7 +1820,7 @@ enhanced_smc_elite <- function(data, loglik_fn, mu_ref, Sigma_ref,
                                          rw_prob = rw_prob_eff, rw_scale = rw_scale,
                                          pcn_prob = pcn_prob_eff, pcn_beta = pcn_beta_curr,
                                          indep_t_df = indep_t_df_eff, indep_t_prob = indep_t_prob_eff,
-                                         seed = seed + round * 97,
+                                         seed = .seed_plan_block(seed_plan, "main_move", round = round, default = seed + round * 97),
                                           param_names = param_names,
                                           weak_dim_idx = weak_idx,
                                           rw_expand_factor = 2.5,
@@ -1751,17 +1892,33 @@ enhanced_smc_elite <- function(data, loglik_fn, mu_ref, Sigma_ref,
       elite_history[[length(elite_history) + 1L]] <- last_elite_mix
       if (length(elite_history) > 6L) elite_history <- tail(elite_history, 6L)
     }
+    while (checkpoint_ptr <= length(checkpoint_lambdas) &&
+           lambda >= checkpoint_lambdas[checkpoint_ptr] - 1e-12) {
+      checkpoint_log_evidence[checkpoint_ptr] <- log_evidence
+      checkpoint_log_increments[checkpoint_ptr] <- if (checkpoint_ptr == 1L) {
+        checkpoint_log_evidence[checkpoint_ptr]
+      } else {
+        checkpoint_log_evidence[checkpoint_ptr] - checkpoint_log_evidence[checkpoint_ptr - 1L]
+      }
+      checkpoint_ptr <- checkpoint_ptr + 1L
+    }
   }
 
   # Final MCSE(logZ) from accumulated per-round variances
   mcse_logZ <- sqrt(mcse_var_accum)
-  cat(sprintf("\nDone in %d rounds. Final λ=%.3f | logZ≈%.4f ± %.4f (MCSE)\n",
-              round, lambda, log_evidence, mcse_logZ))
+  cat(sprintf("\nDone in %d rounds. Final λ=%.3f/%.3f | logZ≈%.4f ± %.4f (MCSE)\n",
+              round, lambda, lambda_target, log_evidence, mcse_logZ))
   list(
     Theta = Theta, Z = Z, loglik = loglik, w = w, transport = Tmap,
     ref_mix = ref_mix, lp_ref = lp_ref,
     final_lambda = lambda, log_evidence = log_evidence,
     mcse_logZ = mcse_logZ, lpz = lpz,
+    elite_mix_final = last_elite_mix,
+    elite_history = elite_history,
+    checkpoint_lambdas = checkpoint_lambdas,
+    checkpoint_log_evidence = checkpoint_log_evidence,
+    checkpoint_log_increments = checkpoint_log_increments,
+    seed_plan = seed_plan,
     meta = list(rounds = round, ess = ESS(w), lambda_hist = lambda_hist,
                 rw_scale_final = exp(log_rw_scale),
                 pcn_beta_final = plogis(logit_pcn_beta),

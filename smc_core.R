@@ -542,11 +542,13 @@ cess_target_at_lambda <- function(lambda) {
 next_lambda_via_rCESS <- function(w, loglik, lambda,
                                   target = 0.92,
                                   eps_stop = 1e-6,
-                                  itmax = 30) {
-  if (lambda >= 1 - eps_stop) return(1.0)
-  rem <- 1 - lambda
+                                  itmax = 30,
+                                  lambda_target = 1.0) {
+  lambda_target <- as.numeric(lambda_target)
+  if (lambda >= lambda_target - eps_stop) return(lambda_target)
+  rem <- lambda_target - lambda
   r_full <- rCESS(w, loglik, rem)
-  if (is.finite(r_full) && r_full >= target) return(1.0)
+  if (is.finite(r_full) && r_full >= target) return(lambda_target)
   lo <- 0.0; hi <- rem
   for (it in 1:itmax) {
     mid <- 0.5 * (lo + hi)
@@ -561,11 +563,13 @@ next_lambda_via_rCESS <- function(w, loglik, lambda,
 next_lambda_via_rCESS_stat <- function(w, h, lambda,
                                        target = 0.92,
                                        eps_stop = 1e-6,
-                                       itmax = 30) {
-  if (lambda >= 1 - eps_stop) return(1.0)
-  rem <- 1 - lambda
+                                       itmax = 30,
+                                       lambda_target = 1.0) {
+  lambda_target <- as.numeric(lambda_target)
+  if (lambda >= lambda_target - eps_stop) return(lambda_target)
+  rem <- lambda_target - lambda
   r_full <- rCESS_stat(w, h, rem)
-  if (is.finite(r_full) && r_full >= target) return(1.0)
+  if (is.finite(r_full) && r_full >= target) return(lambda_target)
   lo <- 0.0; hi <- rem
   for (it in 1:itmax) {
     mid <- 0.5 * (lo + hi)
