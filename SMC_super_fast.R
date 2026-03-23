@@ -1,11 +1,7 @@
 # ========================================================================
 # Per-group / local SMC sampler
-#
-# Historical note:
-# - This is the maintained local SMC, despite older benchmark scripts using
-#   different stage labels.
-# - It runs one group at a time and produces the local particle system,
-#   transport map, and proposal objects reused later.
+# - Runs one group at a time and returns the local particle system,
+#   transport map, and proposal objects used by the EMC example runner
 #
 # This implementation provides:
 # - Adaptive SMC with temperature schedule based on conditional ESS (CESS)
@@ -22,11 +18,11 @@ suppressPackageStartupMessages({
   library(matrixStats)
 })
 
-# Source utility functions if present
+# Source the shared local SMC utilities.
 source("smc_core.R")
 
 
-# ------------- Utilities: moved to utility_funs.R -------------
+# ----------------------------- transport utilities -----------------------------
 
 # Create tail-safe CDF transformation bundle for marginal distributions
 # Handles degenerate dimensions and provides robust tail behavior
@@ -347,8 +343,7 @@ weak_dims_from_Z <- function(Z, w, frac = 0.30, min_keep = 1L) {
   order(rowSums(Z))
 }
 
-# ------------- Mixture helpers moved to utility_funs.R -------------
-# See utility_funs.R for: prep_mix_cache, gmm_logpdf_Z_vec,
+# ----------------------------- mixture helpers -----------------------------
 # dmvt_mixture_logpdf_Z_vec, regularize_cov, merge_components,
 # prune_merge_mixture_Z
 
@@ -442,8 +437,7 @@ weak_dims_from_Z <- function(Z, w, frac = 0.30, min_keep = 1L) {
   rep_vals[gidx]
 }
 
-# ------------- Mixture sampling moved to utility_funs.R -------------
-# See utility_funs.R for: sample_gmm_Z_qmc, rmvt_mixture_Z_qmc
+# ----------------------------- mixture sampling -----------------------------
 
 # Combine elite mixtures from recent history into single mixture
 # Args:
@@ -512,7 +506,6 @@ weak_dims_from_Z <- function(Z, w, frac = 0.30, min_keep = 1L) {
 }
 
 # ------------- Difficulty index and light-touch adaptations -------------
-# Basic helpers moved to utility_funs.R: .clamp
 
 # Fit weighted Gaussian mixture model in whitened coordinates
 # Uses robust EM algorithm with Cholesky regularization and warm start support
@@ -548,7 +541,7 @@ weak_dims_from_Z <- function(Z, w, frac = 0.30, min_keep = 1L) {
 
 
 
-# ------------- Resampling moved to utility_funs.R -------------
+# ----------------------------- resampling -----------------------------
 
 # Vectorized MCMC moves in transformed space with mixture proposals
 # Combines random-walk and independence proposals from elite/history mixtures
@@ -997,8 +990,7 @@ maybe_update_ref_mix <- function(lambda, elite_mix, hist_mix,
        snapshot_taken = snapshot_taken, refresh_taken = refresh_taken)
 }
 
-# ------------- Convergence helpers moved to utility_funs.R -------------
-# See utility_funs.R for: rCESS, cess_target_at_lambda, next_lambda_via_rCESS
+# ----------------------------- convergence helpers -----------------------------
 
 # Removed unused helper: grow_particles_keep (was never called)
 

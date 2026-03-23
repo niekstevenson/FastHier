@@ -1,9 +1,8 @@
 #!/usr/bin/env Rscript
 # ============================================================================
 # SMC Core Utilities
-# - Shared numerics, rCESS scheduling, resampling, and likelihood helpers
-# - Consolidates functionality used by the maintained local SMC and the
-#   retained hierarchical-state helper code
+# - Shared numerics, rCESS scheduling, resampling, mixture helpers, and
+#   likelihood batching for the local SMC workflow
 # ============================================================================
 
 suppressPackageStartupMessages({
