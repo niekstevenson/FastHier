@@ -1,0 +1,445 @@
+#!/usr/bin/env Rscript
+# ============================================================================
+# Hierarchical local-reference workflow
+# - Broad reference prior construction
+# - Stratified pilot-subset selection
+# - Refined reference-prior construction from pilot local fits
+# - Full local refits under the refined reference prior
+# ============================================================================
+
+if (!exists("%||%", mode = "function") ||
+    !exists("weighted_cov", mode = "function") ||
+    !exists("regularize_cov", mode = "function")) {
+  source("smc_core.R")
+}
+if (!exists("normalize_reference_prior", mode = "function") ||
+    !exists("make_broad_reference_prior", mode = "function")) {
+  source("reference_priors.R")
+}
+if (!exists("enhanced_smc_elite", mode = "function")) {
+  source("SMC_super_fast.R")
+}
+
+suppressPackageStartupMessages({
+  library(parallel)
+})
+
+normalize_particle_weights <- function(w) {
+  w <- pmax(as.numeric(w), 0)
+  sw <- sum(w)
+  if (!is.finite(sw) || sw <= 0) {
+    rep(1 / length(w), length(w))
+  } else {
+    w / sw
+  }
+}
+
+weighted_particle_moments <- function(Theta, w) {
+  Theta <- as.matrix(Theta)
+  w <- normalize_particle_weights(w)
+  mu <- colSums(Theta * w)
+  Sigma <- regularize_cov(weighted_cov(Theta, w), min_eig = 1e-8, cond_cap = 1e8)
+  names(mu) <- colnames(Theta)
+  dimnames(Sigma) <- list(colnames(Theta), colnames(Theta))
+  list(mu = mu, Sigma = Sigma)
+}
+
+summarize_local_reference_fit <- function(local_fit) {
+  if (is.null(local_fit$Theta) || is.null(local_fit$w)) {
+    stop("local_fit must contain Theta and w.")
+  }
+  moments <- weighted_particle_moments(local_fit$Theta, local_fit$w)
+  list(
+    local_id = local_fit$local_id %||% NA_integer_,
+    mu = moments$mu,
+    Sigma = moments$Sigma,
+    log_evidence = as.numeric(local_fit$log_evidence %||% NA_real_),
+    mcse_log_evidence = as.numeric(local_fit$mcse_logZ %||% NA_real_)
+  )
+}
+
+default_local_feature_vector <- function(data_i) {
+  if (is.data.frame(data_i)) {
+    n_obs <- nrow(data_i)
+    numeric_part <- data_i[, vapply(data_i, is.numeric, logical(1)), drop = FALSE]
+    vals <- unlist(numeric_part, use.names = FALSE)
+  } else if (is.matrix(data_i)) {
+    n_obs <- nrow(data_i)
+    vals <- as.numeric(data_i[is.finite(data_i)])
+  } else {
+    flat <- unlist(data_i, recursive = TRUE, use.names = FALSE)
+    n_obs <- length(flat)
+    vals <- suppressWarnings(as.numeric(flat))
+    vals <- vals[is.finite(vals)]
+  }
+
+  vals <- vals[is.finite(vals)]
+  if (!length(vals)) vals <- 0
+  value_sd <- stats::sd(vals)
+  if (!is.finite(value_sd)) value_sd <- 0
+
+  c(
+    n_obs = as.numeric(max(1L, n_obs)),
+    value_mean = mean(vals),
+    value_sd = value_sd,
+    value_q90 = as.numeric(stats::quantile(vals, probs = 0.90, names = FALSE, na.rm = TRUE))
+  )
+}
+
+compute_local_feature_matrix <- function(data_list, feature_fn = default_local_feature_vector) {
+  features <- lapply(data_list, feature_fn)
+  lens <- vapply(features, length, integer(1))
+  if (length(unique(lens)) != 1L) {
+    stop("feature_fn must return feature vectors with a constant length across locals.")
+  }
+  names_ref <- names(features[[1L]]) %||% paste0("feature_", seq_len(lens[1L]))
+  out <- do.call(rbind, lapply(features, function(x) {
+    x <- as.numeric(x)
+    names(x) <- names_ref
+    x
+  }))
+  colnames(out) <- names_ref
+  out[!is.finite(out)] <- 0
+  out
+}
+
+make_pilot_strata <- function(data_list = NULL,
+                              feature_matrix = NULL,
+                              n_strata = NULL,
+                              feature_fn = default_local_feature_vector,
+                              seed = 123L) {
+  feature_matrix <- if (is.null(feature_matrix)) {
+    compute_local_feature_matrix(data_list, feature_fn = feature_fn)
+  } else {
+    as.matrix(feature_matrix)
+  }
+  L <- nrow(feature_matrix)
+  if (L <= 1L) return(rep.int(1L, L))
+
+  n_strata <- as.integer(n_strata %||% min(max(2L, floor(sqrt(L))), L))
+  n_strata <- max(1L, min(n_strata, L))
+  X <- scale(feature_matrix)
+  X[!is.finite(X)] <- 0
+
+  if (n_strata == 1L || nrow(unique(X)) == 1L) {
+    return(rep.int(1L, L))
+  }
+
+  set.seed(as.integer(seed))
+  km <- stats::kmeans(
+    X,
+    centers = n_strata,
+    nstart = min(10L, n_strata),
+    iter.max = 50L
+  )
+  as.integer(km$cluster)
+}
+
+.allocate_stratified_counts <- function(strata, subset_size) {
+  strata <- as.integer(strata)
+  tab <- table(strata)
+  counts <- as.integer(tab)
+  H <- length(counts)
+  subset_size <- min(as.integer(subset_size), sum(counts))
+  if (subset_size <= 0L) stop("subset_size must be positive.")
+
+  raw <- subset_size * counts / sum(counts)
+  alloc <- floor(raw)
+  min_alloc <- if (subset_size >= H) as.integer(counts > 0) else rep.int(0L, H)
+  alloc <- pmax(alloc, min_alloc)
+  alloc <- pmin(alloc, counts)
+
+  while (sum(alloc) > subset_size) {
+    reducible <- which(alloc > min_alloc)
+    if (!length(reducible)) break
+    idx <- reducible[which.min(raw[reducible] - alloc[reducible])]
+    alloc[idx] <- alloc[idx] - 1L
+  }
+  while (sum(alloc) < subset_size) {
+    expandable <- which(alloc < counts)
+    if (!length(expandable)) break
+    idx <- expandable[which.max(raw[expandable] - alloc[expandable])]
+    alloc[idx] <- alloc[idx] + 1L
+  }
+
+  stats::setNames(alloc, names(tab))
+}
+
+select_stratified_pilot_subset <- function(data_list,
+                                           pilot_size = 20L,
+                                           strata = NULL,
+                                           feature_fn = default_local_feature_vector,
+                                           n_strata = NULL,
+                                           seed = 123L) {
+  L <- length(data_list)
+  pilot_size <- min(as.integer(pilot_size), L)
+  if (pilot_size <= 0L) stop("pilot_size must be positive.")
+
+  feature_matrix <- compute_local_feature_matrix(data_list, feature_fn = feature_fn)
+  strata <- strata %||% make_pilot_strata(
+    feature_matrix = feature_matrix,
+    n_strata = n_strata,
+    seed = seed
+  )
+  strata <- as.integer(strata)
+  alloc <- .allocate_stratified_counts(strata, subset_size = pilot_size)
+
+  set.seed(as.integer(seed))
+  groups <- split(seq_len(L), strata)
+  selected <- unlist(
+    Map(
+      function(idx, n_take) {
+        if (n_take <= 0L) return(integer(0))
+        sample(idx, size = n_take, replace = FALSE)
+      },
+      groups,
+      alloc[names(groups)]
+    ),
+    use.names = FALSE
+  )
+  selected <- sort(as.integer(selected))
+
+  list(
+    indices = selected,
+    strata = strata,
+    feature_matrix = feature_matrix,
+    allocation = alloc
+  )
+}
+
+run_reference_local_smc <- function(data_list,
+                                    loglik_fn,
+                                    reference_prior,
+                                    indices = seq_along(data_list),
+                                    M = 2000L,
+                                    n_jobs = 1L,
+                                    local_n_cores = 1L,
+                                    base_seed = 123L,
+                                    verbose = TRUE,
+                                    ...) {
+  reference_prior <- normalize_reference_prior(reference_prior = reference_prior)
+  extra_args <- list(...)
+  blocked <- intersect(names(extra_args), c("data", "loglik_fn", "reference_prior", "M", "n_cores", "seed", "verbose"))
+  if (length(blocked)) {
+    stop("Pass ", paste(blocked, collapse = ", "), " via the dedicated run_reference_local_smc arguments.")
+  }
+  indices <- sort(unique(as.integer(indices)))
+  fits <- parallel::mclapply(
+    indices,
+    function(i) {
+      fit_args <- modifyList(
+        list(
+          data = data_list[[i]],
+          loglik_fn = loglik_fn,
+          reference_prior = reference_prior,
+          M = as.integer(M),
+          n_cores = as.integer(local_n_cores),
+          seed = as.integer(base_seed + i - 1L),
+          verbose = verbose
+        ),
+        extra_args
+      )
+      fit <- do.call(enhanced_smc_elite, fit_args)
+      fit$local_id <- as.integer(i)
+      fit$reference_prior_label <- reference_prior$label
+      fit
+    },
+    mc.cores = as.integer(max(1L, n_jobs))
+  )
+  names(fits) <- as.character(indices)
+  fits
+}
+
+aggregate_pilot_local_moments <- function(pilot_fits) {
+  if (!length(pilot_fits)) stop("pilot_fits must be non-empty.")
+  summaries <- lapply(pilot_fits, summarize_local_reference_fit)
+  mu_list <- lapply(summaries, `[[`, "mu")
+  Sigma_list <- lapply(summaries, `[[`, "Sigma")
+  mu_bar <- Reduce(`+`, mu_list) / length(mu_list)
+  Sigma_bar <- Reduce(
+    `+`,
+    Map(
+      function(mu_i, Sigma_i) {
+        dm <- as.numeric(mu_i - mu_bar)
+        Sigma_i + tcrossprod(dm)
+      },
+      mu_list,
+      Sigma_list
+    )
+  ) / length(Sigma_list)
+  Sigma_bar <- regularize_cov(Sigma_bar, min_eig = 1e-8, cond_cap = 1e8)
+  names(mu_bar) <- names(mu_list[[1L]])
+  dimnames(Sigma_bar) <- list(names(mu_bar), names(mu_bar))
+  list(
+    mu = mu_bar,
+    Sigma = Sigma_bar,
+    local_summaries = summaries
+  )
+}
+
+build_refined_reference_prior <- function(pilot_fits,
+                                          method = c("defensive_mixture", "broadened_gaussian"),
+                                          inflation = 1.5,
+                                          defensive_weight = 0.10,
+                                          broad_reference = NULL,
+                                          defensive_scale = 4) {
+  method <- match.arg(method)
+  pilot_summary <- aggregate_pilot_local_moments(pilot_fits)
+
+  core_prior <- make_reference_prior_gaussian(
+    mu = pilot_summary$mu,
+    Sigma = pilot_summary$Sigma,
+    scale = inflation,
+    param_names = names(pilot_summary$mu),
+    label = "pilot_centered_gaussian"
+  )
+
+  if (identical(method, "broadened_gaussian")) {
+    return(core_prior)
+  }
+
+  defensive_prior <- if (is.null(broad_reference)) {
+    inflate_reference_prior(core_prior, scale = defensive_scale, label = "pilot_defensive_component")
+  } else {
+    normalize_reference_prior(reference_prior = broad_reference)
+  }
+
+  combine_reference_priors(
+    priors = list(core_prior, defensive_prior),
+    weights = c(1 - defensive_weight, defensive_weight),
+    label = "pilot_defensive_mixture"
+  )
+}
+
+build_local_reference_object <- function(local_fit, reference_prior) {
+  if (is.null(local_fit$Theta) || is.null(local_fit$w)) {
+    stop("local_fit must contain Theta and w.")
+  }
+  particles <- as.matrix(local_fit$Theta)
+  reference_prior <- normalize_reference_prior(reference_prior = reference_prior)
+  structure(
+    list(
+      local_id = as.integer(local_fit$local_id %||% NA_integer_),
+      particles = particles,
+      weights = normalize_particle_weights(local_fit$w),
+      log_evidence = as.numeric(local_fit$log_evidence %||% NA_real_),
+      mcse_log_evidence = as.numeric(local_fit$mcse_logZ %||% NA_real_),
+      reference_prior = reference_prior,
+      log_reference_density = reference_prior_logpdf(reference_prior, particles),
+      diagnostics = list(
+        rounds = as.integer(local_fit$meta$rounds %||% NA_integer_),
+        final_lambda = as.numeric(local_fit$final_lambda %||% NA_real_)
+      )
+    ),
+    class = "reference_local_object"
+  )
+}
+
+build_local_reference_objects <- function(local_fits, reference_prior) {
+  objs <- lapply(local_fits, build_local_reference_object, reference_prior = reference_prior)
+  names(objs) <- names(local_fits)
+  objs
+}
+
+prepare_reference_local_stage <- function(data_list,
+                                          loglik_fn,
+                                          base_mu,
+                                          base_Sigma,
+                                          pilot_size = 20L,
+                                          broad_scale = 4,
+                                          broad_defensive = FALSE,
+                                          pilot_particles = 1000L,
+                                          full_particles = 4000L,
+                                          refined_method = c("defensive_mixture", "broadened_gaussian"),
+                                          inflation = 1.5,
+                                          defensive_weight = 0.10,
+                                          defensive_scale = 4,
+                                          n_jobs = 1L,
+                                          pilot_local_n_cores = 1L,
+                                          full_local_n_cores = 1L,
+                                          base_seed = 123L,
+                                          feature_fn = default_local_feature_vector,
+                                          n_strata = NULL,
+                                          verbose = TRUE,
+                                          pilot_smc_control = list(
+                                            n_mcmc_moves = 1L,
+                                            max_rounds = 50L,
+                                            G_mix = 8L,
+                                            hist_mix_enable = FALSE,
+                                            gss_enable = FALSE,
+                                            da_enable = FALSE
+                                          ),
+                                          full_smc_control = list()) {
+  refined_method <- match.arg(refined_method)
+
+  broad_reference <- make_broad_reference_prior(
+    mu = base_mu,
+    Sigma = base_Sigma,
+    scale = broad_scale,
+    defensive = broad_defensive,
+    defensive_scale = broad_scale * defensive_scale,
+    defensive_weight = defensive_weight
+  )
+
+  pilot <- select_stratified_pilot_subset(
+    data_list = data_list,
+    pilot_size = pilot_size,
+    feature_fn = feature_fn,
+    n_strata = n_strata,
+    seed = base_seed
+  )
+
+  pilot_args <- modifyList(
+    list(
+      data_list = data_list,
+      loglik_fn = loglik_fn,
+      reference_prior = broad_reference,
+      indices = pilot$indices,
+      M = pilot_particles,
+      n_jobs = n_jobs,
+      local_n_cores = pilot_local_n_cores,
+      base_seed = base_seed,
+      verbose = verbose
+    ),
+    pilot_smc_control
+  )
+  pilot_fits <- do.call(run_reference_local_smc, pilot_args)
+
+  refined_reference <- build_refined_reference_prior(
+    pilot_fits = pilot_fits,
+    method = refined_method,
+    inflation = inflation,
+    defensive_weight = defensive_weight,
+    broad_reference = broad_reference,
+    defensive_scale = defensive_scale
+  )
+
+  full_args <- modifyList(
+    list(
+      data_list = data_list,
+      loglik_fn = loglik_fn,
+      reference_prior = refined_reference,
+      indices = seq_along(data_list),
+      M = full_particles,
+      n_jobs = n_jobs,
+      local_n_cores = full_local_n_cores,
+      base_seed = base_seed + 100000L,
+      verbose = verbose
+    ),
+    full_smc_control
+  )
+  local_fits <- do.call(run_reference_local_smc, full_args)
+  local_objects <- build_local_reference_objects(local_fits, reference_prior = refined_reference)
+
+  list(
+    broad_reference = broad_reference,
+    pilot = list(
+      selection = pilot,
+      fits = pilot_fits,
+      summary = aggregate_pilot_local_moments(pilot_fits)
+    ),
+    refined_reference = refined_reference,
+    local_fits = local_fits,
+    local_objects = local_objects
+  )
+}

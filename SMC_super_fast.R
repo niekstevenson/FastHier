@@ -20,6 +20,11 @@ suppressPackageStartupMessages({
 
 # Source the shared local SMC utilities.
 source("smc_core.R")
+if (!exists("normalize_reference_prior", mode = "function") ||
+    !exists("reference_prior_logpdf", mode = "function") ||
+    !exists("reference_prior_sample", mode = "function")) {
+  source("reference_priors.R")
+}
 
 
 # ----------------------------- transport utilities -----------------------------
@@ -215,11 +220,11 @@ fit_copula_transform <- function(X, w, ngrid = 400, tail = 1e-3,
 
 # ---------- TRANSPORT DIAGNOSTICS (drop-in) ----------
 
-compute_transport_diag <- function(Tmap, Theta, mu_ref, prior_L, nsample = 2000L) {
+compute_transport_diag <- function(Tmap, Theta, reference_prior, nsample = 2000L) {
   n <- nrow(Theta)
   if (n > nsample) Theta <- Theta[sample.int(n, nsample), , drop = FALSE]
   Z   <- Tmap$fwd(Theta)
-  lp  <- dmvnorm_chol_log(Theta, mu_ref, prior_L)
+  lp  <- reference_prior_logpdf(reference_prior, Theta)
   lqZ <- dmvnorm_chol_log(Z, rep(0, ncol(Z)), chol(diag(ncol(Z))))
   r   <- lp - (lqZ + Tmap$log_jac(Theta))
 
@@ -241,16 +246,16 @@ shrinkage_from_lambda <- function(lambda) {
 }
 
 # ---------- BUILD (drop-in) ----------
-build_transport <- function(Theta, w, mu_ref, Sigma_ref,
+build_transport <- function(Theta, w, mu_ref = NULL, Sigma_ref = NULL, reference_prior = NULL,
                             lambda = 0,
                             ngrid = 400, tail = 1e-3,
                             verbose = TRUE) {
-  prior_L <- tryCatch(chol(Sigma_ref), error = function(e) chol(Matrix::nearPD(Sigma_ref)$mat))
+  reference_prior <- normalize_reference_prior(reference_prior = reference_prior, mu = mu_ref, Sigma = Sigma_ref)
   Tmap <- fit_copula_transform(
     Theta, w, ngrid = ngrid, tail = tail,
     corr_shrink = shrinkage_from_lambda(lambda)
   )
-  diag <- compute_transport_diag(Tmap, Theta, mu_ref, prior_L)
+  diag <- compute_transport_diag(Tmap, Theta, reference_prior = reference_prior)
   if (isTRUE(verbose)) {
     cat(sprintf("  Transport check: mean=%.4f sd=%.4f | diag_dev=%.3f off_max=%.3f\n",
                 diag$mean, diag$sd, diag$diag_dev, diag$off_max))
@@ -574,6 +579,7 @@ weak_dims_from_Z <- function(Z, w, frac = 0.30, min_keep = 1L) {
 mcmc_moves_z_mix_batched <- function(Z, loglik, lpz, Tmap, lambda,
                                      mu_ref, prior_L, w,
                                      elite_mix, hist_mix = NULL,
+                                     reference_prior,
                                      data, loglik_fn, n_moves = 1,
                                      rw_prob = 0.35, rw_scale = 0.9,
                                      indep_t_df = 7, indep_t_prob = 0.75,
@@ -593,12 +599,18 @@ mcmc_moves_z_mix_batched <- function(Z, loglik, lpz, Tmap, lambda,
                                      da_screen_mix = NULL,    # mixture in Z used to build surrogate
                                      # --- Likelihood cache (optional) ---
                                      ll_cache = NULL,
+                                     allow_pcn = TRUE,
                                      n_cores = 1
                                      ) {
   N <- nrow(Z); d <- ncol(Z)
   if (!is.null(seed)) set.seed(seed)
   if (is.null(param_names)) param_names <- colnames(Z)
   gss_on <- !is.null(ref_mix)
+  allow_pcn <- isTRUE(allow_pcn) && reference_prior_is_gaussian(reference_prior)
+  if (!allow_pcn) pcn_prob <- 0
+  lpz_from_theta <- function(Theta_mat) {
+    as.numeric(reference_prior_logpdf(reference_prior, Theta_mat) - Tmap$log_jac(Theta_mat))
+  }
 
   # Prior-blended RW metric in Z-space
   S_emp <- weighted_cov(Z, w); if (any(!is.finite(S_emp))) S_emp <- diag(d)
@@ -700,7 +712,7 @@ mcmc_moves_z_mix_batched <- function(Z, loglik, lpz, Tmap, lambda,
       Zp_loc <- Tmap$fwd(Theta_p)
       lref_c <- if (gss_on) { if (!is.null(lp_ref_vec)) lp_ref_vec[idx] else log_r_theta(Theta_c, Z[idx,,drop=FALSE], Tmap, ref_mix) } else NULL
       lref_p <- if (gss_on) log_r_theta(Theta_p, Zp_loc, Tmap, ref_mix) else NULL
-      lpz_p  <- as.numeric(dmvnorm_chol_log(Theta_p, mu_ref, prior_L) - Tmap$log_jac(Theta_p))
+      lpz_p  <- lpz_from_theta(Theta_p)
       Lc_t   <- Ltilde_batch(Z[idx,,drop=FALSE], Theta_c, lpz[idx], lref_c)
       Lp_t   <- Ltilde_batch(Zp_loc, Theta_p, lpz_p, lref_p)
       a1 <- Lp_t - Lc_t                     # symmetric proposal ⇒ no q terms
@@ -728,7 +740,7 @@ mcmc_moves_z_mix_batched <- function(Z, loglik, lpz, Tmap, lambda,
         Zp <- Tmap$fwd(Theta_acc)
         Z[idx[acc_idx], ]    <<- Zp
         loglik[idx[acc_idx]] <<- ll_p_pass[match(acc_idx, pass)]
-        lpz[idx[acc_idx]]    <<- as.numeric(dmvnorm_chol_log(Theta_acc, mu_ref, prior_L) - Tmap$log_jac(Theta_acc))
+        lpz[idx[acc_idx]]    <<- lpz_from_theta(Theta_acc)
         acc_pcn              <<- acc_pcn + length(acc_idx)
       }
     } else {
@@ -753,7 +765,7 @@ mcmc_moves_z_mix_batched <- function(Z, loglik, lpz, Tmap, lambda,
         Zp <- Tmap$fwd(Theta_acc)
         Z[idx[ia], ]       <<- Zp
         loglik[idx[ia]]    <<- ll_p[ia]
-        lpz[idx[ia]]       <<- as.numeric(dmvnorm_chol_log(Theta_acc, mu_ref, prior_L) - Tmap$log_jac(Theta_acc))
+        lpz[idx[ia]]       <<- lpz_from_theta(Theta_acc)
         acc_pcn            <<- acc_pcn + length(ia)
       }
     }
@@ -771,7 +783,7 @@ mcmc_moves_z_mix_batched <- function(Z, loglik, lpz, Tmap, lambda,
       Theta_c <- Tmap$inv(Zc); colnames(Theta_c) <- param_names
       lref_c <- if (gss_on) { if (!is.null(lp_ref_vec)) lp_ref_vec[idx] else log_r_theta(Theta_c, Zc, Tmap, ref_mix) } else NULL
       lref_p <- if (gss_on) log_r_theta(Theta_p, Zp, Tmap, ref_mix) else NULL
-      lpz_p  <- as.numeric(dmvnorm_chol_log(Theta_p, mu_ref, prior_L) - Tmap$log_jac(Theta_p))
+      lpz_p  <- lpz_from_theta(Theta_p)
       Lc_t <- Ltilde_batch(Zc, Theta_c, lpz[idx], lref_c)
       Lp_t <- Ltilde_batch(Zp, Theta_p, lpz_p, lref_p)
       a1 <- Lp_t - Lc_t
@@ -795,8 +807,7 @@ mcmc_moves_z_mix_batched <- function(Z, loglik, lpz, Tmap, lambda,
       }
     } else {
       ll_p <- .ll_cached_eval(Theta_p, data, loglik_fn, ll_cache, expect_dups = resampled, n_cores = n_cores)
-      lp_prior_p <- dmvnorm_chol_log(Theta_p, mu_ref, prior_L)
-      lpz_p <- as.numeric(lp_prior_p - Tmap$log_jac(Theta_p))
+      lpz_p <- lpz_from_theta(Theta_p)
       if (gss_on) {
         if (!is.null(lp_ref_vec)) {
           lref_c <- lp_ref_vec[idx]
@@ -847,7 +858,7 @@ mcmc_moves_z_mix_batched <- function(Z, loglik, lpz, Tmap, lambda,
     lq_p <- log_q_mixture(Zp, elite_mix, hist_mix, indep_t_prob, smp$hprob)
     Theta_p <- Tmap$inv(Zp); colnames(Theta_p) <- param_names
     if (da_on) {
-      lpz_p <- as.numeric(dmvnorm_chol_log(Theta_p, mu_ref, prior_L) - Tmap$log_jac(Theta_p))
+      lpz_p <- lpz_from_theta(Theta_p)
       lref_p <- if (gss_on) log_r_theta(Theta_p, Zp, Tmap, ref_mix) else NULL
       Lc_t <- Ltilde_batch(Zc, Theta_c, lpz[idx], lref_c)
       Lp_t <- Ltilde_batch(Zp, Theta_p, lpz_p, lref_p)
@@ -871,7 +882,7 @@ mcmc_moves_z_mix_batched <- function(Z, loglik, lpz, Tmap, lambda,
       }
     } else {
       ll_p <- .ll_cached_eval(Theta_p, data, loglik_fn, ll_cache, expect_dups = resampled, n_cores = n_cores)
-      lpz_p <- as.numeric(dmvnorm_chol_log(Theta_p, mu_ref, prior_L) - Tmap$log_jac(Theta_p))
+      lpz_p <- lpz_from_theta(Theta_p)
       if (gss_on) {
         lref_p <- log_r_theta(Theta_p, Zp, Tmap, ref_mix)
         lt_p <- lpz_p + lambda * ll_p + (1 - lambda) * lref_p
@@ -1048,7 +1059,7 @@ maybe_update_ref_mix <- function(lambda, elite_mix, hist_mix,
 #   seed: random seed
 #   verbose: whether to print progress
 # Returns: list with final samples, weights, transport map, and diagnostics
-enhanced_smc_elite <- function(data, loglik_fn, mu_ref, Sigma_ref,
+enhanced_smc_elite <- function(data, loglik_fn, mu_ref = NULL, Sigma_ref = NULL, reference_prior = NULL,
                                M = 5000L,
                                resample_threshold = 0.6,
                                n_mcmc_moves = 3L,
@@ -1112,13 +1123,25 @@ enhanced_smc_elite <- function(data, loglik_fn, mu_ref, Sigma_ref,
   checkpoint_log_evidence <- numeric(length(checkpoint_lambdas))
   checkpoint_log_increments <- numeric(length(checkpoint_lambdas))
   checkpoint_ptr <- 1L
-  param_names <- names(mu_ref)
-  prior_L <- tryCatch(chol(Sigma_ref), error = function(e) chol(Matrix::nearPD(Sigma_ref)$mat))
+  reference_prior <- normalize_reference_prior(reference_prior = reference_prior, mu = mu_ref, Sigma = Sigma_ref)
+  ref_geom <- reference_prior_geometry(reference_prior)
+  mu_ref <- ref_geom$mean
+  Sigma_ref <- ref_geom$cov
+  param_names <- ref_geom$param_names
+  prior_L <- ref_geom$chol
+  allow_pcn <- reference_prior_is_gaussian(reference_prior)
+  if (!allow_pcn && isTRUE(verbose)) {
+    cat("  Reference prior is not Gaussian; pCN moves disabled.\n")
+  }
+  log_ref_theta <- function(Theta_mat) {
+    as.numeric(reference_prior_logpdf(reference_prior, Theta_mat))
+  }
   # Build likelihood cache (persists across rounds; valid in θ-space)
   ll_cache <- if (ll_cache_enable) .ll_cache_make(digits = ll_cache_digits, cap = ll_cache_cap) else NULL
   cat("Stage 1: sample prior & build transport...\n")
   set.seed(.seed_plan_block(seed_plan, "init", default = seed))
-  Theta <- mvtnorm::rmvnorm(M, mu_ref, Sigma_ref); colnames(Theta) <- param_names
+  Theta <- reference_prior_sample(reference_prior, M)
+  colnames(Theta) <- param_names
   # No cache benefit on the very first batch
   loglik <- ll_parallel(Theta, data, loglik_fn, n_cores)
   warm_theta <- NULL
@@ -1167,8 +1190,7 @@ enhanced_smc_elite <- function(data, loglik_fn, mu_ref, Sigma_ref,
       build_transport(
         warm_theta,
         warm_w,
-        mu_ref = mu_ref,
-        Sigma_ref = Sigma_ref,
+        reference_prior = reference_prior,
         lambda = warm_lambda,
         verbose = FALSE
       ),
@@ -1181,13 +1203,13 @@ enhanced_smc_elite <- function(data, loglik_fn, mu_ref, Sigma_ref,
   if (is.null(Tmap)) {
     Tmap <- build_transport(
       Theta, rep(1 / M, M),
-      mu_ref = mu_ref, Sigma_ref = Sigma_ref,
+      reference_prior = reference_prior,
       lambda = 0,
       verbose = verbose
     )
   }
   Z <- Tmap$fwd(Theta)
-  lpz <- as.numeric(dmvnorm_chol_log(Theta, mu_ref, prior_L) - Tmap$log_jac(Theta))
+  lpz <- as.numeric(log_ref_theta(Theta) - Tmap$log_jac(Theta))
   w <- rep(1/M, M); lambda <- 0; round <- 0L
   log_evidence <- 0.0
   lambda_hist <- c(0)
@@ -1236,7 +1258,7 @@ enhanced_smc_elite <- function(data, loglik_fn, mu_ref, Sigma_ref,
   last_rw_acc  <- NA_real_
   last_pcn_acc <- NA_real_
   last_id_acc  <- NA_real_
-  pcn_disabled <- FALSE
+  pcn_disabled <- !allow_pcn
   pcn_low_streak <- 0
   # --- Adaptive move/jitter knobs ---
   moves_cap <- 8L                 # hard cap on MCMC moves per round
@@ -1356,7 +1378,8 @@ enhanced_smc_elite <- function(data, loglik_fn, mu_ref, Sigma_ref,
           Z, loglik, lpz, Tmap, lambda,
           mu_ref, prior_L, w_new,
           elite_mix = emix_pre, hist_mix = NULL,
-          data, loglik_fn,
+          reference_prior = reference_prior,
+          data = data, loglik_fn = loglik_fn,
           n_moves = 1,
           rw_prob = 0.40, rw_scale = 0.35,
           pcn_prob = 0.60, pcn_beta = pcn_beta_curr,
@@ -1365,6 +1388,7 @@ enhanced_smc_elite <- function(data, loglik_fn, mu_ref, Sigma_ref,
           param_names = param_names,
           weak_dim_idx = integer(0), rw_expand_factor = 1.0,
           resampled = FALSE,
+          allow_pcn = allow_pcn,
           n_cores = n_cores
         )
         Z <- move_pre$Z; loglik <- move_pre$loglik; lpz <- move_pre$lpz
@@ -1416,7 +1440,7 @@ enhanced_smc_elite <- function(data, loglik_fn, mu_ref, Sigma_ref,
       ## --- Decide jitter order after resampling ---
       ## If many exact duplicates or λ is not tiny -> RW-first; else pCN-first.
       dup0 <- 1 - (length(unique(idx)) / length(idx))
-      do_rw_first <- (lambda >= pcn_jitter_first_lambda) || (dup0 > dup_high_thresh) ||
+      do_rw_first <- (!allow_pcn) || (lambda >= pcn_jitter_first_lambda) || (dup0 > dup_high_thresh) ||
                      (is.finite(last_pcn_acc) && last_pcn_acc < 0.10)
 
       if (do_rw_first) {
@@ -1425,7 +1449,8 @@ enhanced_smc_elite <- function(data, loglik_fn, mu_ref, Sigma_ref,
           Z, loglik, lpz, Tmap, lambda,
           mu_ref, prior_L, w,
           elite_mix = .default_std_normal_mix(ncol(Z)), hist_mix = NULL,
-          data, loglik_fn,
+          reference_prior = reference_prior,
+          data = data, loglik_fn = loglik_fn,
           n_moves = 1,
           rw_prob = 1, rw_scale = 0.35,
           pcn_prob = 0, pcn_beta = plogis(logit_pcn_beta),
@@ -1434,20 +1459,22 @@ enhanced_smc_elite <- function(data, loglik_fn, mu_ref, Sigma_ref,
           param_names = param_names,
           weak_dim_idx = integer(0), rw_expand_factor = 1.0,
           resampled = TRUE,
+          allow_pcn = allow_pcn,
           n_cores = n_cores)
         Z <- mover1$Z; loglik <- mover1$loglik; lpz <- mover1$lpz
         Theta <- Tmap$inv(Z); colnames(Theta) <- param_names
         if (gss_enable && !is.null(ref_mix)) lp_ref <- log_r_theta(Theta, Z, Tmap, ref_mix)
 
         dup1 <- 1 - (nrow(unique(Z)) / nrow(Z))
-        need_pcn <- (dup1 > dup_low_thresh) && (lambda < 0.40) && (mover1$rw_accept_rate < 0.35)
+        need_pcn <- allow_pcn && (dup1 > dup_low_thresh) && (lambda < 0.40) && (mover1$rw_accept_rate < 0.35)
         if (need_pcn) {
           cat(sprintf("  Pre-move jitter (pCN second)... [dup1=%.1f%%]\n", 100*dup1))
           movej <- mcmc_moves_z_mix_batched(
             Z, loglik, lpz, Tmap, lambda,
             mu_ref, prior_L, w,
             elite_mix = .default_std_normal_mix(ncol(Z)), hist_mix = NULL,
-            data, loglik_fn,
+            reference_prior = reference_prior,
+            data = data, loglik_fn = loglik_fn,
             n_moves = 1,
             rw_prob = 0, rw_scale = 0.5,
             pcn_prob = 1, pcn_beta = plogis(logit_pcn_beta),
@@ -1456,6 +1483,7 @@ enhanced_smc_elite <- function(data, loglik_fn, mu_ref, Sigma_ref,
             param_names = param_names,
             weak_dim_idx = integer(0), rw_expand_factor = 1.0,
             resampled = TRUE,
+            allow_pcn = allow_pcn,
             n_cores = n_cores)
           Z <- movej$Z; loglik <- movej$loglik; lpz <- movej$lpz
           Theta <- Tmap$inv(Z); colnames(Theta) <- param_names
@@ -1471,7 +1499,8 @@ enhanced_smc_elite <- function(data, loglik_fn, mu_ref, Sigma_ref,
           Z, loglik, lpz, Tmap, lambda,
           mu_ref, prior_L, w,
           elite_mix = .default_std_normal_mix(ncol(Z)), hist_mix = NULL,
-          data, loglik_fn,
+          reference_prior = reference_prior,
+          data = data, loglik_fn = loglik_fn,
           n_moves = 1,
           rw_prob = 0, rw_scale = 0.5,
           pcn_prob = 1, pcn_beta = plogis(logit_pcn_beta),
@@ -1480,6 +1509,7 @@ enhanced_smc_elite <- function(data, loglik_fn, mu_ref, Sigma_ref,
           param_names = param_names,
           weak_dim_idx = integer(0), rw_expand_factor = 1.0,
           resampled = TRUE,
+          allow_pcn = allow_pcn,
           n_cores = n_cores)
         Z <- movej$Z; loglik <- movej$loglik; lpz <- movej$lpz
         Theta <- Tmap$inv(Z); colnames(Theta) <- param_names
@@ -1495,7 +1525,8 @@ enhanced_smc_elite <- function(data, loglik_fn, mu_ref, Sigma_ref,
           Z, loglik, lpz, Tmap, lambda,
           mu_ref, prior_L, w,
           elite_mix = .default_std_normal_mix(ncol(Z)), hist_mix = NULL,
-          data, loglik_fn,
+          reference_prior = reference_prior,
+          data = data, loglik_fn = loglik_fn,
           n_moves = 1,
           rw_prob = 1, rw_scale = 0.35,
           pcn_prob = 0, pcn_beta = plogis(logit_pcn_beta),
@@ -1504,6 +1535,7 @@ enhanced_smc_elite <- function(data, loglik_fn, mu_ref, Sigma_ref,
           param_names = param_names,
           weak_dim_idx = integer(0), rw_expand_factor = 1.0,
           resampled = TRUE,
+          allow_pcn = allow_pcn,
           n_cores = n_cores)
           Z <- mover$Z; loglik <- mover$loglik; lpz <- mover$lpz
           Theta <- Tmap$inv(Z); colnames(Theta) <- param_names
@@ -1559,7 +1591,7 @@ enhanced_smc_elite <- function(data, loglik_fn, mu_ref, Sigma_ref,
       }
       Tmap <- ref$Tmap
       Z    <- Tmap$fwd(Theta)
-      lpz  <- as.numeric(dmvnorm_chol_log(Theta, mu_ref, prior_L) - Tmap$log_jac(Theta))
+      lpz  <- as.numeric(log_ref_theta(Theta) - Tmap$log_jac(Theta))
       # Transport changed => all Z-space objects are invalid under old coordinates.
       last_elite_mix <- NULL
       elite_history  <- list()
@@ -1808,7 +1840,8 @@ enhanced_smc_elite <- function(data, loglik_fn, mu_ref, Sigma_ref,
     move <- mcmc_moves_z_mix_batched(Z, loglik, lpz, Tmap, lambda,
                                          mu_ref, prior_L, w,
                                          elite_mix, hist_mix,
-                                         data, loglik_fn, n_moves = n_moves_eff,
+                                         reference_prior = reference_prior,
+                                         data = data, loglik_fn = loglik_fn, n_moves = n_moves_eff,
                                          rw_prob = rw_prob_eff, rw_scale = rw_scale,
                                          pcn_prob = pcn_prob_eff, pcn_beta = pcn_beta_curr,
                                          indep_t_df = indep_t_df_eff, indep_t_prob = indep_t_prob_eff,
@@ -1825,6 +1858,7 @@ enhanced_smc_elite <- function(data, loglik_fn, mu_ref, Sigma_ref,
                                           da_calib = c(da_calib_info$a, da_calib_info$b),
                                           da_screen_mix = da_screen_mix,
                                           ll_cache = ll_cache,
+                                          allow_pcn = allow_pcn,
                                           n_cores = n_cores)
     Z <- move$Z; loglik <- move$loglik; lpz <- move$lpz
     Theta <- Tmap$inv(Z); colnames(Theta) <- param_names
@@ -1874,7 +1908,7 @@ enhanced_smc_elite <- function(data, loglik_fn, mu_ref, Sigma_ref,
     }
 
     # Compute KL divergence proxy for diagnostics
-    kl_proxy <- mean(lpz) - mean(dmvnorm_chol_log(Theta, mu_ref, prior_L))
+    kl_proxy <- mean(lpz) - mean(log_ref_theta(Theta))
     cat(sprintf("  acc[pCN=%.2f, rw=%.2f, id=%.2f] | KLproxy=%.3f\n",
                 move$pcn_accept_rate, move$rw_accept_rate,
                 move$indep_accept_rate, kl_proxy))
