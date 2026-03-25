@@ -277,6 +277,119 @@ aggregate_pilot_local_moments <- function(pilot_fits) {
   )
 }
 
+.ensure_population_refinement_helpers <- function() {
+  if (!exists("build_population_factor_set", mode = "function") ||
+      !exists("outer_population_smc", mode = "function") ||
+      !exists("population_model_reference_components_from_theta", mode = "function")) {
+    source("outer_population_smc.R")
+  }
+}
+
+.sample_weighted_indices <- function(w, size, seed = NULL) {
+  w <- normalize_particle_weights(w)
+  n <- length(w)
+  size <- as.integer(max(1L, min(size, n)))
+  if (!is.null(seed)) set.seed(as.integer(seed))
+  sample.int(n, size = size, replace = FALSE, prob = w)
+}
+
+fit_pilot_population_model <- function(pilot_fits,
+                                       reference_prior,
+                                       population_model,
+                                       outer_control = list(),
+                                       n_cores = 1L,
+                                       seed = 123L,
+                                       verbose = TRUE) {
+  .ensure_population_refinement_helpers()
+  pilot_objects <- build_local_reference_objects(pilot_fits, reference_prior = reference_prior)
+  factor_set <- build_population_factor_set(pilot_objects, population_model)
+  fit_args <- modifyList(
+    list(
+      factor_set = factor_set,
+      N = 1000L,
+      n_mcmc_moves = 2L,
+      max_rounds = 50L,
+      n_cores = as.integer(n_cores),
+      seed = as.integer(seed),
+      verbose = verbose
+    ),
+    outer_control
+  )
+  do.call(outer_population_smc, fit_args)
+}
+
+build_refined_reference_prior_from_population_fit <- function(population_fit,
+                                                              population_model,
+                                                              method = c("defensive_mixture", "broadened_gaussian"),
+                                                              inflation = 1.5,
+                                                              defensive_weight = 0.10,
+                                                              broad_reference = NULL,
+                                                              defensive_scale = 4,
+                                                              support_size = 8L,
+                                                              support_seed = 123L) {
+  .ensure_population_refinement_helpers()
+  method <- match.arg(method)
+  model <- normalize_population_model(population_model)
+  theta <- .as_hyper_matrix(population_fit$theta, hyper_names = model$hyper_names, hyper_dim = model$hyper_dim)
+  w <- normalize_particle_weights(population_fit$w)
+  comps <- population_model_reference_components_from_theta(model, theta)
+
+  if (identical(method, "broadened_gaussian")) {
+    mu_bar <- Reduce(
+      `+`,
+      Map(function(w_i, mu_i) w_i * mu_i, as.list(w), comps$component_means)
+    )
+    Sigma_bar <- Reduce(
+      `+`,
+      Map(
+        function(w_i, mu_i, Sigma_i) {
+          dm <- as.numeric(mu_i - mu_bar)
+          w_i * (Sigma_i + tcrossprod(dm))
+        },
+        as.list(w),
+        comps$component_means,
+        comps$component_covs
+      )
+    )
+    Sigma_bar <- regularize_cov(Sigma_bar, min_eig = 1e-8, cond_cap = 1e8)
+    core_prior <- make_reference_prior_gaussian(
+      mu = mu_bar,
+      Sigma = Sigma_bar,
+      scale = inflation,
+      param_names = model$alpha_names,
+      label = "pilot_population_gaussian"
+    )
+  } else {
+    idx <- .sample_weighted_indices(w, size = support_size, seed = support_seed)
+    comp_means <- comps$component_means[idx]
+    comp_covs <- lapply(comps$component_covs[idx], function(S) as.numeric(inflation) * S)
+    comp_weights <- normalize_particle_weights(w[idx])
+    core_prior <- make_reference_prior_gaussian_mixture(
+      component_means = comp_means,
+      component_covs = comp_covs,
+      weights = comp_weights,
+      param_names = model$alpha_names,
+      label = "pilot_population_mixture"
+    )
+  }
+
+  if (identical(method, "broadened_gaussian")) {
+    return(core_prior)
+  }
+
+  defensive_prior <- if (is.null(broad_reference)) {
+    inflate_reference_prior(core_prior, scale = defensive_scale, label = "pilot_population_defensive_component")
+  } else {
+    normalize_reference_prior(reference_prior = broad_reference)
+  }
+
+  combine_reference_priors(
+    priors = list(core_prior, defensive_prior),
+    weights = c(1 - defensive_weight, defensive_weight),
+    label = "pilot_population_defensive_mixture"
+  )
+}
+
 build_refined_reference_prior <- function(pilot_fits,
                                           method = c("defensive_mixture", "broadened_gaussian"),
                                           inflation = 1.5,
@@ -360,6 +473,9 @@ prepare_reference_local_stage <- function(data_list,
                                           base_seed = 123L,
                                           feature_fn = default_local_feature_vector,
                                           n_strata = NULL,
+                                          pilot_population_model = NULL,
+                                          pilot_reference_support_size = 8L,
+                                          pilot_outer_control = list(),
                                           verbose = TRUE,
                                           pilot_smc_control = list(
                                             n_mcmc_moves = 1L,
@@ -405,14 +521,38 @@ prepare_reference_local_stage <- function(data_list,
   )
   pilot_fits <- do.call(run_reference_local_smc, pilot_args)
 
-  refined_reference <- build_refined_reference_prior(
-    pilot_fits = pilot_fits,
-    method = refined_method,
-    inflation = inflation,
-    defensive_weight = defensive_weight,
-    broad_reference = broad_reference,
-    defensive_scale = defensive_scale
-  )
+  pilot_population_fit <- NULL
+  refined_reference <- if (is.null(pilot_population_model)) {
+    build_refined_reference_prior(
+      pilot_fits = pilot_fits,
+      method = refined_method,
+      inflation = inflation,
+      defensive_weight = defensive_weight,
+      broad_reference = broad_reference,
+      defensive_scale = defensive_scale
+    )
+  } else {
+    pilot_population_fit <- fit_pilot_population_model(
+      pilot_fits = pilot_fits,
+      reference_prior = broad_reference,
+      population_model = pilot_population_model,
+      outer_control = pilot_outer_control,
+      n_cores = n_jobs,
+      seed = base_seed + 50000L,
+      verbose = verbose
+    )
+    build_refined_reference_prior_from_population_fit(
+      population_fit = pilot_population_fit,
+      population_model = pilot_population_model,
+      method = refined_method,
+      inflation = inflation,
+      defensive_weight = defensive_weight,
+      broad_reference = broad_reference,
+      defensive_scale = defensive_scale,
+      support_size = pilot_reference_support_size,
+      support_seed = base_seed + 50001L
+    )
+  }
 
   full_args <- modifyList(
     list(
@@ -436,7 +576,9 @@ prepare_reference_local_stage <- function(data_list,
     pilot = list(
       selection = pilot,
       fits = pilot_fits,
-      summary = aggregate_pilot_local_moments(pilot_fits)
+      summary = aggregate_pilot_local_moments(pilot_fits),
+      population_fit = pilot_population_fit,
+      refinement_source = if (is.null(pilot_population_model)) "pooled_local_moments" else "pilot_population_fit"
     ),
     refined_reference = refined_reference,
     local_fits = local_fits,

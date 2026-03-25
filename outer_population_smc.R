@@ -17,7 +17,9 @@ if (!exists("normalize_reference_prior", mode = "function") ||
     !exists("reference_prior_logpdf", mode = "function")) {
   source("reference_priors.R")
 }
-if (!exists("normalize_population_model", mode = "function")) {
+if (!exists("normalize_population_model", mode = "function") ||
+    !exists("population_model_prepare_theta", mode = "function") ||
+    !exists("population_model_log_alpha_given_prepared_theta_many", mode = "function")) {
   source("population_models.R")
 }
 
@@ -71,20 +73,94 @@ build_population_local_factor <- function(local_object, population_model) {
       log_reference_density = logq,
       log_base = log_base,
       log_constant = as.numeric(local_object$log_evidence %||% 0),
-      reference_prior = local_object$reference_prior
+      reference_prior = local_object$reference_prior,
+      fast_family = as.character(population_model$fast_family %||% ""),
+      fast_cache = NULL
     ),
     class = "population_local_factor"
   )
 }
 
-population_local_factor_log_marginal_many <- function(factor, theta, include_constant = TRUE) {
+.pack_alpha_quadratic_terms_t <- function(alpha) {
+  alpha <- as.matrix(alpha)
+  d <- ncol(alpha)
+  out <- matrix(0, nrow = d * (d + 1L) / 2L, ncol = nrow(alpha))
+  pos <- 1L
+  for (j in seq_len(d)) {
+    aj <- alpha[, j]
+    out[pos, ] <- aj * aj
+    pos <- pos + 1L
+    if (j < d) {
+      for (k in (j + 1L):d) {
+        out[pos, ] <- 2 * aj * alpha[, k]
+        pos <- pos + 1L
+      }
+    }
+  }
+  out
+}
+
+.gaussian_log_alpha_given_prepared_theta_many <- function(alpha, theta_prepared) {
+  alpha <- as.matrix(alpha)
+  linear <- theta_prepared$eta %*% t(alpha)
+  quad_t <- if (identical(theta_prepared$quadratic_kind, "diag")) {
+    t(alpha * alpha)
+  } else {
+    .pack_alpha_quadratic_terms_t(alpha)
+  }
+  quad <- theta_prepared$quadratic_coef %*% quad_t
+  sweep(linear - 0.5 * quad, 1L, theta_prepared$log_kernel_constant, "+")
+}
+
+.population_log_alpha_given_theta_many <- function(model,
+                                                   alpha,
+                                                   theta = NULL,
+                                                   theta_prepared = NULL) {
+  if (is.null(theta_prepared)) {
+    theta_prepared <- population_model_prepare_theta(model, theta)
+  }
+  if (identical(theta_prepared$family, "gaussian")) {
+    return(.gaussian_log_alpha_given_prepared_theta_many(alpha, theta_prepared))
+  }
+  population_model_log_alpha_given_prepared_theta_many(model, alpha = alpha, theta_prepared = theta_prepared)
+}
+
+.local_log_marginal_blocked <- function(model,
+                                        alpha,
+                                        log_base,
+                                        theta,
+                                        theta_prepared = NULL,
+                                        block_size = 1024L) {
+  theta <- .as_hyper_matrix(theta, hyper_names = model$hyper_names, hyper_dim = model$hyper_dim)
+  theta_prepared <- theta_prepared %||% population_model_prepare_theta(model, theta)
+  block_size <- as.integer(max(1L, block_size))
+  accum <- rep.int(-Inf, nrow(theta))
+  n_alpha <- nrow(alpha)
+
+  for (start in seq.int(1L, n_alpha, by = block_size)) {
+    idx <- seq.int(start, min(start + block_size - 1L, n_alpha))
+    log_terms <- .population_log_alpha_given_theta_many(
+      model = model,
+      alpha = alpha[idx, , drop = FALSE],
+      theta_prepared = theta_prepared
+    )
+    block_lse <- .rowLogSumExp(sweep(log_terms, 2L, log_base[idx], "+"))
+    accum <- rlogsumexp2(accum, block_lse)
+  }
+  as.numeric(accum)
+}
+
+population_local_factor_log_marginal_many <- function(factor, theta, include_constant = TRUE, block_size = 1024L) {
   stopifnot(inherits(factor, "population_local_factor"))
-  logp <- population_model_log_alpha_given_theta_many(
-    factor$population_model,
+  theta_prepared <- population_model_prepare_theta(factor$population_model, theta)
+  out <- .local_log_marginal_blocked(
+    model = factor$population_model,
     alpha = factor$particles,
-    theta = theta
+    log_base = factor$log_base,
+    theta = theta_prepared$theta,
+    theta_prepared = theta_prepared,
+    block_size = block_size
   )
-  out <- .rowLogSumExp(sweep(logp, 2L, factor$log_base, "+"))
   if (isTRUE(include_constant)) out <- out + factor$log_constant
   as.numeric(out)
 }
@@ -95,11 +171,12 @@ population_local_factor_log_marginal <- function(factor, theta, include_constant
 
 population_local_factor_ess <- function(factor, theta) {
   stopifnot(inherits(factor, "population_local_factor"))
-  logp <- population_model_log_alpha_given_theta(
-    factor$population_model,
+  theta_prepared <- population_model_prepare_theta(factor$population_model, theta)
+  logp <- .population_log_alpha_given_theta_many(
+    model = factor$population_model,
     alpha = factor$particles,
-    theta = theta
-  )
+    theta_prepared = theta_prepared
+  )[1L, ]
   lw <- factor$log_base + logp
   lse <- logsumexp(lw)
   if (!is.finite(lse)) return(0)
@@ -109,11 +186,12 @@ population_local_factor_ess <- function(factor, theta) {
 
 population_local_factor_reweighted_particles <- function(factor, theta) {
   stopifnot(inherits(factor, "population_local_factor"))
-  logp <- population_model_log_alpha_given_theta(
-    factor$population_model,
+  theta_prepared <- population_model_prepare_theta(factor$population_model, theta)
+  logp <- .population_log_alpha_given_theta_many(
+    model = factor$population_model,
     alpha = factor$particles,
-    theta = theta
-  )
+    theta_prepared = theta_prepared
+  )[1L, ]
   lw <- factor$log_base + logp
   lse <- logsumexp(lw)
   if (!is.finite(lse)) {
@@ -127,27 +205,87 @@ population_local_factor_reweighted_particles <- function(factor, theta) {
   )
 }
 
-build_population_factor_set <- function(local_objects, population_model) {
+build_population_factor_set <- function(local_objects,
+                                        population_model,
+                                        particle_block_size = 1024L) {
   population_model <- normalize_population_model(population_model)
   factors <- lapply(local_objects, build_population_local_factor, population_model = population_model)
   names(factors) <- names(local_objects)
+  particle_block_size <- as.integer(max(1L, particle_block_size))
+  if (length(factors)) {
+    local_lengths <- vapply(factors, function(factor) nrow(factor$particles), integer(1))
+    alpha <- do.call(rbind, lapply(factors, `[[`, "particles"))
+    log_base <- unlist(lapply(factors, `[[`, "log_base"), use.names = FALSE)
+    local_index <- rep.int(seq_along(factors), local_lengths)
+    block_starts <- seq.int(1L, nrow(alpha), by = particle_block_size)
+    blocks <- lapply(block_starts, function(start) {
+      idx <- seq.int(start, min(start + particle_block_size - 1L, nrow(alpha)))
+      rr <- rle(local_index[idx])
+      ends <- cumsum(rr$lengths)
+      starts <- c(1L, head(ends, -1L) + 1L)
+      list(
+        idx = idx,
+        local = as.integer(rr$values),
+        starts = as.integer(starts),
+        ends = as.integer(ends)
+      )
+    })
+  } else {
+    alpha <- matrix(numeric(0), nrow = 0L, ncol = population_model$alpha_dim)
+    colnames(alpha) <- population_model$alpha_names
+    log_base <- numeric(0)
+    local_index <- integer(0)
+    blocks <- list()
+  }
   structure(
     list(
       population_model = population_model,
       factors = factors,
       n_locals = length(factors),
-      log_constant = sum(vapply(factors, `[[`, numeric(1), "log_constant"))
+      log_constant = sum(vapply(factors, `[[`, numeric(1), "log_constant")),
+      stack = list(
+        alpha = alpha,
+        log_base = log_base,
+        local_index = local_index,
+        blocks = blocks,
+        particle_block_size = particle_block_size
+      )
     ),
     class = "population_factor_set"
   )
 }
 
-.evaluate_factor_batch <- function(factors, theta, include_constant = FALSE) {
-  out <- rep.int(0, nrow(as.matrix(theta)))
-  for (factor in factors) {
-    out <- out + population_local_factor_log_marginal_many(factor, theta = theta, include_constant = include_constant)
+.evaluate_factor_set_stacked <- function(factor_set, theta, include_constant = FALSE) {
+  stopifnot(inherits(factor_set, "population_factor_set"))
+  model <- factor_set$population_model
+  theta <- .as_hyper_matrix(theta, hyper_names = model$hyper_names, hyper_dim = model$hyper_dim)
+  if (!length(factor_set$factors)) {
+    out <- rep.int(0, nrow(theta))
+    if (isTRUE(include_constant)) out <- out + factor_set$log_constant
+    return(out)
   }
-  out
+
+  theta_prepared <- population_model_prepare_theta(model, theta)
+  accum <- matrix(-Inf, nrow = nrow(theta), ncol = factor_set$n_locals)
+
+  for (block in factor_set$stack$blocks) {
+    log_terms <- .population_log_alpha_given_theta_many(
+      model = model,
+      alpha = factor_set$stack$alpha[block$idx, , drop = FALSE],
+      theta_prepared = theta_prepared
+    )
+    log_terms <- sweep(log_terms, 2L, factor_set$stack$log_base[block$idx], "+")
+
+    for (seg_id in seq_along(block$local)) {
+      cols <- seq.int(block$starts[seg_id], block$ends[seg_id])
+      seg_lse <- if (length(cols) == 1L) log_terms[, cols] else .rowLogSumExp(log_terms[, cols, drop = FALSE])
+      accum[, block$local[seg_id]] <- rlogsumexp2(accum[, block$local[seg_id]], as.numeric(seg_lse))
+    }
+  }
+
+  out <- rowSums(accum)
+  if (isTRUE(include_constant)) out <- out + factor_set$log_constant
+  as.numeric(out)
 }
 
 population_factor_set_loglik <- function(factor_set, theta, include_constant = FALSE, n_cores = 1L) {
@@ -160,20 +298,27 @@ population_factor_set_loglik <- function(factor_set, theta, include_constant = F
     return(out)
   }
 
-  if (as.integer(n_cores) <= 1L || length(factor_set$factors) == 1L) {
-    return(.evaluate_factor_batch(factor_set$factors, theta, include_constant = include_constant))
+  if (as.integer(n_cores) <= 1L || nrow(theta) <= 1L) {
+    return(.evaluate_factor_set_stacked(factor_set, theta, include_constant = include_constant))
   }
 
-  split_idx <- cut(seq_along(factor_set$factors), breaks = as.integer(min(n_cores, length(factor_set$factors))), labels = FALSE)
-  batches <- split(factor_set$factors, split_idx)
+  split_idx <- cut(seq_len(nrow(theta)), breaks = as.integer(min(n_cores, nrow(theta))), labels = FALSE)
+  batches <- split(seq_len(nrow(theta)), split_idx)
   parts <- parallel::mclapply(
     batches,
-    .evaluate_factor_batch,
-    theta = theta,
-    include_constant = FALSE,
+    function(idx) {
+      .evaluate_factor_set_stacked(
+        factor_set = factor_set,
+        theta = theta[idx, , drop = FALSE],
+        include_constant = FALSE
+      )
+    },
     mc.cores = as.integer(min(n_cores, length(batches)))
   )
-  out <- Reduce(`+`, parts)
+  out <- numeric(nrow(theta))
+  for (i in seq_along(batches)) {
+    out[batches[[i]]] <- parts[[i]]
+  }
   if (isTRUE(include_constant)) out <- out + factor_set$log_constant
   out
 }
@@ -191,13 +336,75 @@ population_factor_set_logposterior <- function(factor_set, theta, include_consta
     population_factor_set_loglik(factor_set, theta, include_constant = include_constant, n_cores = n_cores)
 }
 
-.outer_sort_order <- function(theta) {
+.outer_cheap_sort_order <- function(Z) {
+  Z <- as.matrix(Z)
+  n <- nrow(Z)
+  if (n <= 1L) return(seq_len(n))
+  if (ncol(Z) <= 1L) return(order(Z[, 1L]))
+  order(rowSums(Z))
+}
+
+.outer_whiten_theta <- function(theta, w = NULL) {
   theta <- as.matrix(theta)
-  if (nrow(theta) <= 1L) return(seq_len(nrow(theta)))
-  if (ncol(theta) == 1L) return(order(theta[, 1L]))
-  theta_sc <- scale(theta)
-  theta_sc[!is.finite(theta_sc)] <- 0
-  order(rowSums(theta_sc))
+  n <- nrow(theta)
+  d <- ncol(theta)
+  if (n <= 1L || d <= 0L) return(theta)
+
+  if (is.null(w)) {
+    w <- rep(1 / n, n)
+  } else {
+    w <- pmax(as.numeric(w), 0)
+    sw <- sum(w)
+    w <- if (!is.finite(sw) || sw <= 0) rep(1 / n, n) else w / sw
+  }
+
+  mu <- colSums(theta * w)
+  S <- tryCatch(weighted_cov(theta, w), error = function(e) NULL)
+  if (is.null(S) || any(!is.finite(S))) {
+    S <- tryCatch(stats::cov(theta), error = function(e) NULL)
+  }
+  if (is.null(S) || any(!is.finite(S))) {
+    S <- diag(d)
+  } else {
+    S <- regularize_cov(S, min_eig = 1e-8, cond_cap = 1e8)
+  }
+
+  L <- tryCatch(chol(S), error = function(e) diag(d))
+  theta_centered <- sweep(theta, 2L, mu, "-")
+  Z <- t(backsolve(L, t(theta_centered), transpose = TRUE))
+  Z[!is.finite(Z)] <- 0
+  Z
+}
+
+.outer_resample_sort_order <- function(theta,
+                                       w = NULL,
+                                       ess_frac = 1,
+                                       mode = c("adaptive", "hilbert", "cheap1d", "none"),
+                                       hilbert_hard_ess = 0.25,
+                                       hilbert_max_dim = 8L) {
+  mode <- match.arg(mode)
+  theta <- as.matrix(theta)
+  if (nrow(theta) <= 1L) {
+    return(list(order = seq_len(nrow(theta)), sort_used = "none"))
+  }
+  if (mode == "none") {
+    return(list(order = seq_len(nrow(theta)), sort_used = "none"))
+  }
+
+  Z <- .outer_whiten_theta(theta, w = w)
+  want_hilbert <- identical(mode, "hilbert") ||
+    (identical(mode, "adaptive") &&
+       ess_frac <= as.numeric(hilbert_hard_ess) &&
+       ncol(Z) <= as.integer(hilbert_max_dim))
+
+  if (isTRUE(want_hilbert)) {
+    ord <- tryCatch(hilbert_sort_order(Z, bits = 16L), error = function(e) NULL)
+    if (!is.null(ord)) {
+      return(list(order = ord, sort_used = "hilbert"))
+    }
+  }
+
+  list(order = .outer_cheap_sort_order(Z), sort_used = "cheap1d")
 }
 
 .outer_rejuvenate <- function(theta,
@@ -205,30 +412,70 @@ population_factor_set_logposterior <- function(factor_set, theta, include_consta
                               loglik_dynamic,
                               beta,
                               factor_set,
-                              n_moves = 3L,
+                              w = NULL,
+                              min_n_moves = 1L,
+                              max_n_moves = 3L,
+                              target_accepted_moves = NULL,
+                              target_accepted_moves_resampled = 1.5,
+                              target_accepted_moves_not_resampled = 0.75,
                               rw_scale = 0.8,
+                              target_accept = 0.234,
+                              rm_gain_move = 0.15,
                               n_cores = 1L,
+                              resampled = FALSE,
                               seed = NULL) {
   if (!is.null(seed)) set.seed(as.integer(seed))
   theta <- as.matrix(theta)
   N <- nrow(theta)
   d <- ncol(theta)
   model <- factor_set$population_model
+  if (N <= 1L) {
+    return(list(
+      theta = theta,
+      logprior = logprior,
+      loglik_dynamic = loglik_dynamic,
+      accept_rate = 0,
+      move_accept = numeric(0),
+      n_moves_used = 0L,
+      cumulative_accept = 0,
+      rw_scale = as.numeric(rw_scale)
+    ))
+  }
 
-  S <- tryCatch(stats::cov(theta), error = function(e) NULL)
+  if (is.null(w)) {
+    w_cov <- rep(1 / N, N)
+  } else {
+    w_cov <- pmax(as.numeric(w), 0)
+    sw <- sum(w_cov)
+    w_cov <- if (!is.finite(sw) || sw <= 0) rep(1 / N, N) else w_cov / sw
+  }
+
+  S <- tryCatch(weighted_cov(theta, w_cov), error = function(e) NULL)
+  if (is.null(S) || any(!is.finite(S))) {
+    S <- tryCatch(stats::cov(theta), error = function(e) NULL)
+  }
   if (is.null(S) || any(!is.finite(S))) {
     S <- diag(d)
   } else {
     S <- regularize_cov(S, min_eig = 1e-8, cond_cap = 1e8)
   }
   Lrw <- tryCatch(chol(S), error = function(e) diag(d))
-  step_scale <- as.numeric(rw_scale) / sqrt(max(d, 1))
+  log_rw_scale <- log(pmax(as.numeric(rw_scale), 1e-6))
+  min_n_moves <- as.integer(max(1L, min_n_moves))
+  max_n_moves <- as.integer(max(min_n_moves, max_n_moves))
+  target_accepted_moves <- as.numeric(
+    target_accepted_moves %||%
+      if (isTRUE(resampled)) target_accepted_moves_resampled else target_accepted_moves_not_resampled
+  )
 
   acc_total <- 0L
   prop_total <- 0L
   logpost <- logprior + beta * loglik_dynamic
+  move_accept <- numeric(0)
+  cumulative_accept <- 0
 
-  for (move_id in seq_len(max(1L, as.integer(n_moves)))) {
+  for (move_id in seq_len(max_n_moves)) {
+    step_scale <- exp(log_rw_scale) / sqrt(max(d, 1))
     theta_prop <- theta + step_scale * (matrix(rnorm(N * d), nrow = N, ncol = d) %*% Lrw)
     colnames(theta_prop) <- model$hyper_names
 
@@ -247,6 +494,14 @@ population_factor_set_logposterior <- function(factor_set, theta, include_consta
     log_alpha <- logpost_prop - logpost
     accept <- which(log(runif(N)) < pmin(0, log_alpha))
     prop_total <- prop_total + N
+    accept_rate_move <- length(accept) / N
+    move_accept <- c(move_accept, accept_rate_move)
+    cumulative_accept <- cumulative_accept + accept_rate_move
+    log_rw_scale <- .clamp(
+      log_rw_scale + as.numeric(rm_gain_move) * (accept_rate_move - as.numeric(target_accept)),
+      log(0.05),
+      log(4.0)
+    )
 
     if (length(accept)) {
       theta[accept, ] <- theta_prop[accept, , drop = FALSE]
@@ -255,13 +510,21 @@ population_factor_set_logposterior <- function(factor_set, theta, include_consta
       logpost[accept] <- logpost_prop[accept]
       acc_total <- acc_total + length(accept)
     }
+
+    if (move_id >= min_n_moves && cumulative_accept >= target_accepted_moves) {
+      break
+    }
   }
 
   list(
     theta = theta,
     logprior = logprior,
     loglik_dynamic = loglik_dynamic,
-    accept_rate = if (prop_total > 0L) acc_total / prop_total else 0
+    accept_rate = if (prop_total > 0L) acc_total / prop_total else 0,
+    move_accept = move_accept,
+    n_moves_used = length(move_accept),
+    cumulative_accept = cumulative_accept,
+    rw_scale = exp(log_rw_scale)
   )
 }
 
@@ -269,11 +532,19 @@ outer_population_smc <- function(factor_set,
                                  N = 2000L,
                                  resample_threshold = 0.5,
                                  n_mcmc_moves = 3L,
+                                 min_mcmc_moves = 1L,
                                  max_rounds = 100L,
                                  beta_target = 1.0,
                                  rw_scale_init = 0.8,
                                  target_accept = 0.234,
-                                 rm_gain = 0.05,
+                                 rm_gain = 0.15,
+                                 target_accepted_moves = NULL,
+                                 target_accepted_moves_resampled = 1.5,
+                                 target_accepted_moves_not_resampled = 0.75,
+                                 deterministic_resampling = FALSE,
+                                 resample_sort_mode = c("adaptive", "hilbert", "cheap1d", "none"),
+                                 hilbert_hard_ess = 0.25,
+                                 hilbert_max_dim = 8L,
                                  n_cores = 1L,
                                  seed = 123L,
                                  verbose = TRUE) {
@@ -286,6 +557,9 @@ outer_population_smc <- function(factor_set,
   if (!is.finite(beta_target) || beta_target <= 0 || beta_target > 1) {
     stop("beta_target must be in (0, 1].")
   }
+  resample_sort_mode <- match.arg(resample_sort_mode)
+  min_mcmc_moves <- as.integer(max(1L, min_mcmc_moves))
+  n_mcmc_moves <- as.integer(max(min_mcmc_moves, n_mcmc_moves))
 
   theta <- population_model_sample_hyper(model, n = as.integer(N))
   colnames(theta) <- model$hyper_names
@@ -304,6 +578,8 @@ outer_population_smc <- function(factor_set,
   accept_hist <- numeric(0)
   rw_scale_hist <- exp(log_rw_scale)
   resampled_hist <- logical(0)
+  moves_hist <- integer(0)
+  sort_hist <- character(0)
 
   while (beta < beta_target - 1e-12 && round < as.integer(max_rounds)) {
     round <- round + 1L
@@ -343,9 +619,19 @@ outer_population_smc <- function(factor_set,
                  round, beta, beta_new, ess_now, log_evidence_dynamic))
 
     beta <- beta_new
+    sort_used <- "not_used"
     if (ess_now < resample_threshold) {
-      ord <- .outer_sort_order(theta)
-      idx_sorted <- stratified_resample_sorted(w[ord], deterministic = FALSE)
+      sort_info <- .outer_resample_sort_order(
+        theta = theta,
+        w = w,
+        ess_frac = ess_now,
+        mode = resample_sort_mode,
+        hilbert_hard_ess = hilbert_hard_ess,
+        hilbert_max_dim = hilbert_max_dim
+      )
+      ord <- sort_info$order
+      sort_used <- sort_info$sort_used
+      idx_sorted <- stratified_resample_sorted(w[ord], deterministic = deterministic_resampling)
       idx <- ord[idx_sorted]
       theta <- theta[idx, , drop = FALSE]
       logprior <- logprior[idx]
@@ -360,26 +646,39 @@ outer_population_smc <- function(factor_set,
       loglik_dynamic = loglik_dynamic,
       beta = beta,
       factor_set = factor_set,
-      n_moves = n_mcmc_moves,
+      w = w,
+      min_n_moves = min_mcmc_moves,
+      max_n_moves = n_mcmc_moves,
+      target_accepted_moves = target_accepted_moves,
+      target_accepted_moves_resampled = target_accepted_moves_resampled,
+      target_accepted_moves_not_resampled = target_accepted_moves_not_resampled,
       rw_scale = exp(log_rw_scale),
+      target_accept = target_accept,
+      rm_gain_move = rm_gain,
       n_cores = n_cores,
+      resampled = resampled,
       seed = seed + 1009L * round
     )
     theta <- rejuvenated$theta
     logprior <- rejuvenated$logprior
     loglik_dynamic <- rejuvenated$loglik_dynamic
     accept_rate <- rejuvenated$accept_rate
-
-    log_rw_scale <- .clamp(log_rw_scale + rm_gain * (accept_rate - target_accept), log(0.05), log(2.0))
+    log_rw_scale <- log(pmax(rejuvenated$rw_scale, 1e-6))
 
     beta_hist <- c(beta_hist, beta)
     ess_hist <- c(ess_hist, ess_now)
     accept_hist <- c(accept_hist, accept_rate)
     rw_scale_hist <- c(rw_scale_hist, exp(log_rw_scale))
     resampled_hist <- c(resampled_hist, resampled)
+    moves_hist <- c(moves_hist, rejuvenated$n_moves_used)
+    sort_hist <- c(sort_hist, sort_used)
 
-    vcat(sprintf("  Rejuvenation accept=%.3f | rw_scale=%.3f%s\n",
-                 accept_rate, exp(log_rw_scale), if (resampled) " | resampled" else ""))
+    vcat(sprintf("  Rejuvenation accept=%.3f | moves=%d | rw_scale=%.3f%s%s\n",
+                 accept_rate,
+                 rejuvenated$n_moves_used,
+                 exp(log_rw_scale),
+                 if (resampled) " | resampled" else "",
+                 if (identical(sort_used, "not_used")) "" else paste0(" | sort=", sort_used)))
   }
 
   if (beta < beta_target - 1e-12) {
@@ -403,7 +702,9 @@ outer_population_smc <- function(factor_set,
       ess_hist = ess_hist,
       accept_hist = accept_hist,
       rw_scale_hist = rw_scale_hist,
-      resampled_hist = resampled_hist
+      resampled_hist = resampled_hist,
+      moves_hist = moves_hist,
+      sort_hist = sort_hist
     )
   )
 }

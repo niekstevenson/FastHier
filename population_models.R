@@ -53,6 +53,122 @@ if (!exists("%||%", mode = "function")) {
   theta
 }
 
+.pack_gaussian_precision <- function(precision) {
+  precision <- as.array(precision)
+  if (length(dim(precision)) == 2L) {
+    precision <- array(precision, dim = c(nrow(precision), ncol(precision), 1L))
+  }
+  if (length(dim(precision)) != 3L) {
+    stop("precision must be a matrix or a 3D array.")
+  }
+
+  d <- dim(precision)[1L]
+  qdim <- d * (d + 1L) / 2L
+  out <- matrix(0, nrow = dim(precision)[3L], ncol = qdim)
+  pos <- 1L
+  for (j in seq_len(d)) {
+    out[, pos] <- as.numeric(precision[j, j, ])
+    pos <- pos + 1L
+    if (j < d) {
+      for (k in (j + 1L):d) {
+        out[, pos] <- 2 * as.numeric(precision[j, k, ])
+        pos <- pos + 1L
+      }
+    }
+  }
+  out
+}
+
+prepare_gaussian_theta <- function(mean,
+                                   precision,
+                                   logdet_precision,
+                                   alpha_names = colnames(mean)) {
+  mean <- as.matrix(mean)
+  n_theta <- nrow(mean)
+  d <- ncol(mean)
+  precision <- as.array(precision)
+
+  if (length(dim(precision)) == 2L) {
+    precision <- array(precision, dim = c(nrow(precision), ncol(precision), 1L))
+  }
+  if (dim(precision)[1L] != d || dim(precision)[2L] != d) {
+    stop("precision dimensions do not match mean.")
+  }
+  if (dim(precision)[3L] == 1L && n_theta > 1L) {
+    precision <- precision[, , rep.int(1L, n_theta), drop = FALSE]
+  }
+  if (dim(precision)[3L] != n_theta) {
+    stop("precision must provide one matrix per theta row.")
+  }
+
+  logdet_precision <- rep_len(as.numeric(logdet_precision), n_theta)
+  eta <- t(vapply(
+    seq_len(n_theta),
+    function(i) as.numeric(precision[, , i, drop = TRUE] %*% mean[i, ]),
+    numeric(d)
+  ))
+
+  out <- list(
+    family = "gaussian",
+    theta = mean,
+    mean = mean,
+    eta = eta,
+    quadratic_kind = "packed",
+    quadratic_coef = .pack_gaussian_precision(precision),
+    log_kernel_constant = -0.5 * (
+      d * log(2 * pi) -
+        logdet_precision +
+        rowSums(mean * eta)
+    ),
+    alpha_dim = d,
+    alpha_names = alpha_names
+  )
+  colnames(out$eta) <- alpha_names
+  out
+}
+
+prepare_gaussian_theta_diag <- function(mean,
+                                        sigma2,
+                                        alpha_names = colnames(mean)) {
+  mean <- as.matrix(mean)
+  sigma2 <- as.matrix(sigma2)
+  n_theta <- nrow(mean)
+  d <- ncol(mean)
+
+  if (ncol(sigma2) != d) {
+    stop("sigma2 dimensions do not match mean.")
+  }
+  if (nrow(sigma2) == 1L && n_theta > 1L) {
+    sigma2 <- sigma2[rep.int(1L, n_theta), , drop = FALSE]
+  }
+  if (nrow(sigma2) != n_theta) {
+    stop("sigma2 must provide one row per theta row.")
+  }
+
+  sigma2 <- pmax(sigma2, 1e-12)
+  inv_sigma2 <- 1 / sigma2
+  eta <- mean * inv_sigma2
+
+  out <- list(
+    family = "gaussian",
+    theta = mean,
+    mean = mean,
+    eta = eta,
+    quadratic_kind = "diag",
+    quadratic_coef = inv_sigma2,
+    log_kernel_constant = -0.5 * (
+      d * log(2 * pi) +
+        rowSums(log(sigma2)) +
+        rowSums(mean * eta)
+    ),
+    alpha_dim = d,
+    alpha_names = alpha_names
+  )
+  colnames(out$eta) <- alpha_names
+  colnames(out$quadratic_coef) <- alpha_names
+  out
+}
+
 normalize_population_model <- function(model) {
   if (!is.list(model)) stop("population model must be a list.")
   required <- c("name", "alpha_dim", "hyper_dim", "alpha_names", "hyper_names", "sample_hyper", "log_hyperprior", "log_alpha_given_theta")
@@ -132,6 +248,91 @@ population_model_log_alpha_given_theta_many <- function(model, alpha, theta) {
   ))
   rownames(out) <- rownames(theta)
   out
+}
+
+population_model_prepare_theta <- function(model, theta) {
+  model <- normalize_population_model(model)
+  theta <- .as_hyper_matrix(theta, hyper_names = model$hyper_names, hyper_dim = model$hyper_dim)
+
+  if (!is.function(model$prepare_theta)) {
+    return(list(family = "generic", theta = theta))
+  }
+
+  out <- model$prepare_theta(theta)
+  if (!is.list(out)) {
+    stop("prepare_theta() must return a list.")
+  }
+
+  out$family <- as.character(out$family %||% "generic")
+  out$theta <- .as_hyper_matrix(out$theta %||% theta, hyper_names = model$hyper_names, hyper_dim = model$hyper_dim)
+
+  if (identical(out$family, "gaussian")) {
+    out$eta <- as.matrix(out$eta)
+    out$quadratic_kind <- as.character(out$quadratic_kind %||% "packed")
+    out$quadratic_coef <- as.matrix(out$quadratic_coef)
+    out$log_kernel_constant <- as.numeric(out$log_kernel_constant)
+    if (nrow(out$eta) != nrow(theta) ||
+        nrow(out$quadratic_coef) != nrow(theta) ||
+        length(out$log_kernel_constant) != nrow(theta)) {
+      stop("Gaussian prepare_theta() outputs must provide one row per theta row.")
+    }
+  }
+
+  out
+}
+
+population_model_log_alpha_given_prepared_theta_many <- function(model, alpha, theta_prepared) {
+  model <- normalize_population_model(model)
+  alpha <- as.matrix(alpha)
+  if (is.function(model$log_alpha_given_prepared_theta_many)) {
+    out <- model$log_alpha_given_prepared_theta_many(alpha, theta_prepared)
+    out <- as.matrix(out)
+    if (nrow(out) != nrow(theta_prepared$theta) || ncol(out) != nrow(alpha)) {
+      stop("log_alpha_given_prepared_theta_many must return an n_theta x n_alpha matrix.")
+    }
+    return(out)
+  }
+  population_model_log_alpha_given_theta_many(model, alpha = alpha, theta = theta_prepared$theta)
+}
+
+population_model_reference_components_from_theta <- function(model, theta) {
+  model <- normalize_population_model(model)
+  theta <- .as_hyper_matrix(theta, hyper_names = model$hyper_names, hyper_dim = model$hyper_dim)
+  if (!is.function(model$reference_components_from_theta)) {
+    stop("population model does not define reference_components_from_theta().")
+  }
+
+  out <- model$reference_components_from_theta(theta)
+  if (!is.list(out) ||
+      is.null(out$component_means) ||
+      is.null(out$component_covs)) {
+    stop("reference_components_from_theta() must return a list with component_means and component_covs.")
+  }
+  if (length(out$component_means) != nrow(theta) || length(out$component_covs) != nrow(theta)) {
+    stop("reference_components_from_theta() must return one alpha-space component per theta row.")
+  }
+
+  component_means <- lapply(out$component_means, function(mu) {
+    mu <- as.numeric(mu)
+    if (length(mu) != model$alpha_dim) {
+      stop("reference component mean has incompatible dimension.")
+    }
+    names(mu) <- model$alpha_names
+    mu
+  })
+  component_covs <- lapply(out$component_covs, function(S) {
+    S <- as.matrix(S)
+    if (nrow(S) != model$alpha_dim || ncol(S) != model$alpha_dim) {
+      stop("reference component covariance has incompatible dimension.")
+    }
+    dimnames(S) <- list(model$alpha_names, model$alpha_names)
+    S
+  })
+
+  list(
+    component_means = component_means,
+    component_covs = component_covs
+  )
 }
 
 make_population_model_diag_gaussian <- function(alpha_names,
@@ -221,9 +422,42 @@ make_population_model_diag_gaussian <- function(alpha_names,
     out
   }
 
+  reference_components_from_theta <- function(theta) {
+    theta <- .as_hyper_matrix(theta, hyper_names = hyper_names, hyper_dim = 2L * d)
+    mu <- theta[, seq_len(d), drop = FALSE]
+    sigma2 <- pmax(exp(theta[, d + seq_len(d), drop = FALSE]), 1e-12)
+
+    list(
+      component_means = lapply(seq_len(nrow(theta)), function(i) {
+        out <- as.numeric(mu[i, ])
+        names(out) <- alpha_names
+        out
+      }),
+      component_covs = lapply(seq_len(nrow(theta)), function(i) {
+        out <- diag(as.numeric(sigma2[i, ]), nrow = d, ncol = d)
+        dimnames(out) <- list(alpha_names, alpha_names)
+        out
+      })
+    )
+  }
+
+  prepare_theta <- function(theta) {
+    theta <- .as_hyper_matrix(theta, hyper_names = hyper_names, hyper_dim = 2L * d)
+    mu <- theta[, seq_len(d), drop = FALSE]
+    sigma2 <- pmax(exp(theta[, d + seq_len(d), drop = FALSE]), 1e-12)
+    prepared <- prepare_gaussian_theta_diag(
+      mean = mu,
+      sigma2 = sigma2,
+      alpha_names = alpha_names
+    )
+    prepared$theta <- theta
+    prepared
+  }
+
   normalize_population_model(
     list(
       name = label,
+      fast_family = "gaussian",
       alpha_dim = d,
       hyper_dim = 2L * d,
       alpha_names = alpha_names,
@@ -232,6 +466,8 @@ make_population_model_diag_gaussian <- function(alpha_names,
       log_hyperprior = log_hyperprior,
       log_alpha_given_theta = log_alpha_given_theta,
       log_alpha_given_theta_many = log_alpha_given_theta_many,
+      prepare_theta = prepare_theta,
+      reference_components_from_theta = reference_components_from_theta,
       prior_spec = list(
         mean_prior_mean = mean_prior_mean,
         mean_prior_var = mean_prior_var,

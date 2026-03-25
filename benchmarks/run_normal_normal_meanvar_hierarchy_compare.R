@@ -32,6 +32,7 @@ outer_mcmc_moves <- 3L
 outer_max_rounds <- 80L
 base_seed <- 20260323L
 verbose <- TRUE
+reference_refinement_source <- "pilot_population_fit"
 
 dir.create(file.path("benchmarks", "samples"), showWarnings = FALSE, recursive = TRUE)
 dir.create(file.path("benchmarks", "results"), showWarnings = FALSE, recursive = TRUE)
@@ -39,6 +40,7 @@ dir.create(file.path("benchmarks", "results"), showWarnings = FALSE, recursive =
 source("hierarchical_locals.R")
 source("population_models.R")
 source("outer_population_smc.R")
+source("utilities.R")
 
 if (!file.exists(stan_results_file)) {
   stop("Missing Stan benchmark results: ", stan_results_file)
@@ -65,66 +67,6 @@ base_Sigma <- structure(
   diag(c(4.0, 2.0), 2L),
   dimnames = list(alpha_names, alpha_names)
 )
-
-normalize_weights <- function(w) {
-  w <- pmax(as.numeric(w), 0)
-  sw <- sum(w)
-  if (!is.finite(sw) || sw <= 0) {
-    rep(1 / length(w), length(w))
-  } else {
-    w / sw
-  }
-}
-
-resample_weighted_rows <- function(x, w, n_draws, seed) {
-  set.seed(as.integer(seed))
-  x <- as.matrix(x)
-  idx <- sample.int(
-    nrow(x),
-    size = as.integer(n_draws),
-    replace = TRUE,
-    prob = normalize_weights(w)
-  )
-  x[idx, , drop = FALSE]
-}
-
-theta_draws_to_named_list <- function(theta_draws) {
-  theta_draws <- as.matrix(theta_draws)
-  colnames(theta_draws) <- hyper_names
-  list(
-    mu_mean = theta_draws[, "mu_mean"],
-    mu_log_var = theta_draws[, "mu_log_var"],
-    tau2_mean = exp(theta_draws[, "log_tau2_mean"]),
-    tau2_log_var = exp(theta_draws[, "log_tau2_log_var"])
-  )
-}
-
-plot_density_overlay <- function(stan_x, workflow_x, main, xlab) {
-  d_stan <- stats::density(stan_x)
-  d_workflow <- stats::density(workflow_x)
-  xlim <- range(c(d_stan$x, d_workflow$x))
-  ylim <- c(0, 1.05 * max(d_stan$y, d_workflow$y))
-
-  plot(
-    d_stan,
-    lwd = 2,
-    col = "black",
-    xlim = xlim,
-    ylim = ylim,
-    main = main,
-    xlab = xlab,
-    ylab = "Density"
-  )
-  lines(d_workflow, lwd = 2, col = "firebrick3")
-  legend(
-    "topright",
-    legend = c("Stan", "Current workflow"),
-    col = c("black", "firebrick3"),
-    lwd = 2,
-    bty = "n",
-    cex = 0.85
-  )
-}
 
 loglik_fn <- function(Theta, y_i) {
   Theta <- as.matrix(Theta)
@@ -216,6 +158,33 @@ make_population_model_normal_logvar <- function(prior_mean, prior_sd) {
     out
   }
 
+  reference_components_from_theta <- function(theta) {
+    theta <- as.matrix(theta)
+    colnames(theta) <- hyper_names
+
+    list(
+      component_means = lapply(seq_len(nrow(theta)), function(i) {
+        out <- c(
+          subject_mean = theta[i, "mu_mean"],
+          subject_log_var = theta[i, "mu_log_var"]
+        )
+        out
+      }),
+      component_covs = lapply(seq_len(nrow(theta)), function(i) {
+        out <- diag(
+          c(
+            exp(theta[i, "log_tau2_mean"]),
+            exp(theta[i, "log_tau2_log_var"])
+          ),
+          nrow = length(alpha_names),
+          ncol = length(alpha_names)
+        )
+        dimnames(out) <- list(alpha_names, alpha_names)
+        out
+      })
+    )
+  }
+
   normalize_population_model(
     list(
       name = "normal_normal_meanvar_hierarchy",
@@ -226,7 +195,8 @@ make_population_model_normal_logvar <- function(prior_mean, prior_sd) {
       sample_hyper = sample_hyper,
       log_hyperprior = log_hyperprior,
       log_alpha_given_theta = log_alpha_given_theta,
-      log_alpha_given_theta_many = log_alpha_given_theta_many
+      log_alpha_given_theta_many = log_alpha_given_theta_many,
+      reference_components_from_theta = reference_components_from_theta
     )
   )
 }
@@ -247,25 +217,16 @@ stage <- prepare_reference_local_stage(
   base_Sigma = base_Sigma,
   pilot_size = min(pilot_size, S),
   broad_scale = 1,
-  broad_defensive = FALSE,
   pilot_particles = pilot_particles,
   full_particles = full_particles,
-  refined_method = "defensive_mixture",
-  inflation = 1.5,
-  defensive_weight = 0.10,
-  defensive_scale = 4,
   n_jobs = mc.cores,
-  pilot_local_n_cores = 1L,
-  full_local_n_cores = 1L,
   base_seed = base_seed,
-  verbose = verbose,
+  pilot_population_model = if (identical(reference_refinement_source, "pilot_population_fit")) population_model else NULL,
+  pilot_outer_control = list(
+    max_rounds = 40L
+  ),
   pilot_smc_control = list(
-    max_rounds = 40L,
-    n_mcmc_moves = 1L,
-    G_mix = 8L,
-    hist_mix_enable = FALSE,
-    gss_enable = FALSE,
-    da_enable = FALSE
+    max_rounds = 40L
   ),
   full_smc_control = list(
     hist_mix_enable = FALSE,
@@ -287,22 +248,37 @@ fit <- outer_population_smc(
   verbose = verbose
 )
 
-workflow_draws <- theta_draws_to_named_list(
-  resample_weighted_rows(
-    fit$theta,
-    fit$w,
-    n_draws = length(stan_draws$mu_mean),
-    seed = base_seed + 1L
-  )
+workflow_theta <- smc_posteriors(
+  fit,
+  n_draws = length(stan_draws$mu_mean),
+  seed = base_seed + 1L
 )
 
-# png(plot_file, width = 1200, height = 900)
-par(mfrow = c(2, 2), mar = c(4, 4, 3, 1))
-plot_density_overlay(stan_draws$mu_mean, workflow_draws$mu_mean, "mu_mean", "mu_mean")
-plot_density_overlay(stan_draws$tau2_mean, workflow_draws$tau2_mean, "tau2_mean", "tau2_mean")
-plot_density_overlay(stan_draws$mu_log_var, workflow_draws$mu_log_var, "mu_log_var", "mu_log_var")
-plot_density_overlay(stan_draws$tau2_log_var, workflow_draws$tau2_log_var, "tau2_log_var", "tau2_log_var")
-# dev.off()
+workflow_draws <- data.frame(
+  mu_mean = workflow_theta$mu_mean,
+  tau2_mean = exp(workflow_theta$log_tau2_mean),
+  mu_log_var = workflow_theta$mu_log_var,
+  tau2_log_var = exp(workflow_theta$log_tau2_log_var),
+  check.names = FALSE
+)
+
+stan_matrix <- data.frame(
+  mu_mean = stan_draws$mu_mean,
+  tau2_mean = stan_draws$tau2_mean,
+  mu_log_var = stan_draws$mu_log_var,
+  tau2_log_var = stan_draws$tau2_log_var,
+  check.names = FALSE
+)
+
+grDevices::png(plot_file, width = 1200, height = 900)
+plot_posteriors(
+  stan_matrix,
+  workflow_draws,
+  labels = c("Stan", "Current workflow"),
+  cols = c("black", "firebrick3"),
+  n_cols = 2L
+)
+grDevices::dev.off()
 
 saveRDS(
   list(
@@ -319,7 +295,8 @@ saveRDS(
       outer_particles = outer_particles,
       outer_mcmc_moves = outer_mcmc_moves,
       outer_max_rounds = outer_max_rounds,
-      base_seed = base_seed
+      base_seed = base_seed,
+      reference_refinement_source = reference_refinement_source
     ),
     plot_file = plot_file
   ),

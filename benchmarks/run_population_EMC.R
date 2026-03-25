@@ -67,29 +67,8 @@ load_reference_stage <- function() {
     loglik_fn = loglik_emc2,
     base_mu = base_mu,
     base_Sigma = base_Sigma,
-    pilot_size = 20L,
-    broad_scale = 4,
     broad_defensive = TRUE,
-    pilot_particles = 1000L,
-    full_particles = 4000L,
-    refined_method = "defensive_mixture",
-    inflation = 1.5,
-    defensive_weight = 0.10,
-    defensive_scale = 4,
-    n_jobs = mc.cores,
-    pilot_local_n_cores = 1L,
-    full_local_n_cores = 1L,
-    base_seed = base_seed,
-    verbose = verbose,
-    pilot_smc_control = list(
-      max_rounds = 50L,
-      n_mcmc_moves = 1L,
-      G_mix = 8L,
-      hist_mix_enable = FALSE,
-      gss_enable = FALSE,
-      da_enable = FALSE
-    ),
-    full_smc_control = list()
+    n_jobs = mc.cores
   )
 }
 
