@@ -1433,7 +1433,9 @@ enhanced_smc_elite <- function(data, loglik_fn, mu_ref = NULL, Sigma_ref = NULL,
       w_new <- rep(1/length(w_new), length(w_new))
       resampled <- TRUE
     }
-    w <- w_new; lambda <- next_lambda; lambda_hist <- c(lambda_hist, lambda)
+    # Keep the clipped/current lambda in state; `next_lambda` can lie beyond a
+    # checkpoint or guard-floor adjustment.
+    w <- w_new; lambda_hist <- c(lambda_hist, lambda)
 
     # Post-resampling jitter now handled by the single adaptive branch below.
     if (resampled) {
