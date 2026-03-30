@@ -97,35 +97,202 @@ if (!exists("normalize_reference_prior", mode = "function") ||
        F_mid = F_mid, Q_mid = Q_mid, xmin = xmin, xmax = xmax, vL = vL, vR = vR, gL = gL, gR = gR)
 }
 
-# Build Gaussian-copula transport from weighted samples
-# Maps parameter space to approximately standard normal space via marginal CDFs
-# and correlation modeling. Handles degenerate dimensions robustly.
-# Args:
-#   X: sample matrix (n x d)
-#   w: sample weights (length n)
-#   ngrid: number of grid points for marginal CDFs
-#   tail: tail probability for robust extrapolation
-#   corr_shrink: correlation shrinkage parameter
-#   use_weights_in_corr: whether to use weights in correlation estimation
-#   prior_sd: prior standard deviations for regularization
-#   disable_jacobian: whether to disable Jacobian computation
-# Returns: list with fwd(), inv(), log_jac() functions and metadata
-# NOTE: lean interface: no 'use_weights_in_corr', no 'validate', fixed "cov" whitening
-fit_copula_transform <- function(X, w, ngrid = 400, tail = 1e-3,
-                                 corr_shrink = 0.5) {
+# Weighted quantile helper used by the transport marginals and residual bundles.
+.weighted_quantile_linear <- function(x, w, p) {
+  o <- order(x)
+  x <- x[o]
+  w <- pmax(w[o], 0)
+  sw <- sum(w)
+  if (!is.finite(sw) || sw <= 0) {
+    w <- rep(1 / length(x), length(x))
+  } else {
+    w <- w / sw
+  }
+  cw <- cumsum(w)
+  cw <- cw / cw[length(cw)]
+  approx(cw, x, xout = p, ties = "ordered", rule = 2)$y
+}
+
+.weighted_mean1 <- function(x, w) {
+  w <- pmax(w, 0)
+  sw <- sum(w)
+  if (!is.finite(sw) || sw <= 0) return(mean(x))
+  sum(x * w) / sw
+}
+
+.weighted_var1 <- function(x, w, mu = NULL) {
+  mu <- mu %||% .weighted_mean1(x, w)
+  w <- pmax(w, 0)
+  sw <- sum(w)
+  if (!is.finite(sw) || sw <= 0) return(stats::var(x))
+  sum(w * (x - mu)^2) / sw
+}
+
+.weighted_sd1 <- function(x, w, mu = NULL, floor = 1e-6) {
+  sqrt(max(.weighted_var1(x, w, mu = mu), floor))
+}
+
+.weighted_cor1 <- function(x, y, w) {
+  mx <- .weighted_mean1(x, w)
+  my <- .weighted_mean1(y, w)
+  vx <- .weighted_var1(x, w, mu = mx)
+  vy <- .weighted_var1(y, w, mu = my)
+  if (!is.finite(vx) || !is.finite(vy) || vx <= 0 || vy <= 0) return(0)
+  w <- pmax(w, 0)
+  sw <- sum(w)
+  if (!is.finite(sw) || sw <= 0) return(0)
+  cov_xy <- sum(w * (x - mx) * (y - my)) / sw
+  cov_xy / sqrt(vx * vy)
+}
+
+.make_triangular_features <- function(Zprev,
+                                      parents,
+                                      centers = NULL,
+                                      scales = NULL,
+                                      interaction_max = 3L) {
+  n <- if (is.null(Zprev)) 0L else nrow(Zprev)
+  if (!length(parents)) {
+    X <- matrix(1, nrow = n, ncol = 1L)
+    colnames(X) <- "(Intercept)"
+    return(list(X = X, centers = numeric(0), scales = numeric(0)))
+  }
+
+  Zsel <- as.matrix(Zprev[, parents, drop = FALSE])
+  cols <- list()
+  cols[[1L]] <- Zsel
+  if (ncol(Zsel) >= 1L) {
+    cols[[length(cols) + 1L]] <- Zsel^2 - 1
+  }
+  if (ncol(Zsel) >= 2L && ncol(Zsel) <= interaction_max) {
+    cmb <- utils::combn(seq_len(ncol(Zsel)), 2L)
+    for (k in seq_len(ncol(cmb))) {
+      cols[[length(cols) + 1L]] <- Zsel[, cmb[1L, k]] * Zsel[, cmb[2L, k]]
+    }
+  }
+
+  Xraw <- do.call(cbind, cols)
+  if (is.null(centers)) {
+    centers <- colMeans(Xraw)
+  }
+  if (is.null(scales)) {
+    scales <- apply(Xraw, 2L, stats::sd)
+    scales[!is.finite(scales) | scales < 1e-8] <- 1
+  }
+  Xstd <- sweep(Xraw, 2L, centers, "-")
+  Xstd <- sweep(Xstd, 2L, scales, "/")
+  X <- cbind(1, Xstd)
+  colnames(X) <- c("(Intercept)", paste0("f", seq_len(ncol(Xstd))))
+  list(X = X, centers = centers, scales = scales)
+}
+
+.fit_triangular_mean_model <- function(y,
+                                       Zprev,
+                                       w,
+                                       max_parents = 4L,
+                                       min_parent_cor = 0.05,
+                                       ridge = 1e-3,
+                                       interaction_max = 3L) {
+  if (is.null(Zprev) || !ncol(Zprev)) {
+    mu <- .weighted_mean1(y, w)
+    return(list(
+      parents = integer(0),
+      centers = numeric(0),
+      scales = numeric(0),
+      beta = mu,
+      interaction_max = interaction_max
+    ))
+  }
+
+  dprev <- ncol(Zprev)
+  max_keep <- max(0L, min(as.integer(max_parents), dprev))
+  if (!max_keep) {
+    mu <- .weighted_mean1(y, w)
+    return(list(
+      parents = integer(0),
+      centers = numeric(0),
+      scales = numeric(0),
+      beta = mu,
+      interaction_max = interaction_max
+    ))
+  }
+
+  cors <- vapply(seq_len(dprev), function(j) abs(.weighted_cor1(y, Zprev[, j], w)), numeric(1))
+  ord <- order(cors, decreasing = TRUE)
+  keep <- ord[seq_len(max_keep)]
+  keep <- keep[cors[keep] >= min_parent_cor]
+  if (!length(keep)) {
+    keep <- ord[seq_len(min(1L, dprev))]
+  }
+
+  feat <- .make_triangular_features(Zprev, keep, interaction_max = interaction_max)
+  X <- feat$X
+  w <- pmax(w, 0)
+  sw <- sum(w)
+  if (!is.finite(sw) || sw <= 0) {
+    w <- rep(1 / nrow(X), nrow(X))
+  } else {
+    w <- w / sw
+  }
+  WX <- X * w
+  pen <- diag(ncol(X))
+  pen[1L, 1L] <- 0
+  ridge_eff <- as.numeric(ridge) * (1 + ncol(X) / max(nrow(X), 1))
+  XtWX <- crossprod(X, WX) + ridge_eff * pen
+  XtWy <- drop(crossprod(X, w * y))
+  beta <- tryCatch(
+    as.numeric(solve(XtWX, XtWy)),
+    error = function(e) as.numeric(qr.solve(XtWX, XtWy))
+  )
+  list(
+    parents = keep,
+    centers = feat$centers,
+    scales = feat$scales,
+    beta = beta,
+    interaction_max = interaction_max
+  )
+}
+
+.eval_triangular_mean_model <- function(model, Zprev) {
+  if (!length(model$parents)) {
+    n <- if (is.null(Zprev)) 1L else nrow(as.matrix(Zprev))
+    return(rep(model$beta[1L], n))
+  }
+  feat <- .make_triangular_features(
+    Zprev = Zprev,
+    parents = model$parents,
+    centers = model$centers,
+    scales = model$scales,
+    interaction_max = model$interaction_max %||% 3L
+  )
+  drop(feat$X %*% model$beta)
+}
+
+.fit_residual_bundle <- function(r, w, pgrid) {
+  rng <- diff(range(r))
+  if (!is.finite(rng) || rng < 1e-10) {
+    mu <- .weighted_mean1(r, w)
+    sig <- .weighted_sd1(r, w, mu = mu, floor = 1e-6)
+    return(list(
+      Fhat = function(x) pnorm((x - mu) / sig),
+      Qhat = function(u) mu + sig * qnorm(pmin(pmax(u, 1e-12), 1 - 1e-12)),
+      slope = function(x) dnorm((x - mu) / sig) / sig
+    ))
+  }
+  rq <- .weighted_quantile_linear(r, w, pgrid)
+  .make_tail_safe_cdf_bundle(rq, pgrid)
+}
+
+# Original Gaussian-copula transport kept as a fallback.
+.fit_gaussian_copula_transform <- function(X, w, ngrid = 400, tail = 1e-3,
+                                           corr_shrink = 0.5) {
   X <- as.matrix(X); d <- ncol(X)
   w <- pmax(w, 0); w <- w / sum(w)
   pgrid <- seq(tail, 1 - tail, length.out = ngrid)
 
   # per-dim marginal bundles
   per_dim <- vector("list", d)
-  wtd_q <- function(x, w, p) {
-    o <- order(x); x <- x[o]; w <- w[o]
-    cw <- cumsum(w); cw <- cw / cw[length(cw)]
-    approx(cw, x, xout = p, ties = "ordered", rule = 2)$y
-  }
   for (j in seq_len(d)) {
-    xj <- X[, j]; xq <- wtd_q(xj, w, pgrid)
+    xj <- X[, j]; xq <- .weighted_quantile_linear(xj, w, pgrid)
     rng <- xq[length(xq)] - xq[1]
     if (!is.finite(rng) || rng < 1e-12) {
       muj <- sum(xj * w); vj <- sum(w * (xj - muj)^2); sigj <- sqrt(max(vj, 1e-6))
@@ -215,7 +382,159 @@ fit_copula_transform <- function(X, w, ngrid = 400, tail = 1e-3,
   }
 
   list(fwd = fwd, inv = inv, log_jac = log_jac,
-       meta = list(C = Tmat, U = U, muY = muY))
+       meta = list(C = Tmat, U = U, muY = muY, method = "gaussian_copula"))
+}
+
+# Sparse triangular transport:
+# 1. Tail-safe marginal Gaussianization x -> y.
+# 2. Sequential sparse autoregression y_j ~ m_j(z_{<j}) with residual Gaussianization.
+fit_copula_transform <- function(X, w, ngrid = 400, tail = 1e-3,
+                                 corr_shrink = 0.5,
+                                 max_parents = NULL,
+                                 min_parent_cor = 0.05,
+                                 ridge = 1e-3,
+                                 interaction_max = 3L) {
+  X <- as.matrix(X)
+  d <- ncol(X)
+  w <- pmax(w, 0)
+  sw <- sum(w)
+  if (!is.finite(sw) || sw <= 0) {
+    w <- rep(1 / nrow(X), nrow(X))
+  } else {
+    w <- w / sw
+  }
+  pgrid <- seq(tail, 1 - tail, length.out = ngrid)
+  max_parents <- as.integer(max_parents %||% min(4L, max(1L, floor(sqrt(d)))))
+
+  # Per-dimension outer marginals x -> y.
+  marginals <- vector("list", d)
+  for (j in seq_len(d)) {
+    xj <- X[, j]
+    xq <- .weighted_quantile_linear(xj, w, pgrid)
+    rng <- xq[length(xq)] - xq[1L]
+    if (!is.finite(rng) || rng < 1e-12) {
+      muj <- .weighted_mean1(xj, w)
+      sigj <- .weighted_sd1(xj, w, mu = muj, floor = 1e-6)
+      marginals[[j]] <- list(
+        Fhat = function(x) pnorm((x - muj) / sigj),
+        Qhat = function(u) muj + sigj * qnorm(pmin(pmax(u, 1e-12), 1 - 1e-12)),
+        slope = function(x) dnorm((x - muj) / sigj) / sigj,
+        F_mid = function(x) pnorm((x - muj) / sigj),
+        Q_mid = function(u) muj + sigj * qnorm(pmin(pmax(u, 1e-12), 1 - 1e-12)),
+        xmin = -Inf, xmax = Inf, vL = -8, vR = 8, gL = 1 / sigj, gR = 1 / sigj
+      )
+    } else {
+      eps <- max(1e-12, 1e-8 * max(1, abs(rng)))
+      for (k in 2:length(xq)) if (xq[k] <= xq[k - 1L]) xq[k] <- xq[k - 1L] + eps
+      marginals[[j]] <- .make_tail_safe_cdf_bundle(xq, pgrid)
+    }
+  }
+
+  fwd_y <- function(Xnew) {
+    Xnew <- as.matrix(Xnew)
+    Y <- matrix(0.0, nrow(Xnew), ncol(Xnew))
+    for (j in seq_len(ncol(Xnew))) {
+      b <- marginals[[j]]
+      xj <- Xnew[, j]
+      lt <- xj < b$xmin
+      rt <- xj > b$xmax
+      md <- !(lt | rt)
+      yj <- numeric(length(xj))
+      if (any(md)) yj[md] <- qnorm(b$F_mid(xj[md]))
+      if (any(lt)) yj[lt] <- b$vL + b$gL * (xj[lt] - b$xmin)
+      if (any(rt)) yj[rt] <- b$vR + b$gR * (xj[rt] - b$xmax)
+      Y[, j] <- yj
+    }
+    colnames(Y) <- colnames(Xnew)
+    Y
+  }
+
+  Y0 <- fwd_y(X)
+  Z0 <- matrix(0.0, nrow(Y0), ncol(Y0))
+  cond_models <- vector("list", d)
+  resid_bundles <- vector("list", d)
+  resid_sds <- numeric(d)
+  for (j in seq_len(d)) {
+    Zprev <- if (j > 1L) Z0[, seq_len(j - 1L), drop = FALSE] else NULL
+    mean_model <- .fit_triangular_mean_model(
+      y = Y0[, j],
+      Zprev = Zprev,
+      w = w,
+      max_parents = max_parents,
+      min_parent_cor = min_parent_cor,
+      ridge = ridge,
+      interaction_max = interaction_max
+    )
+    mean_fit <- .eval_triangular_mean_model(mean_model, Zprev)
+    resid <- Y0[, j] - mean_fit
+    resid_bundle <- .fit_residual_bundle(resid, w, pgrid)
+    Z0[, j] <- qnorm(resid_bundle$Fhat(resid))
+    cond_models[[j]] <- mean_model
+    resid_bundles[[j]] <- resid_bundle
+    resid_sds[j] <- stats::sd(resid)
+  }
+  colnames(Z0) <- colnames(X)
+
+  forward_details <- function(Xnew) {
+    Xnew <- as.matrix(Xnew)
+    Y <- fwd_y(Xnew)
+    Z <- matrix(0.0, nrow(Y), ncol(Y), dimnames = dimnames(Y))
+    R <- matrix(0.0, nrow(Y), ncol(Y), dimnames = dimnames(Y))
+    for (j in seq_len(ncol(Y))) {
+      Zprev <- if (j > 1L) Z[, seq_len(j - 1L), drop = FALSE] else NULL
+      mean_j <- .eval_triangular_mean_model(cond_models[[j]], Zprev)
+      R[, j] <- Y[, j] - mean_j
+      Z[, j] <- qnorm(resid_bundles[[j]]$Fhat(R[, j]))
+    }
+    list(Y = Y, R = R, Z = Z)
+  }
+
+  fwd <- function(Xnew) {
+    forward_details(Xnew)$Z
+  }
+
+  inv <- function(Znew) {
+    Znew <- as.matrix(Znew)
+    Y <- matrix(0.0, nrow(Znew), ncol(Znew), dimnames = dimnames(Znew))
+    Xrec <- matrix(0.0, nrow(Znew), ncol(Znew), dimnames = dimnames(Znew))
+    for (j in seq_len(ncol(Znew))) {
+      Zprev <- if (j > 1L) Znew[, seq_len(j - 1L), drop = FALSE] else NULL
+      mean_j <- .eval_triangular_mean_model(cond_models[[j]], Zprev)
+      resid_j <- resid_bundles[[j]]$Qhat(stats::pnorm(Znew[, j]))
+      Y[, j] <- mean_j + resid_j
+      Xrec[, j] <- marginals[[j]]$Qhat(stats::pnorm(Y[, j]))
+    }
+    colnames(Xrec) <- colnames(Znew)
+    Xrec
+  }
+
+  log_jac <- function(Theta) {
+    Theta <- as.matrix(Theta)
+    det <- forward_details(Theta)
+    out <- rep(0.0, nrow(Theta))
+    for (j in seq_len(ncol(Theta))) {
+      out <- out +
+        log(marginals[[j]]$slope(Theta[, j])) - stats::dnorm(det$Y[, j], log = TRUE) +
+        log(resid_bundles[[j]]$slope(det$R[, j])) - stats::dnorm(det$Z[, j], log = TRUE)
+    }
+    out
+  }
+
+  list(
+    fwd = fwd,
+    inv = inv,
+    log_jac = log_jac,
+    meta = list(
+      method = "sparse_triangular",
+      max_parents = max_parents,
+      min_parent_cor = min_parent_cor,
+      ridge = ridge,
+      interaction_max = interaction_max,
+      marginal_bundles = marginals,
+      conditional_models = cond_models,
+      residual_sds = resid_sds
+    )
+  )
 }
 
 # ---------- TRANSPORT DIAGNOSTICS (drop-in) ----------
@@ -606,10 +925,13 @@ mcmc_moves_z_mix_batched <- function(Z, loglik, lpz, Tmap, lambda,
   if (!is.null(seed)) set.seed(seed)
   if (is.null(param_names)) param_names <- colnames(Z)
   gss_on <- !is.null(ref_mix)
-  allow_pcn <- isTRUE(allow_pcn) && reference_prior_is_gaussian(reference_prior)
+  allow_pcn <- isTRUE(allow_pcn)
   if (!allow_pcn) pcn_prob <- 0
   lpz_from_theta <- function(Theta_mat) {
     as.numeric(reference_prior_logpdf(reference_prior, Theta_mat) - Tmap$log_jac(Theta_mat))
+  }
+  standard_normal_logpdf_rows <- function(Zmat) {
+    rowSums(stats::dnorm(as.matrix(Zmat), log = TRUE))
   }
 
   # Prior-blended RW metric in Z-space
@@ -654,12 +976,13 @@ mcmc_moves_z_mix_batched <- function(Z, loglik, lpz, Tmap, lambda,
   da_on <- isTRUE(da_enable) && !is.null(da_screen_mix)
   da_eps <- 1e-8
   # Keep one helper for exact pCN target to avoid DA / non-DA drift.
-  pcn_exact_target <- function(loglik_vec, lref_vec = NULL) {
+  pcn_exact_target <- function(lpz_vec, Zmat, loglik_vec, lref_vec = NULL) {
+    base <- lpz_vec - standard_normal_logpdf_rows(Zmat)
     if (gss_on) {
       if (is.null(lref_vec)) stop("pcn_exact_target requires lref_vec when GSS is enabled.")
-      lambda * loglik_vec + (1 - lambda) * lref_vec
+      base + lambda * loglik_vec + (1 - lambda) * lref_vec
     } else {
-      lambda * loglik_vec
+      base + lambda * loglik_vec
     }
   }
   # vectorized Ltilde for a batch; lpz_vec must correspond to thetas supplied
@@ -700,21 +1023,20 @@ mcmc_moves_z_mix_batched <- function(Z, loglik, lpz, Tmap, lambda,
   do_pcn <- function(idx) {
     if (!length(idx)) return(invisible(NULL))
     k <- length(idx); prop_pcn <<- prop_pcn + k   # Track proposal count
-    Theta_c <- Tmap$inv(Z[idx, , drop = FALSE]); colnames(Theta_c) <- param_names
+    Zc <- Z[idx, , drop = FALSE]
+    Theta_c <- Tmap$inv(Zc); colnames(Theta_c) <- param_names
     beta <- min(max(pcn_beta, 1e-6), 1.0)
-    # pCN noise must be N(0, Sigma_ref): use upper Cholesky directly
-    Xi <- matrix(rnorm(k * d), nrow = k, ncol = d) %*% prior_L
-    Theta_p <- sweep(Theta_c, 2L, mu_ref, `-`)
-    Theta_p <- sweep(sqrt(1 - beta^2) * Theta_p, 2L, mu_ref, `+`) + beta * Xi
+    Xi <- matrix(rnorm(k * d), nrow = k, ncol = d)
+    Zp <- sqrt(1 - beta^2) * Zc + beta * Xi
+    Theta_p <- Tmap$inv(Zp)
     colnames(Theta_p) <- param_names
     # ---- DA: Stage-1 (cheap) ----
     if (da_on) {
-      Zp_loc <- Tmap$fwd(Theta_p)
-      lref_c <- if (gss_on) { if (!is.null(lp_ref_vec)) lp_ref_vec[idx] else log_r_theta(Theta_c, Z[idx,,drop=FALSE], Tmap, ref_mix) } else NULL
-      lref_p <- if (gss_on) log_r_theta(Theta_p, Zp_loc, Tmap, ref_mix) else NULL
+      lref_c <- if (gss_on) { if (!is.null(lp_ref_vec)) lp_ref_vec[idx] else log_r_theta(Theta_c, Zc, Tmap, ref_mix) } else NULL
+      lref_p <- if (gss_on) log_r_theta(Theta_p, Zp, Tmap, ref_mix) else NULL
       lpz_p  <- lpz_from_theta(Theta_p)
-      Lc_t   <- Ltilde_batch(Z[idx,,drop=FALSE], Theta_c, lpz[idx], lref_c)
-      Lp_t   <- Ltilde_batch(Zp_loc, Theta_p, lpz_p, lref_p)
+      Lc_t   <- Ltilde_batch(Zc, Theta_c, lpz[idx], lref_c) - standard_normal_logpdf_rows(Zc)
+      Lp_t   <- Ltilde_batch(Zp, Theta_p, lpz_p, lref_p) - standard_normal_logpdf_rows(Zp)
       a1 <- Lp_t - Lc_t                     # symmetric proposal ⇒ no q terms
       u1 <- log(runif(k))
       pass <- which(u1 < pmin(0, a1))
@@ -725,10 +1047,14 @@ mcmc_moves_z_mix_batched <- function(Z, loglik, lpz, Tmap, lambda,
       ll_p_pass <- .ll_cached_eval(Theta_p[pass, , drop = FALSE], data, loglik_fn, ll_cache,
                                    expect_dups = resampled, n_cores = n_cores)
       Lc_ex <- pcn_exact_target(
+        lpz[idx[pass]],
+        Zc[pass, , drop = FALSE],
         loglik[idx[pass]],
         if (gss_on) lref_c[pass] else NULL
       )
       Lp_ex <- pcn_exact_target(
+        lpz_p[pass],
+        Zp[pass, , drop = FALSE],
         ll_p_pass,
         if (gss_on) lref_p[pass] else NULL
       )
@@ -736,11 +1062,9 @@ mcmc_moves_z_mix_batched <- function(Z, loglik, lpz, Tmap, lambda,
       u2 <- log(runif(length(pass)))
       acc_idx <- pass[which(u2 < pmin(0, corr))]
       if (length(acc_idx)) {
-        Theta_acc <- Theta_p[acc_idx, , drop = FALSE]
-        Zp <- Tmap$fwd(Theta_acc)
-        Z[idx[acc_idx], ]    <<- Zp
+        Z[idx[acc_idx], ]    <<- Zp[acc_idx, , drop = FALSE]
         loglik[idx[acc_idx]] <<- ll_p_pass[match(acc_idx, pass)]
-        lpz[idx[acc_idx]]    <<- lpz_from_theta(Theta_acc)
+        lpz[idx[acc_idx]]    <<- lpz_p[acc_idx]
         acc_pcn              <<- acc_pcn + length(acc_idx)
       }
     } else {
@@ -750,22 +1074,22 @@ mcmc_moves_z_mix_batched <- function(Z, loglik, lpz, Tmap, lambda,
         if (!is.null(lp_ref_vec)) {
           lref_c <- lp_ref_vec[idx]
         } else {
-          Zc_loc <- Z[idx, , drop = FALSE]
-          lref_c <- log_r_theta(Theta_c, Zc_loc, Tmap, ref_mix)
+          lref_c <- log_r_theta(Theta_c, Zc, Tmap, ref_mix)
         }
-        Zp_loc <- Tmap$fwd(Theta_p)
-        lref_p <- log_r_theta(Theta_p, Zp_loc, Tmap, ref_mix)
-        a <- pcn_exact_target(ll_p, lref_p) - pcn_exact_target(loglik[idx], lref_c)
+        lref_p <- log_r_theta(Theta_p, Zp, Tmap, ref_mix)
+        lpz_p <- lpz_from_theta(Theta_p)
+        a <- pcn_exact_target(lpz_p, Zp, ll_p, lref_p) -
+          pcn_exact_target(lpz[idx], Zc, loglik[idx], lref_c)
       } else {
-        a <- pcn_exact_target(ll_p) - pcn_exact_target(loglik[idx])
+        lpz_p <- lpz_from_theta(Theta_p)
+        a <- pcn_exact_target(lpz_p, Zp, ll_p) -
+          pcn_exact_target(lpz[idx], Zc, loglik[idx])
       }
       u <- log(runif(k)); ia <- which(u < pmin(0, a))
       if (length(ia)) {
-        Theta_acc <- Theta_p[ia, , drop = FALSE]
-        Zp <- Tmap$fwd(Theta_acc)
-        Z[idx[ia], ]       <<- Zp
+        Z[idx[ia], ]       <<- Zp[ia, , drop = FALSE]
         loglik[idx[ia]]    <<- ll_p[ia]
-        lpz[idx[ia]]       <<- lpz_from_theta(Theta_acc)
+        lpz[idx[ia]]       <<- lpz_p[ia]
         acc_pcn            <<- acc_pcn + length(ia)
       }
     }
@@ -1129,9 +1453,9 @@ enhanced_smc_elite <- function(data, loglik_fn, mu_ref = NULL, Sigma_ref = NULL,
   Sigma_ref <- ref_geom$cov
   param_names <- ref_geom$param_names
   prior_L <- ref_geom$chol
-  allow_pcn <- reference_prior_is_gaussian(reference_prior)
-  if (!allow_pcn && isTRUE(verbose)) {
-    cat("  Reference prior is not Gaussian; pCN moves disabled.\n")
+  allow_pcn <- TRUE
+  if (isTRUE(verbose)) {
+    cat("  Using transported-space pCN moves.\n")
   }
   log_ref_theta <- function(Theta_mat) {
     as.numeric(reference_prior_logpdf(reference_prior, Theta_mat))
@@ -1277,6 +1601,87 @@ enhanced_smc_elite <- function(data, loglik_fn, mu_ref = NULL, Sigma_ref = NULL,
   da_prop_cum <- 0L; da_pass_cum <- 0L
   # Transport refit state
   tr_state <- NULL  # Will be initialized by maybe_refit_transport
+  # Exact normalization correction for target changes induced by GSS snapshot/refresh
+  # or by dropping the frozen reference before a transport refit.
+  apply_weight_correction <- function(w_cur, log_adjust, clamp_label, reset_msg) {
+    w_base <- pmax(as.numeric(w_cur), 0)
+    sw_base <- sum(w_base)
+    if (!is.finite(sw_base) || sw_base <= 0) {
+      w_base <- rep(1 / length(w_cur), length(w_cur))
+    } else {
+      w_base <- w_base / sw_base
+    }
+
+    log_adjust <- as.numeric(log_adjust)
+    bad <- !is.finite(log_adjust)
+    if (all(bad)) {
+      return(list(
+        ok = FALSE,
+        w = rep(1 / length(w_base), length(w_base)),
+        log_norm = NA_real_,
+        var_log = 0.0,
+        all_bad = TRUE,
+        reset_msg = reset_msg
+      ))
+    }
+    if (any(bad)) {
+      log_adjust[bad] <- min(log_adjust[!bad]) - 50
+      cat(sprintf("  [GSS Guard] Clamped %d non-finite %s values.\n", sum(bad), clamp_label))
+    }
+
+    amax <- max(log_adjust)
+    u <- exp(log_adjust - amax)
+    mu1 <- sum(w_base * u)
+    if (!is.finite(mu1) || mu1 <= 0) {
+      return(list(
+        ok = FALSE,
+        w = rep(1 / length(w_base), length(w_base)),
+        log_norm = NA_real_,
+        var_log = 0.0,
+        all_bad = FALSE,
+        reset_msg = reset_msg
+      ))
+    }
+    mu2 <- sum(w_base * u * u)
+    Neff <- 1 / sum(w_base * w_base)
+    var_log <- (mu2 - mu1^2) / (max(Neff, 1) * max(mu1^2, .Machine$double.eps))
+
+    logw_corr <- log(pmax(w_base, .Machine$double.eps)) + log_adjust
+    lse_corr <- logsumexp(logw_corr)
+    if (!is.finite(lse_corr)) {
+      return(list(
+        ok = FALSE,
+        w = rep(1 / length(w_base), length(w_base)),
+        log_norm = NA_real_,
+        var_log = 0.0,
+        all_bad = FALSE,
+        reset_msg = reset_msg
+      ))
+    }
+
+    w_new <- exp(logw_corr - lse_corr)
+    sw_new <- sum(w_new)
+    if (!is.finite(sw_new) || sw_new <= 0) {
+      return(list(
+        ok = FALSE,
+        w = rep(1 / length(w_base), length(w_base)),
+        log_norm = NA_real_,
+        var_log = 0.0,
+        all_bad = FALSE,
+        reset_msg = reset_msg
+      ))
+    }
+    w_new <- w_new / sw_new
+
+    list(
+      ok = TRUE,
+      w = w_new,
+      log_norm = lse_corr,
+      var_log = max(var_log, 0),
+      all_bad = FALSE,
+      reset_msg = reset_msg
+    )
+  }
 
   while (lambda < lambda_target - 1e-12 && round < max_rounds) {
     round <- round + 1L
@@ -1571,24 +1976,20 @@ enhanced_smc_elite <- function(data, loglik_fn, mu_ref = NULL, Sigma_ref = NULL,
       # before invalidating it due to transport-coordinate change.
       if (gss_enable && !is.null(lp_ref)) {
         lp_ref_old <- as.numeric(lp_ref)
-        bad_old <- !is.finite(lp_ref_old)
-        if (all(bad_old)) {
-          w <- rep(1 / length(w), length(w))
-          cat("  [GSS Guard] All old lp_ref non-finite at refit; reset weights.\n")
+        corr <- apply_weight_correction(
+          w_cur = w,
+          log_adjust = -(1 - lambda) * lp_ref_old,
+          clamp_label = "old lp_ref at refit",
+          reset_msg = "  [GSS Guard] Refit deweight normalization non-finite; reset weights.\n"
+        )
+        if (!isTRUE(corr$ok)) {
+          w <- corr$w
+          cat(corr$reset_msg)
         } else {
-          if (any(bad_old)) {
-            lp_ref_old[bad_old] <- min(lp_ref_old[!bad_old]) - 50
-            cat(sprintf("  [GSS Guard] Clamped %d non-finite old lp_ref values at refit.\n", sum(bad_old)))
-          }
-          logw_corr <- log(pmax(w, .Machine$double.eps)) - (1 - lambda) * lp_ref_old
-          lse_corr <- logsumexp(logw_corr)
-          if (!is.finite(lse_corr)) {
-            w <- rep(1 / length(w), length(w))
-            cat("  [GSS Guard] Refit deweight normalization non-finite; reset weights.\n")
-          } else {
-            w <- exp(logw_corr - lse_corr)
-            w <- w / sum(w)
-          }
+          w <- corr$w
+          log_evidence <- log_evidence + corr$log_norm
+          mcse_var_accum <- mcse_var_accum + corr$var_log
+          cat(sprintf("  [GSS] removed frozen reference before refit (logZ += %.4f)\n", corr$log_norm))
         }
       }
       Tmap <- ref$Tmap
@@ -1663,37 +2064,45 @@ enhanced_smc_elite <- function(data, loglik_fn, mu_ref = NULL, Sigma_ref = NULL,
           ref_mix <- NULL
           lp_ref <- NULL
         } else {
-          if (any(bad_ref)) {
-            lp_ref_new[bad_ref] <- min(lp_ref_new[!bad_ref]) - 50
-            cat(sprintf("  [GSS Guard] Clamped %d non-finite lp_ref values.\n", sum(bad_ref)))
-          }
           if (is.null(lp_ref)) {
             # first snapshot: incorporate (1 - lambda) * log r into current target
-            logw <- log(pmax(w, .Machine$double.eps)) + (1 - lambda) * lp_ref_new
-            lse <- logsumexp(logw)
-            if (!is.finite(lse)) {
-              w <- rep(1 / length(w), length(w))
-              cat("  [GSS Guard] Snapshot normalization non-finite; reset weights.\n")
+            corr <- apply_weight_correction(
+              w_cur = w,
+              log_adjust = (1 - lambda) * lp_ref_new,
+              clamp_label = "lp_ref",
+              reset_msg = "  [GSS Guard] Snapshot normalization non-finite; reset weights.\n"
+            )
+            if (!isTRUE(corr$ok)) {
+              w <- corr$w
+              cat(corr$reset_msg)
             } else {
-              w <- exp(logw - lse)
-              w <- w / sum(w)
+              w <- corr$w
+              log_evidence <- log_evidence + corr$log_norm
+              mcse_var_accum <- mcse_var_accum + corr$var_log
             }
             lp_ref <- lp_ref_new
-            cat("  [GSS] reference SNAPSHOT at lambda=", sprintf("%.3f", lambda), " (weights updated)\n")
+            cat("  [GSS] reference SNAPSHOT at lambda=", sprintf("%.3f", lambda),
+                sprintf(" (weights updated, logZ += %.4f)\n", if (isTRUE(corr$ok)) corr$log_norm else 0))
             if (freeze_transport_after_gss) transport_frozen <- TRUE
           } else {
             # refresh: exact corrective reweighting at fixed lambda
-            logw <- log(pmax(w, .Machine$double.eps)) + (1 - lambda) * (lp_ref_new - lp_ref)
-            lse <- logsumexp(logw)
-            if (!is.finite(lse)) {
-              w <- rep(1 / length(w), length(w))
-              cat("  [GSS Guard] Refresh normalization non-finite; reset weights.\n")
+            corr <- apply_weight_correction(
+              w_cur = w,
+              log_adjust = (1 - lambda) * (lp_ref_new - lp_ref),
+              clamp_label = "lp_ref",
+              reset_msg = "  [GSS Guard] Refresh normalization non-finite; reset weights.\n"
+            )
+            if (!isTRUE(corr$ok)) {
+              w <- corr$w
+              cat(corr$reset_msg)
             } else {
-              w <- exp(logw - lse)
-              w <- w / sum(w)
+              w <- corr$w
+              log_evidence <- log_evidence + corr$log_norm
+              mcse_var_accum <- mcse_var_accum + corr$var_log
             }
             lp_ref <- lp_ref_new
-            cat("  [GSS] reference REFRESH at lambda=", sprintf("%.3f", lambda), " (weights corrected)\n")
+            cat("  [GSS] reference REFRESH at lambda=", sprintf("%.3f", lambda),
+                sprintf(" (weights corrected, logZ += %.4f)\n", if (isTRUE(corr$ok)) corr$log_norm else 0))
           }
         }
       } else if (!is.null(ref_mix) && is.null(lp_ref)) {
@@ -1705,18 +2114,19 @@ enhanced_smc_elite <- function(data, loglik_fn, mu_ref = NULL, Sigma_ref = NULL,
           ref_mix <- NULL
           lp_ref <- NULL
         } else {
-          if (any(bad_ref)) {
-            lp_ref[bad_ref] <- min(lp_ref[!bad_ref]) - 50
-            cat(sprintf("  [GSS Guard] Clamped %d non-finite safety lp_ref values.\n", sum(bad_ref)))
-          }
-          logw <- log(pmax(w, .Machine$double.eps)) + (1 - lambda) * lp_ref
-          lse <- logsumexp(logw)
-          if (!is.finite(lse)) {
-            w <- rep(1 / length(w), length(w))
-            cat("  [GSS Guard] Safety normalization non-finite; reset weights.\n")
+          corr <- apply_weight_correction(
+            w_cur = w,
+            log_adjust = (1 - lambda) * lp_ref,
+            clamp_label = "safety lp_ref",
+            reset_msg = "  [GSS Guard] Safety normalization non-finite; reset weights.\n"
+          )
+          if (!isTRUE(corr$ok)) {
+            w <- corr$w
+            cat(corr$reset_msg)
           } else {
-            w <- exp(logw - lse)
-            w <- w / sum(w)
+            w <- corr$w
+            log_evidence <- log_evidence + corr$log_norm
+            mcse_var_accum <- mcse_var_accum + corr$var_log
           }
         }
       }

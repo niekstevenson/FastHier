@@ -8,38 +8,118 @@ script_path <- if (length(file_arg)) {
 repo_dir <- dirname(dirname(script_path))
 setwd(repo_dir)
 
+parse_cli_args <- function(args) {
+  out <- list()
+  if (!length(args)) return(out)
+  for (arg in args) {
+    if (!startsWith(arg, "--")) next
+    arg <- sub("^--", "", arg)
+    parts <- strsplit(arg, "=", fixed = TRUE)[[1L]]
+    key <- gsub("-", "_", parts[1L])
+    value <- if (length(parts) > 1L) paste(parts[-1L], collapse = "=") else "true"
+    out[[key]] <- value
+  }
+  out
+}
+
+arg_chr <- function(args, key, default = NULL) {
+  val <- args[[key]]
+  if (is.null(val) || !nzchar(val)) default else as.character(val)
+}
+
+arg_int <- function(args, key, default) {
+  val <- args[[key]]
+  if (is.null(val) || !nzchar(val)) return(as.integer(default))
+  as.integer(val)
+}
+
+arg_lgl <- function(args, key, default = FALSE) {
+  val <- args[[key]]
+  if (is.null(val) || !nzchar(val)) return(isTRUE(default))
+  tolower(as.character(val)) %in% c("1", "true", "t", "yes", "y")
+}
+
+config_label_default <- function(refined_method, transport_method, gss_enable, da_enable) {
+  refined_tag <- if (identical(refined_method, "defensive_mixture")) "defmix" else "broad"
+  transport_tag <- if (identical(transport_method, "gaussian_copula")) "gcop" else "tri"
+  mode_tag <- if (gss_enable && da_enable) {
+    "gss_da"
+  } else if (gss_enable) {
+    "gss"
+  } else if (da_enable) {
+    "da"
+  } else {
+    "base"
+  }
+  paste(refined_tag, transport_tag, mode_tag, sep = "_")
+}
+
 suppressPackageStartupMessages({
   library(parallel)
 })
 
 set.seed(20260324L)
 
+cli_args <- parse_cli_args(commandArgs(trailingOnly = TRUE))
+
+transport_method <- arg_chr(cli_args, "transport_method", "sparse_triangular")
+refined_method <- arg_chr(cli_args, "refined_method", "defensive_mixture")
+gss_enable <- arg_lgl(cli_args, "gss_enable", FALSE)
+da_enable <- arg_lgl(cli_args, "da_enable", FALSE)
+hist_mix_enable <- arg_lgl(cli_args, "hist_mix_enable", gss_enable || da_enable)
+run_label <- arg_chr(cli_args, "label", NULL)
+
 stan_results_file <- file.path("benchmarks", "samples", "shifted_gamma_hierarchy_stan_results.rds")
-results_file <- file.path("benchmarks", "results", "shifted_gamma_hierarchy_current_results.rds")
-plot_file <- file.path("benchmarks", "results", "shifted_gamma_hierarchy_current_posteriors.png")
+results_file <- arg_chr(cli_args, "results_file", file.path("benchmarks", "results", "shifted_gamma_hierarchy_current_results.rds"))
+plot_file <- arg_chr(cli_args, "plot_file", file.path("benchmarks", "results", "shifted_gamma_hierarchy_current_posteriors.png"))
 
 detected_cores <- suppressWarnings(parallel::detectCores(logical = TRUE))
 if (!is.finite(detected_cores) || detected_cores < 1L) {
   detected_cores <- 1L
 }
 
-mc.cores <- as.integer(max(1L, min(4L, detected_cores)))
-pilot_size <- 10L
-pilot_particles <- 800L
-full_particles <- 2000L
-outer_particles <- 2000L
-outer_mcmc_moves <- 3L
-outer_max_rounds <- 80L
-base_seed <- 20260324L
-verbose <- TRUE
+mc.cores <- as.integer(max(1L, min(arg_int(cli_args, "mc_cores", 4L), detected_cores)))
+pilot_size <- arg_int(cli_args, "pilot_size", 10L)
+pilot_particles <- arg_int(cli_args, "pilot_particles", 800L)
+full_particles <- arg_int(cli_args, "full_particles", 2000L)
+outer_particles <- arg_int(cli_args, "outer_particles", 2000L)
+outer_mcmc_moves <- arg_int(cli_args, "outer_mcmc_moves", 3L)
+outer_max_rounds <- arg_int(cli_args, "outer_max_rounds", 80L)
+base_seed <- arg_int(cli_args, "base_seed", 20260324L)
+verbose <- arg_lgl(cli_args, "verbose", TRUE)
+
+if (is.null(run_label)) {
+  if (length(commandArgs(trailingOnly = TRUE))) {
+    run_label <- config_label_default(refined_method, transport_method, gss_enable, da_enable)
+  } else {
+    run_label <- "current"
+  }
+}
+
+if (is.null(cli_args[["results_file"]])) {
+  if (!identical(run_label, "current")) {
+    results_file <- file.path("benchmarks", "results", sprintf("shifted_gamma_%s_results.rds", run_label))
+  }
+}
+if (is.null(cli_args[["plot_file"]])) {
+  if (!identical(run_label, "current")) {
+    plot_file <- file.path("benchmarks", "results", sprintf("shifted_gamma_%s_posteriors.png", run_label))
+  }
+}
 
 dir.create(file.path("benchmarks", "samples"), showWarnings = FALSE, recursive = TRUE)
 dir.create(file.path("benchmarks", "results"), showWarnings = FALSE, recursive = TRUE)
 
+source("smc_core.R")
+source("reference_priors.R")
+source("utilities.R")
+source("SMC_super_fast.R")
+if (identical(transport_method, "gaussian_copula")) {
+  fit_copula_transform <- .fit_gaussian_copula_transform
+}
 source("hierarchical_locals.R")
 source("population_models.R")
 source("outer_population_smc.R")
-source("utilities.R")
 
 if (!file.exists(stan_results_file)) {
   stop("Missing Stan benchmark results: ", stan_results_file)
@@ -111,6 +191,13 @@ stan_draws <- data.frame(
 
 cat(sprintf("Loaded Stan benchmark bundle: %s\n", stan_results_file))
 cat(sprintf("Data: %d subjects x %d trials\n", nrow(y), ncol(y)))
+cat(sprintf("Configuration: label=%s | refined=%s | transport=%s | hist_mix=%s | gss=%s | da=%s\n",
+            run_label,
+            refined_method,
+            transport_method,
+            hist_mix_enable,
+            gss_enable,
+            da_enable))
 cat("Running local-reference stage...\n")
 
 stage <- prepare_reference_local_stage(
@@ -122,15 +209,19 @@ stage <- prepare_reference_local_stage(
   broad_scale = 1,
   pilot_particles = pilot_particles,
   full_particles = full_particles,
+  refined_method = refined_method,
   n_jobs = mc.cores,
   base_seed = base_seed,
   pilot_smc_control = list(
-    max_rounds = 40L
+    max_rounds = 40L,
+    hist_mix_enable = hist_mix_enable,
+    gss_enable = gss_enable,
+    da_enable = da_enable
   ),
   full_smc_control = list(
-    hist_mix_enable = FALSE,
-    gss_enable = FALSE,
-    da_enable = FALSE
+    hist_mix_enable = hist_mix_enable,
+    gss_enable = gss_enable,
+    da_enable = da_enable
   )
 )
 
@@ -167,7 +258,7 @@ grDevices::png(plot_file, width = 1400, height = 900)
 plot_posteriors(
   stan_draws,
   workflow_draws,
-  labels = c("Stan", "Current workflow"),
+  labels = c("Stan", run_label),
   cols = c("black", "firebrick3"),
   n_cols = 3L
 )
@@ -181,6 +272,12 @@ saveRDS(
     stan_draws = stan_draws,
     workflow_draws = workflow_draws,
     settings = list(
+      label = run_label,
+      transport_method = transport_method,
+      refined_method = refined_method,
+      hist_mix_enable = hist_mix_enable,
+      gss_enable = gss_enable,
+      da_enable = da_enable,
       mc.cores = mc.cores,
       pilot_size = min(pilot_size, length(data_list)),
       pilot_particles = pilot_particles,
