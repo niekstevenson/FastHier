@@ -120,9 +120,12 @@ suppressPackageStartupMessages({
 }
 
 make_reference_prior_gaussian <- function(mu, Sigma, scale = 1, param_names = NULL, label = "gaussian") {
-  mu <- as.numeric(mu)
-  Sigma <- as.matrix(Sigma) * as.numeric(scale)
-  component <- .normalize_reference_component(mu, Sigma, weight = 1, param_names = param_names)
+  nm <- .reference_param_names(mu, Sigma, param_names = param_names)
+  mu <- stats::setNames(as.numeric(mu), nm)
+  Sigma <- as.matrix(Sigma)
+  dimnames(Sigma) <- list(nm, nm)
+  Sigma <- Sigma * as.numeric(scale)
+  component <- .normalize_reference_component(mu, Sigma, weight = 1, param_names = nm)
   .build_reference_prior(list(component), family = "gaussian", label = label)
 }
 
