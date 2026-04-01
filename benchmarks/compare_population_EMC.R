@@ -279,6 +279,7 @@ outer_mcmc_moves <- arg_int(cli_args, "outer_mcmc_moves", 3L)
 outer_max_rounds <- arg_int(cli_args, "outer_max_rounds", 80L)
 base_seed <- arg_int(cli_args, "base_seed", 20260324L)
 broad_scale <- as.numeric(arg_chr(cli_args, "broad_scale", "1"))
+refresh_once <- arg_lgl(cli_args, "refresh_once", TRUE)
 
 dir.create(results_dir, showWarnings = FALSE, recursive = TRUE)
 logs_dir <- file.path(results_dir, "logs")
@@ -388,6 +389,12 @@ for (i in seq_len(nrow(configs))) {
         n_jobs = mc.cores,
         base_seed = base_seed,
         pilot_population_model = population_model,
+        refresh_once = refresh_once,
+        refresh_outer_control = list(
+          N = outer_particles,
+          n_mcmc_moves = outer_mcmc_moves,
+          max_rounds = outer_max_rounds
+        ),
         verbose = inner_verbose,
         pilot_smc_control = list(
           max_rounds = 40L,
@@ -402,17 +409,22 @@ for (i in seq_len(nrow(configs))) {
         )
       )
 
-      cat("Running outer population SMC...\n")
-      factor_set <- build_population_factor_set(stage$local_objects, population_model)
-      fit <- outer_population_smc(
-        factor_set = factor_set,
-        N = outer_particles,
-        n_mcmc_moves = outer_mcmc_moves,
-        max_rounds = outer_max_rounds,
-        n_cores = mc.cores,
-        seed = base_seed,
-        verbose = inner_verbose
-      )
+      if (!is.null(stage$outer_fit)) {
+        cat("Using refreshed outer population SMC fit from local-reference stage...\n")
+        fit <- stage$outer_fit
+      } else {
+        cat("Running outer population SMC...\n")
+        factor_set <- build_population_factor_set(stage$local_objects, population_model)
+        fit <- outer_population_smc(
+          factor_set = factor_set,
+          N = outer_particles,
+          n_mcmc_moves = outer_mcmc_moves,
+          max_rounds = outer_max_rounds,
+          n_cores = mc.cores,
+          seed = base_seed,
+          verbose = inner_verbose
+        )
+      }
 
       workflow_parts <- smc_posteriors(
         fit,
@@ -459,6 +471,7 @@ for (i in seq_len(nrow(configs))) {
             outer_max_rounds = outer_max_rounds,
             base_seed = base_seed,
             broad_scale = broad_scale,
+            refresh_once = refresh_once,
             elapsed_sec = elapsed_sec
           ),
           elapsed_sec = elapsed_sec,

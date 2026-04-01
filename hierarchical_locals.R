@@ -302,7 +302,24 @@ fit_pilot_population_model <- function(pilot_fits,
                                        verbose = TRUE) {
   .ensure_population_refinement_helpers()
   pilot_objects <- build_local_reference_objects(pilot_fits, reference_prior = reference_prior)
-  factor_set <- build_population_factor_set(pilot_objects, population_model)
+  fit_population_model_from_local_objects(
+    local_objects = pilot_objects,
+    population_model = population_model,
+    outer_control = outer_control,
+    n_cores = n_cores,
+    seed = seed,
+    verbose = verbose
+  )
+}
+
+fit_population_model_from_local_objects <- function(local_objects,
+                                                    population_model,
+                                                    outer_control = list(),
+                                                    n_cores = 1L,
+                                                    seed = 123L,
+                                                    verbose = TRUE) {
+  .ensure_population_refinement_helpers()
+  factor_set <- build_population_factor_set(local_objects, population_model)
   fit_args <- modifyList(
     list(
       factor_set = factor_set,
@@ -476,6 +493,8 @@ prepare_reference_local_stage <- function(data_list,
                                           pilot_population_model = NULL,
                                           pilot_reference_support_size = 8L,
                                           pilot_outer_control = list(),
+                                          refresh_once = FALSE,
+                                          refresh_outer_control = list(),
                                           verbose = TRUE,
                                           pilot_smc_control = list(
                                             n_mcmc_moves = 1L,
@@ -487,6 +506,7 @@ prepare_reference_local_stage <- function(data_list,
                                           ),
                                           full_smc_control = list()) {
   refined_method <- match.arg(refined_method)
+  refresh_once <- isTRUE(refresh_once)
 
   broad_reference <- make_broad_reference_prior(
     mu = base_mu,
@@ -554,22 +574,87 @@ prepare_reference_local_stage <- function(data_list,
     )
   }
 
-  full_args <- modifyList(
+  run_full_local_pass <- function(reference_prior, seed_offset) {
+    full_args <- modifyList(
+      list(
+        data_list = data_list,
+        loglik_fn = loglik_fn,
+        reference_prior = reference_prior,
+        indices = seq_along(data_list),
+        M = full_particles,
+        n_jobs = n_jobs,
+        local_n_cores = full_local_n_cores,
+        base_seed = base_seed + as.integer(seed_offset),
+        verbose = verbose
+      ),
+      full_smc_control
+    )
+    local_fits <- do.call(run_reference_local_smc, full_args)
     list(
-      data_list = data_list,
-      loglik_fn = loglik_fn,
-      reference_prior = refined_reference,
-      indices = seq_along(data_list),
-      M = full_particles,
-      n_jobs = n_jobs,
-      local_n_cores = full_local_n_cores,
-      base_seed = base_seed + 100000L,
-      verbose = verbose
-    ),
-    full_smc_control
+      local_fits = local_fits,
+      local_objects = build_local_reference_objects(local_fits, reference_prior = reference_prior)
+    )
+  }
+
+  full_pass <- run_full_local_pass(
+    reference_prior = refined_reference,
+    seed_offset = 100000L
   )
-  local_fits <- do.call(run_reference_local_smc, full_args)
-  local_objects <- build_local_reference_objects(local_fits, reference_prior = refined_reference)
+  local_fits <- full_pass$local_fits
+  local_objects <- full_pass$local_objects
+  outer_fit <- NULL
+  pre_refresh <- NULL
+
+  if (refresh_once) {
+    if (is.null(pilot_population_model)) {
+      stop("refresh_once requires pilot_population_model so the refreshed outer fit can be constructed.")
+    }
+
+    initial_outer_fit <- fit_population_model_from_local_objects(
+      local_objects = local_objects,
+      population_model = pilot_population_model,
+      outer_control = refresh_outer_control,
+      n_cores = n_jobs,
+      seed = base_seed + 150000L,
+      verbose = verbose
+    )
+
+    refreshed_reference <- build_refined_reference_prior_from_population_fit(
+      population_fit = initial_outer_fit,
+      population_model = pilot_population_model,
+      method = refined_method,
+      inflation = inflation,
+      defensive_weight = defensive_weight,
+      broad_reference = broad_reference,
+      defensive_scale = defensive_scale,
+      support_size = pilot_reference_support_size,
+      support_seed = base_seed + 150001L
+    )
+
+    pre_refresh <- list(
+      refined_reference = refined_reference,
+      local_fits = local_fits,
+      local_objects = local_objects,
+      outer_fit = initial_outer_fit
+    )
+
+    refreshed_pass <- run_full_local_pass(
+      reference_prior = refreshed_reference,
+      seed_offset = 200000L
+    )
+    refined_reference <- refreshed_reference
+    local_fits <- refreshed_pass$local_fits
+    local_objects <- refreshed_pass$local_objects
+
+    outer_fit <- fit_population_model_from_local_objects(
+      local_objects = local_objects,
+      population_model = pilot_population_model,
+      outer_control = refresh_outer_control,
+      n_cores = n_jobs,
+      seed = base_seed + 250000L,
+      verbose = verbose
+    )
+  }
 
   list(
     broad_reference = broad_reference,
@@ -582,6 +667,8 @@ prepare_reference_local_stage <- function(data_list,
     ),
     refined_reference = refined_reference,
     local_fits = local_fits,
-    local_objects = local_objects
+    local_objects = local_objects,
+    outer_fit = outer_fit,
+    pre_refresh = pre_refresh
   )
 }
