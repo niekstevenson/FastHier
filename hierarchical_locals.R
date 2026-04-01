@@ -441,25 +441,49 @@ build_refined_reference_prior <- function(pilot_fits,
   )
 }
 
-build_local_reference_object <- function(local_fit, reference_prior) {
+build_local_reference_component <- function(local_fit,
+                                           reference_prior,
+                                           label = NULL) {
   if (is.null(local_fit$Theta) || is.null(local_fit$w)) {
     stop("local_fit must contain Theta and w.")
   }
   particles <- as.matrix(local_fit$Theta)
   reference_prior <- normalize_reference_prior(reference_prior = reference_prior)
+  list(
+    label = as.character(label %||% reference_prior$label %||% ""),
+    particles = particles,
+    weights = normalize_particle_weights(local_fit$w),
+    log_evidence = as.numeric(local_fit$log_evidence %||% NA_real_),
+    mcse_log_evidence = as.numeric(local_fit$mcse_logZ %||% NA_real_),
+    reference_prior = reference_prior,
+    log_reference_density = reference_prior_logpdf(reference_prior, particles),
+    diagnostics = list(
+      rounds = as.integer(local_fit$meta$rounds %||% NA_integer_),
+      final_lambda = as.numeric(local_fit$final_lambda %||% NA_real_)
+    )
+  )
+}
+
+build_local_reference_object <- function(local_fit,
+                                         reference_prior,
+                                         label = NULL) {
+  component <- build_local_reference_component(
+    local_fit = local_fit,
+    reference_prior = reference_prior,
+    label = label
+  )
   structure(
     list(
       local_id = as.integer(local_fit$local_id %||% NA_integer_),
-      particles = particles,
-      weights = normalize_particle_weights(local_fit$w),
-      log_evidence = as.numeric(local_fit$log_evidence %||% NA_real_),
-      mcse_log_evidence = as.numeric(local_fit$mcse_logZ %||% NA_real_),
-      reference_prior = reference_prior,
-      log_reference_density = reference_prior_logpdf(reference_prior, particles),
-      diagnostics = list(
-        rounds = as.integer(local_fit$meta$rounds %||% NA_integer_),
-        final_lambda = as.numeric(local_fit$final_lambda %||% NA_real_)
-      )
+      particles = component$particles,
+      weights = component$weights,
+      log_evidence = component$log_evidence,
+      mcse_log_evidence = component$mcse_log_evidence,
+      reference_prior = component$reference_prior,
+      log_reference_density = component$log_reference_density,
+      diagnostics = component$diagnostics,
+      components = list(component),
+      mixture_weights = 1
     ),
     class = "reference_local_object"
   )
@@ -469,6 +493,83 @@ build_local_reference_objects <- function(local_fits, reference_prior) {
   objs <- lapply(local_fits, build_local_reference_object, reference_prior = reference_prior)
   names(objs) <- names(local_fits)
   objs
+}
+
+.local_reference_object_components <- function(local_object) {
+  if (!is.null(local_object$components)) {
+    return(local_object$components)
+  }
+  list(
+    list(
+      label = "",
+      particles = as.matrix(local_object$particles),
+      weights = normalize_particle_weights(local_object$weights),
+      log_evidence = as.numeric(local_object$log_evidence %||% NA_real_),
+      mcse_log_evidence = as.numeric(local_object$mcse_log_evidence %||% NA_real_),
+      reference_prior = normalize_reference_prior(reference_prior = local_object$reference_prior),
+      log_reference_density = as.numeric(
+        local_object$log_reference_density %||%
+          reference_prior_logpdf(local_object$reference_prior, local_object$particles)
+      ),
+      diagnostics = local_object$diagnostics %||% list()
+    )
+  )
+}
+
+merge_local_reference_objects_dmis <- function(primary_objects,
+                                               secondary_objects,
+                                               mixture_weights = c(0.5, 0.5),
+                                               labels = c("initial", "refreshed")) {
+  if (!length(primary_objects) || !length(secondary_objects)) {
+    stop("Both primary_objects and secondary_objects must be non-empty.")
+  }
+  if (!identical(names(primary_objects), names(secondary_objects))) {
+    stop("primary_objects and secondary_objects must have identical names for DMIS merging.")
+  }
+  mixture_weights <- normalize_particle_weights(mixture_weights)
+  if (length(mixture_weights) != 2L) {
+    stop("mixture_weights must have length 2 for DMIS merging.")
+  }
+  labels <- rep_len(as.character(labels), 2L)
+
+  merged <- lapply(names(primary_objects), function(nm) {
+    primary_components <- .local_reference_object_components(primary_objects[[nm]])
+    secondary_components <- .local_reference_object_components(secondary_objects[[nm]])
+    components <- c(primary_components, secondary_components)
+
+    group_labels <- c(
+      rep.int(labels[1L], length(primary_components)),
+      rep.int(labels[2L], length(secondary_components))
+    )
+    if (length(components) > 1L) {
+      for (idx in seq_along(components)) {
+        components[[idx]]$label <- if (sum(group_labels == group_labels[idx]) > 1L) {
+          paste0(group_labels[idx], "_", idx)
+        } else {
+          group_labels[idx]
+        }
+      }
+    } else {
+      components[[1L]]$label <- labels[1L]
+    }
+
+    component_weights <- c(
+      rep(mixture_weights[1L] / length(primary_components), length(primary_components)),
+      rep(mixture_weights[2L] / length(secondary_components), length(secondary_components))
+    )
+
+    structure(
+      list(
+        local_id = as.integer(primary_objects[[nm]]$local_id %||% secondary_objects[[nm]]$local_id %||% NA_integer_),
+        components = components,
+        mixture_weights = component_weights,
+        diagnostics = list(mode = "dmis_merge")
+      ),
+      class = "reference_local_object"
+    )
+  })
+  names(merged) <- names(primary_objects)
+  merged
 }
 
 prepare_reference_local_stage <- function(data_list,
@@ -604,6 +705,7 @@ prepare_reference_local_stage <- function(data_list,
   local_objects <- full_pass$local_objects
   outer_fit <- NULL
   pre_refresh <- NULL
+  refresh_merge_method <- NULL
 
   if (refresh_once) {
     if (is.null(pilot_population_model)) {
@@ -644,7 +746,13 @@ prepare_reference_local_stage <- function(data_list,
     )
     refined_reference <- refreshed_reference
     local_fits <- refreshed_pass$local_fits
-    local_objects <- refreshed_pass$local_objects
+    local_objects <- merge_local_reference_objects_dmis(
+      primary_objects = pre_refresh$local_objects,
+      secondary_objects = refreshed_pass$local_objects,
+      mixture_weights = c(0.5, 0.5),
+      labels = c("initial", "refreshed")
+    )
+    refresh_merge_method <- "dmis"
 
     outer_fit <- fit_population_model_from_local_objects(
       local_objects = local_objects,
@@ -669,6 +777,7 @@ prepare_reference_local_stage <- function(data_list,
     local_fits = local_fits,
     local_objects = local_objects,
     outer_fit = outer_fit,
-    pre_refresh = pre_refresh
+    pre_refresh = pre_refresh,
+    refresh_merge_method = refresh_merge_method
   )
 }

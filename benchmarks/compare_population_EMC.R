@@ -110,6 +110,88 @@ draw_quantiles <- function(x, probs = c(0.1, 0.5, 0.9)) {
   stats::quantile(as.numeric(x), probs = probs, na.rm = TRUE, names = FALSE)
 }
 
+make_emc_theta_center <- function(emc_draws, param_names) {
+  mu_center <- colMeans(emc_draws[, paste0("mu_", param_names), drop = FALSE])
+  sigma2_center <- colMeans(emc_draws[, paste0("sigma2_", param_names), drop = FALSE])
+  theta <- c(mu_center, log(sigma2_center))
+  theta <- matrix(theta, nrow = 1L)
+  colnames(theta) <- c(paste0("mu_", param_names), paste0("log_sigma2_", param_names))
+  theta
+}
+
+make_sv_tail_grid <- function(emc_draws,
+                              probs = c(0.05, 0.25, 0.50, 0.75, 0.90, 0.95, 0.99)) {
+  log(as.numeric(stats::quantile(emc_draws[["sigma2_sv"]], probs = probs, na.rm = TRUE, names = FALSE)))
+}
+
+summarize_local_factor_diagnostics <- function(local_diag) {
+  finite_k <- local_diag$pareto_k[is.finite(local_diag$pareto_k)]
+  data.frame(
+    min_ess = min(local_diag$ess, na.rm = TRUE),
+    q10_ess = as.numeric(stats::quantile(local_diag$ess, probs = 0.10, na.rm = TRUE, names = FALSE)),
+    mean_ess = mean(local_diag$ess, na.rm = TRUE),
+    max_pareto_k = if (length(finite_k)) max(finite_k) else NA_real_,
+    q90_pareto_k = if (length(finite_k)) as.numeric(stats::quantile(finite_k, probs = 0.90, na.rm = TRUE, names = FALSE)) else NA_real_,
+    n_k_gt_0_7 = sum(local_diag$pareto_k > 0.7, na.rm = TRUE),
+    n_k_gt_1_0 = sum(local_diag$pareto_k > 1.0, na.rm = TRUE),
+    stringsAsFactors = FALSE
+  )
+}
+
+compute_factor_diagnostics <- function(factor_set, theta_center, sv_grid) {
+  center_local <- population_factor_set_local_tail_diagnostics(
+    factor_set = factor_set,
+    theta = theta_center,
+    use_psis = TRUE
+  )
+  list(
+    center_local = center_local,
+    center_summary = summarize_local_factor_diagnostics(center_local),
+    sv_tail = population_factor_set_sv_tail_grid(
+      factor_set = factor_set,
+      theta_center = theta_center,
+      sv_grid = sv_grid,
+      use_psis = TRUE,
+      top_n = 5L
+    )
+  )
+}
+
+log_factor_diagnostics <- function(diag, label) {
+  cat(label, "\n", sep = "")
+  cat("  Centered at EMC mean:\n")
+  print(round(diag$center_summary, 3))
+  cat("  sv tail grid summary:\n")
+  print(round(diag$sv_tail$summary, 3))
+  if (nrow(diag$sv_tail$worst)) {
+    cat("  Worst locals at largest sigma2_sv grid point:\n")
+    largest_sigma2 <- max(diag$sv_tail$worst$sigma2_sv, na.rm = TRUE)
+    worst <- diag$sv_tail$worst[diag$sv_tail$worst$sigma2_sv == largest_sigma2, , drop = FALSE]
+    print(utils::head(worst, 5L))
+  }
+}
+
+append_factor_diag_summary <- function(row, diag, prefix = "") {
+  if (is.null(diag)) return(row)
+  center <- diag$center_summary
+  tail_summary <- diag$sv_tail$summary
+  right_tail <- tail_summary[which.max(tail_summary$sigma2_sv), , drop = FALSE]
+  finite_tail_k <- tail_summary$max_pareto_k[is.finite(tail_summary$max_pareto_k)]
+
+  row[[paste0(prefix, "center_min_ess")]] <- as.numeric(center$min_ess)
+  row[[paste0(prefix, "center_q10_ess")]] <- as.numeric(center$q10_ess)
+  row[[paste0(prefix, "center_mean_ess")]] <- as.numeric(center$mean_ess)
+  row[[paste0(prefix, "center_max_pareto_k")]] <- as.numeric(center$max_pareto_k)
+  row[[paste0(prefix, "center_q90_pareto_k")]] <- as.numeric(center$q90_pareto_k)
+  row[[paste0(prefix, "center_n_k_gt_0_7")]] <- as.integer(center$n_k_gt_0_7)
+  row[[paste0(prefix, "center_n_k_gt_1_0")]] <- as.integer(center$n_k_gt_1_0)
+  row[[paste0(prefix, "sv_tail_max_pareto_k")]] <- if (length(finite_tail_k)) max(finite_tail_k) else NA_real_
+  row[[paste0(prefix, "sv_tail_rightmost_min_ess")]] <- as.numeric(right_tail$min_ess)
+  row[[paste0(prefix, "sv_tail_rightmost_max_pareto_k")]] <- as.numeric(right_tail$max_pareto_k)
+  row[[paste0(prefix, "sv_tail_rightmost_n_k_gt_0_7")]] <- as.integer(right_tail$n_k_gt_0_7)
+  row
+}
+
 run_with_log <- function(log_file, expr) {
   expr <- substitute(expr)
   con <- file(log_file, open = "wt")
@@ -250,6 +332,8 @@ summarize_result <- function(result_file, config, plot_file, log_file) {
   diff_values <- unlist(row[diff_cols], use.names = FALSE)
   row$mean_abs_posterior_diff <- mean(abs(diff_values))
   row$max_abs_posterior_diff <- max(abs(diff_values))
+  row <- append_factor_diag_summary(row, res$factor_diagnostics$final %||% NULL)
+  row <- append_factor_diag_summary(row, res$factor_diagnostics$pre_refresh %||% NULL, prefix = "pre_refresh_")
   row
 }
 
@@ -409,12 +493,18 @@ for (i in seq_len(nrow(configs))) {
         )
       )
 
+      factor_set <- build_population_factor_set(stage$local_objects, population_model)
+      pre_refresh_factor_set <- if (!is.null(stage$pre_refresh)) {
+        build_population_factor_set(stage$pre_refresh$local_objects, population_model)
+      } else {
+        NULL
+      }
+
       if (!is.null(stage$outer_fit)) {
         cat("Using refreshed outer population SMC fit from local-reference stage...\n")
         fit <- stage$outer_fit
       } else {
         cat("Running outer population SMC...\n")
-        factor_set <- build_population_factor_set(stage$local_objects, population_model)
         fit <- outer_population_smc(
           factor_set = factor_set,
           N = outer_particles,
@@ -444,6 +534,36 @@ for (i in seq_len(nrow(configs))) {
         model = population_model
       )
 
+      emc_theta_center <- make_emc_theta_center(emc_draws, param_names = param_names)
+      sv_tail_grid <- make_sv_tail_grid(emc_draws)
+      factor_diagnostics <- list(
+        theta_center = emc_theta_center,
+        sv_grid = data.frame(
+          log_sigma2_sv = sv_tail_grid,
+          sigma2_sv = exp(sv_tail_grid),
+          stringsAsFactors = FALSE
+        ),
+        final = compute_factor_diagnostics(
+          factor_set = factor_set,
+          theta_center = emc_theta_center,
+          sv_grid = sv_tail_grid
+        ),
+        pre_refresh = if (!is.null(pre_refresh_factor_set)) {
+          compute_factor_diagnostics(
+            factor_set = pre_refresh_factor_set,
+            theta_center = emc_theta_center,
+            sv_grid = sv_tail_grid
+          )
+        } else {
+          NULL
+        }
+      )
+
+      log_factor_diagnostics(factor_diagnostics$final, "Final factor diagnostics:")
+      if (!is.null(factor_diagnostics$pre_refresh)) {
+        log_factor_diagnostics(factor_diagnostics$pre_refresh, "Pre-refresh factor diagnostics:")
+      }
+
       plot_config_posteriors(workflow_draws, emc_draws, label, plot_file)
 
       elapsed_sec <- proc.time()[["elapsed"]] - start_time
@@ -455,6 +575,7 @@ for (i in seq_len(nrow(configs))) {
           emc_draws = emc_draws,
           workflow_draws = workflow_draws,
           posterior_summary = posterior_summary,
+          factor_diagnostics = factor_diagnostics,
           settings = list(
             label = label,
             transport_method = cfg$transport_method,

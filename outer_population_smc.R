@@ -27,53 +27,154 @@ suppressPackageStartupMessages({
   library(parallel)
 })
 
+normalize_reference_local_weights <- function(w) {
+  w <- pmax(as.numeric(w), 0)
+  sw <- sum(w)
+  if (!is.finite(sw) || sw <= 0) {
+    rep(1 / length(w), length(w))
+  } else {
+    w / sw
+  }
+}
+
+validate_reference_local_component <- function(component) {
+  if (!is.list(component)) stop("reference local component must be a list.")
+  required <- c("particles", "weights", "reference_prior")
+  missing <- setdiff(required, names(component))
+  if (length(missing)) {
+    stop("reference local component is missing: ", paste(missing, collapse = ", "))
+  }
+  particles <- as.matrix(component$particles)
+  weights <- normalize_reference_local_weights(component$weights)
+  reference_prior <- normalize_reference_prior(reference_prior = component$reference_prior)
+  log_reference_density <- as.numeric(
+    component$log_reference_density %||% reference_prior_logpdf(reference_prior, particles)
+  )
+  component$particles <- particles
+  component$weights <- weights
+  component$reference_prior <- reference_prior
+  component$log_reference_density <- log_reference_density
+  component$log_evidence <- as.numeric(component$log_evidence %||% NA_real_)
+  component$mcse_log_evidence <- as.numeric(component$mcse_log_evidence %||% NA_real_)
+  component
+}
+
 validate_reference_local_object <- function(local_object) {
   if (!is.list(local_object)) stop("local_object must be a list.")
-  required <- c("local_id", "particles", "weights", "reference_prior")
+  local_object$local_id <- as.integer(local_object$local_id %||% NA_integer_)
+
+  if (!is.null(local_object$components)) {
+    if (!length(local_object$components)) {
+      stop("local_object components must be non-empty.")
+    }
+    local_object$components <- lapply(local_object$components, validate_reference_local_component)
+    mixture_weights <- local_object$mixture_weights %||% rep(1 / length(local_object$components), length(local_object$components))
+    mixture_weights <- normalize_reference_local_weights(mixture_weights)
+    if (length(mixture_weights) != length(local_object$components)) {
+      stop("local_object mixture_weights must match the number of components.")
+    }
+    local_object$mixture_weights <- mixture_weights
+    return(local_object)
+  }
+
+  required <- c("particles", "weights", "reference_prior")
   missing <- setdiff(required, names(local_object))
   if (length(missing)) {
     stop("local_object is missing: ", paste(missing, collapse = ", "))
   }
-  particles <- as.matrix(local_object$particles)
-  weights <- pmax(as.numeric(local_object$weights), 0)
-  sw <- sum(weights)
-  if (!is.finite(sw) || sw <= 0) {
-    stop("local_object weights are invalid.")
-  }
-  local_object$particles <- particles
-  local_object$weights <- weights / sw
-  local_object$reference_prior <- normalize_reference_prior(reference_prior = local_object$reference_prior)
+  local_object$components <- list(
+    validate_reference_local_component(
+      list(
+        particles = local_object$particles,
+        weights = local_object$weights,
+        log_evidence = local_object$log_evidence,
+        mcse_log_evidence = local_object$mcse_log_evidence,
+        reference_prior = local_object$reference_prior,
+        log_reference_density = local_object$log_reference_density,
+        diagnostics = local_object$diagnostics %||% list()
+      )
+    )
+  )
+  local_object$mixture_weights <- 1
   local_object
 }
 
 build_population_local_factor <- function(local_object, population_model) {
   local_object <- validate_reference_local_object(local_object)
   population_model <- normalize_population_model(population_model)
+  components <- local_object$components
 
-  alpha <- as.matrix(local_object$particles)
-  if (ncol(alpha) != population_model$alpha_dim) {
-    stop("Local particle dimension does not match the population model.")
+  align_alpha <- function(alpha) {
+    alpha <- as.matrix(alpha)
+    if (ncol(alpha) != population_model$alpha_dim) {
+      stop("Local particle dimension does not match the population model.")
+    }
+    if (!is.null(colnames(alpha)) && setequal(colnames(alpha), population_model$alpha_names)) {
+      alpha[, population_model$alpha_names, drop = FALSE]
+    } else {
+      colnames(alpha) <- population_model$alpha_names
+      alpha
+    }
   }
-  if (!is.null(colnames(alpha)) && setequal(colnames(alpha), population_model$alpha_names)) {
-    alpha <- alpha[, population_model$alpha_names, drop = FALSE]
+
+  if (length(components) == 1L) {
+    component <- components[[1L]]
+    alpha <- align_alpha(component$particles)
+    factor_log_weights <- log(component$weights)
+    factor_log_reference_density <- as.numeric(component$log_reference_density %||% reference_prior_logpdf(component$reference_prior, alpha))
+    log_base <- factor_log_weights - factor_log_reference_density
+    log_constant <- as.numeric(component$log_evidence %||% 0)
+    component_id <- rep.int(1L, nrow(alpha))
   } else {
-    colnames(alpha) <- population_model$alpha_names
-  }
+    eta <- normalize_reference_local_weights(local_object$mixture_weights)
+    log_eta <- ifelse(eta > 0, log(eta), -Inf)
+    alpha_list <- lapply(components, function(component) align_alpha(component$particles))
+    alpha <- do.call(rbind, alpha_list)
+    component_lengths <- vapply(alpha_list, nrow, integer(1))
+    component_id <- rep.int(seq_along(alpha_list), component_lengths)
 
-  logw <- log(local_object$weights)
-  logq <- as.numeric(local_object$log_reference_density %||% reference_prior_logpdf(local_object$reference_prior, alpha))
-  log_base <- logw - logq
+    component_logw <- unlist(
+      Map(function(component, eta_r) {
+        if (!is.finite(eta_r)) {
+          rep(-Inf, nrow(component$particles))
+        } else {
+          log(component$weights) + eta_r
+        }
+      }, components, as.list(log_eta)),
+      use.names = FALSE
+    )
+
+    component_logZ <- vapply(components, function(component) as.numeric(component$log_evidence %||% NA_real_), numeric(1))
+    if (any(!is.finite(component_logZ))) {
+      stop("DMIS local factors require finite log_evidence for every component.")
+    }
+
+    logq_mat <- vapply(
+      components,
+      function(component) as.numeric(reference_prior_logpdf(component$reference_prior, alpha)),
+      numeric(nrow(alpha))
+    )
+    if (!is.matrix(logq_mat)) {
+      logq_mat <- matrix(logq_mat, ncol = length(components))
+    }
+      log_d <- .rowLogSumExp(sweep(logq_mat, 2L, log_eta - component_logZ, "+"))
+    log_base <- component_logw - log_d
+    log_constant <- 0
+    factor_log_weights <- component_logw
+    factor_log_reference_density <- rep(NA_real_, nrow(alpha))
+  }
 
   structure(
     list(
       local_id = as.integer(local_object$local_id),
       population_model = population_model,
       particles = alpha,
-      log_weights = logw,
-      log_reference_density = logq,
+      log_weights = factor_log_weights,
+      log_reference_density = factor_log_reference_density,
       log_base = log_base,
-      log_constant = as.numeric(local_object$log_evidence %||% 0),
-      reference_prior = local_object$reference_prior,
+      log_constant = log_constant,
+      reference_prior = if (length(components) == 1L) components[[1L]]$reference_prior else NULL,
+      component_id = component_id,
       fast_family = as.character(population_model$fast_family %||% ""),
       fast_cache = NULL
     ),
@@ -202,6 +303,138 @@ population_local_factor_reweighted_particles <- function(factor, theta) {
   list(
     particles = factor$particles,
     weights = weights
+  )
+}
+
+population_local_factor_tail_diagnostic <- function(factor, theta, use_psis = TRUE) {
+  stopifnot(inherits(factor, "population_local_factor"))
+  theta_prepared <- population_model_prepare_theta(factor$population_model, theta)
+  logp <- .population_log_alpha_given_theta_many(
+    model = factor$population_model,
+    alpha = factor$particles,
+    theta_prepared = theta_prepared
+  )[1L, ]
+  lw <- factor$log_base + logp
+  keep <- is.finite(lw)
+  if (!any(keep)) {
+    return(list(
+      ess = 0,
+      pareto_k = NA_real_,
+      max_weight = NA_real_,
+      q99_weight = NA_real_,
+      n_finite = 0L
+    ))
+  }
+
+  lw <- lw[keep]
+  lse <- logsumexp(lw)
+  if (!is.finite(lse)) {
+    return(list(
+      ess = 0,
+      pareto_k = NA_real_,
+      max_weight = NA_real_,
+      q99_weight = NA_real_,
+      n_finite = length(lw)
+    ))
+  }
+
+  w <- exp(lw - lse)
+  pareto_k <- NA_real_
+  if (isTRUE(use_psis) &&
+      length(lw) >= 5L &&
+      requireNamespace("loo", quietly = TRUE)) {
+    psis_obj <- tryCatch(
+      suppressWarnings(loo::psis(matrix(lw - max(lw), ncol = 1L))),
+      error = function(e) NULL
+    )
+    if (!is.null(psis_obj)) {
+      pareto_k <- as.numeric(loo::pareto_k_values(psis_obj)[1L])
+    }
+  }
+
+  list(
+    ess = as.numeric(1 / sum(w * w)),
+    pareto_k = pareto_k,
+    max_weight = as.numeric(max(w)),
+    q99_weight = as.numeric(stats::quantile(w, probs = 0.99, na.rm = TRUE, names = FALSE)),
+    n_finite = length(lw)
+  )
+}
+
+population_factor_set_local_tail_diagnostics <- function(factor_set, theta, use_psis = TRUE) {
+  stopifnot(inherits(factor_set, "population_factor_set"))
+  model <- factor_set$population_model
+  theta <- .as_hyper_matrix(theta, hyper_names = model$hyper_names, hyper_dim = model$hyper_dim)
+  if (nrow(theta) != 1L) {
+    stop("population_factor_set_local_tail_diagnostics expects a single theta row.")
+  }
+  rows <- lapply(seq_along(factor_set$factors), function(i) {
+    diag_i <- population_local_factor_tail_diagnostic(factor_set$factors[[i]], theta = theta, use_psis = use_psis)
+    data.frame(
+      local = names(factor_set$factors)[i] %||% as.character(i),
+      ess = as.numeric(diag_i$ess),
+      pareto_k = as.numeric(diag_i$pareto_k),
+      max_weight = as.numeric(diag_i$max_weight),
+      q99_weight = as.numeric(diag_i$q99_weight),
+      n_finite = as.integer(diag_i$n_finite),
+      stringsAsFactors = FALSE
+    )
+  })
+  do.call(rbind, rows)
+}
+
+population_factor_set_sv_tail_grid <- function(factor_set,
+                                               theta_center,
+                                               sv_grid,
+                                               log_sigma2_name = "log_sigma2_sv",
+                                               use_psis = TRUE,
+                                               top_n = 5L) {
+  stopifnot(inherits(factor_set, "population_factor_set"))
+  model <- factor_set$population_model
+  theta_center <- .as_hyper_matrix(theta_center, hyper_names = model$hyper_names, hyper_dim = model$hyper_dim)
+  if (nrow(theta_center) != 1L) {
+    stop("theta_center must contain a single theta row.")
+  }
+  if (!(log_sigma2_name %in% colnames(theta_center))) {
+    stop("log_sigma2_name is not a column in theta_center.")
+  }
+
+  summary_rows <- vector("list", length(sv_grid))
+  worst_rows <- vector("list", length(sv_grid))
+
+  for (idx in seq_along(sv_grid)) {
+    theta <- theta_center
+    theta[1L, log_sigma2_name] <- as.numeric(sv_grid[idx])
+    local_diag <- population_factor_set_local_tail_diagnostics(
+      factor_set = factor_set,
+      theta = theta,
+      use_psis = use_psis
+    )
+    finite_k <- local_diag$pareto_k[is.finite(local_diag$pareto_k)]
+    summary_rows[[idx]] <- data.frame(
+      log_sigma2_sv = as.numeric(sv_grid[idx]),
+      sigma2_sv = exp(as.numeric(sv_grid[idx])),
+      min_ess = min(local_diag$ess, na.rm = TRUE),
+      q10_ess = as.numeric(stats::quantile(local_diag$ess, probs = 0.10, na.rm = TRUE, names = FALSE)),
+      mean_ess = mean(local_diag$ess, na.rm = TRUE),
+      max_pareto_k = if (length(finite_k)) max(finite_k) else NA_real_,
+      q90_pareto_k = if (length(finite_k)) as.numeric(stats::quantile(finite_k, probs = 0.90, na.rm = TRUE, names = FALSE)) else NA_real_,
+      n_k_gt_0_7 = sum(local_diag$pareto_k > 0.7, na.rm = TRUE),
+      n_k_gt_1_0 = sum(local_diag$pareto_k > 1.0, na.rm = TRUE),
+      stringsAsFactors = FALSE
+    )
+    sort_key <- ifelse(is.finite(local_diag$pareto_k), -local_diag$pareto_k, Inf)
+    ord <- order(sort_key, local_diag$ess)
+    worst <- local_diag[ord, , drop = FALSE]
+    worst <- utils::head(worst, as.integer(max(1L, top_n)))
+    worst$log_sigma2_sv <- as.numeric(sv_grid[idx])
+    worst$sigma2_sv <- exp(as.numeric(sv_grid[idx]))
+    worst_rows[[idx]] <- worst
+  }
+
+  list(
+    summary = do.call(rbind, summary_rows),
+    worst = do.call(rbind, worst_rows)
   )
 }
 
