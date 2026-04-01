@@ -192,6 +192,63 @@ append_factor_diag_summary <- function(row, diag, prefix = "") {
   row
 }
 
+log_site_block_diagnostics <- function(diag, label) {
+  cat(label, "\n", sep = "")
+  if (is.null(diag) || !nrow(diag$summary)) {
+    cat("  No difficult blocks detected.\n")
+    return(invisible(NULL))
+  }
+  print(utils::head(diag$summary, 8L))
+  if (nrow(diag$hard_blocks)) {
+    top_block <- diag$hard_blocks[1L, , drop = FALSE]
+    cat("  Top hard block locals:\n")
+    top_local <- diag$block_diagnostics[[top_block$block_id]]$local
+    ord <- order(
+      ifelse(is.finite(top_local$max_pareto_k), -top_local$max_pareto_k, Inf),
+      top_local$min_ess_frac,
+      -top_local$scaled_rmse
+    )
+    print(utils::head(top_local[ord, , drop = FALSE], 5L))
+  }
+}
+
+append_site_block_diag_summary <- function(row, diag, prefix = "") {
+  if (is.null(diag) || !nrow(diag$summary)) {
+    row[[paste0(prefix, "n_detected_blocks")]] <- 0L
+    row[[paste0(prefix, "n_hard_blocks")]] <- 0L
+    row[[paste0(prefix, "top_block_id")]] <- NA_character_
+    row[[paste0(prefix, "top_block_dim")]] <- NA_integer_
+    row[[paste0(prefix, "top_block_total_score")]] <- NA_real_
+    row[[paste0(prefix, "top_block_max_pareto_k")]] <- NA_real_
+    row[[paste0(prefix, "top_block_q10_ess_frac")]] <- NA_real_
+    return(row)
+  }
+  top <- if (nrow(diag$hard_blocks)) diag$hard_blocks[1L, , drop = FALSE] else diag$summary[1L, , drop = FALSE]
+  row[[paste0(prefix, "n_detected_blocks")]] <- nrow(diag$summary)
+  row[[paste0(prefix, "n_hard_blocks")]] <- nrow(diag$hard_blocks)
+  row[[paste0(prefix, "top_block_id")]] <- as.character(top$block_id)
+  row[[paste0(prefix, "top_block_dim")]] <- as.integer(top$dim)
+  row[[paste0(prefix, "top_block_total_score")]] <- as.numeric(top$total_score)
+  row[[paste0(prefix, "top_block_max_pareto_k")]] <- as.numeric(top$max_pareto_k)
+  row[[paste0(prefix, "top_block_q10_ess_frac")]] <- as.numeric(top$q10_ess_frac)
+  row
+}
+
+append_site_refinement_summary <- function(row, refinement) {
+  if (is.null(refinement) || is.null(refinement$summary) || !nrow(refinement$summary)) {
+    row$n_site_surrogates <- 0L
+    row$mean_site_surrogate_abs_delta <- NA_real_
+    row$max_site_surrogate_abs_delta <- NA_real_
+    row$mean_site_surrogate_cv_rmse <- NA_real_
+    return(row)
+  }
+  row$n_site_surrogates <- nrow(refinement$summary)
+  row$mean_site_surrogate_abs_delta <- mean(refinement$summary$mean_abs_delta, na.rm = TRUE)
+  row$max_site_surrogate_abs_delta <- max(refinement$summary$max_abs_delta, na.rm = TRUE)
+  row$mean_site_surrogate_cv_rmse <- mean(refinement$summary$surrogate_cv_rmse, na.rm = TRUE)
+  row
+}
+
 run_with_log <- function(log_file, expr) {
   expr <- substitute(expr)
   con <- file(log_file, open = "wt")
@@ -334,6 +391,9 @@ summarize_result <- function(result_file, config, plot_file, log_file) {
   row$max_abs_posterior_diff <- max(abs(diff_values))
   row <- append_factor_diag_summary(row, res$factor_diagnostics$final %||% NULL)
   row <- append_factor_diag_summary(row, res$factor_diagnostics$pre_refresh %||% NULL, prefix = "pre_refresh_")
+  row <- append_site_block_diag_summary(row, res$site_block_diagnostics %||% NULL)
+  row <- append_site_block_diag_summary(row, res$site_block_diagnostics_pre %||% NULL, prefix = "pre_surrogate_")
+  row <- append_site_refinement_summary(row, res$site_refinement %||% NULL)
   row
 }
 
@@ -364,6 +424,9 @@ outer_max_rounds <- arg_int(cli_args, "outer_max_rounds", 80L)
 base_seed <- arg_int(cli_args, "base_seed", 20260324L)
 broad_scale <- as.numeric(arg_chr(cli_args, "broad_scale", "1"))
 refresh_once <- arg_lgl(cli_args, "refresh_once", TRUE)
+adaptive_surrogate <- arg_lgl(cli_args, "adaptive_surrogate", FALSE)
+surrogate_particles <- arg_int(cli_args, "surrogate_particles", 800L)
+surrogate_max_cases <- arg_int(cli_args, "surrogate_max_cases", 12L)
 
 dir.create(results_dir, showWarnings = FALSE, recursive = TRUE)
 logs_dir <- file.path(results_dir, "logs")
@@ -494,6 +557,7 @@ for (i in seq_len(nrow(configs))) {
       )
 
       factor_set <- build_population_factor_set(stage$local_objects, population_model)
+      site_set <- build_population_site_set(stage$local_objects, population_model)
       pre_refresh_factor_set <- if (!is.null(stage$pre_refresh)) {
         build_population_factor_set(stage$pre_refresh$local_objects, population_model)
       } else {
@@ -514,6 +578,57 @@ for (i in seq_len(nrow(configs))) {
           seed = base_seed,
           verbose = inner_verbose
         )
+      }
+
+      site_block_diagnostics_pre <- detect_population_hard_blocks(
+        site_set = site_set,
+        theta = fit$theta,
+        w = fit$w,
+        max_block_dim = 2L,
+        max_single_blocks = 4L,
+        max_pair_blocks = 4L,
+        use_psis = TRUE
+      )
+
+      site_refinement <- NULL
+      if (adaptive_surrogate) {
+        cat("Running adaptive site surrogate refinement...\n")
+        site_refinement <- refine_population_site_surrogates(
+          data_list = data_list,
+          loglik_fn = loglik_emc2,
+          local_objects = stage$local_objects,
+          local_fits = stage$local_fits,
+          population_model = population_model,
+          outer_fit = fit,
+          hard_block_diagnostics = site_block_diagnostics_pre,
+          broad_reference = stage$broad_reference,
+          max_cases = surrogate_max_cases,
+          anchor_particles = surrogate_particles,
+          n_jobs = mc.cores,
+          local_n_cores = 1L,
+          base_seed = base_seed + 300000L,
+          verbose = inner_verbose,
+          smc_control = list(
+            n_mcmc_moves = 1L,
+            max_rounds = 35L,
+            hist_mix_enable = cfg$hist_mix_enable,
+            gss_enable = FALSE,
+            da_enable = FALSE
+          )
+        )
+        if (!is.null(site_refinement$summary) && nrow(site_refinement$summary)) {
+          site_set <- site_refinement$site_set
+          cat("Running outer population SMC with surrogate-corrected sites...\n")
+          fit <- outer_population_smc(
+            factor_set = site_set,
+            N = outer_particles,
+            n_mcmc_moves = outer_mcmc_moves,
+            max_rounds = outer_max_rounds,
+            n_cores = mc.cores,
+            seed = base_seed + 2L,
+            verbose = inner_verbose
+          )
+        }
       }
 
       workflow_parts <- smc_posteriors(
@@ -559,10 +674,26 @@ for (i in seq_len(nrow(configs))) {
         }
       )
 
+      site_block_diagnostics <- detect_population_hard_blocks(
+        site_set = site_set,
+        theta = fit$theta,
+        w = fit$w,
+        max_block_dim = 2L,
+        max_single_blocks = 4L,
+        max_pair_blocks = 4L,
+        use_psis = TRUE
+      )
+
       log_factor_diagnostics(factor_diagnostics$final, "Final factor diagnostics:")
       if (!is.null(factor_diagnostics$pre_refresh)) {
         log_factor_diagnostics(factor_diagnostics$pre_refresh, "Pre-refresh factor diagnostics:")
       }
+      log_site_block_diagnostics(site_block_diagnostics_pre, "Adaptive site block diagnostics (baseline):")
+      if (!is.null(site_refinement) && !is.null(site_refinement$summary) && nrow(site_refinement$summary)) {
+        cat("Adaptive site surrogate summary:\n")
+        print(site_refinement$summary)
+      }
+      log_site_block_diagnostics(site_block_diagnostics, "Adaptive site block diagnostics (post-surrogate):")
 
       plot_config_posteriors(workflow_draws, emc_draws, label, plot_file)
 
@@ -576,6 +707,9 @@ for (i in seq_len(nrow(configs))) {
           workflow_draws = workflow_draws,
           posterior_summary = posterior_summary,
           factor_diagnostics = factor_diagnostics,
+          site_block_diagnostics_pre = site_block_diagnostics_pre,
+          site_block_diagnostics = site_block_diagnostics,
+          site_refinement = site_refinement,
           settings = list(
             label = label,
             transport_method = cfg$transport_method,
@@ -593,6 +727,9 @@ for (i in seq_len(nrow(configs))) {
             base_seed = base_seed,
             broad_scale = broad_scale,
             refresh_once = refresh_once,
+            adaptive_surrogate = adaptive_surrogate,
+            surrogate_particles = surrogate_particles,
+            surrogate_max_cases = surrogate_max_cases,
             elapsed_sec = elapsed_sec
           ),
           elapsed_sec = elapsed_sec,

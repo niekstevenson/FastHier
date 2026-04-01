@@ -182,6 +182,201 @@ build_population_local_factor <- function(local_object, population_model) {
   )
 }
 
+build_population_local_site <- function(local_object, population_model) {
+  base_factor <- build_population_local_factor(
+    local_object = local_object,
+    population_model = population_model
+  )
+  structure(
+    list(
+      local_id = as.integer(base_factor$local_id),
+      population_model = base_factor$population_model,
+      base_factor = base_factor,
+      corrections = list(),
+      diagnostics = list()
+    ),
+    class = "population_local_site"
+  )
+}
+
+population_local_site_log_marginal_many <- function(site, theta, include_constant = TRUE, block_size = 1024L) {
+  stopifnot(inherits(site, "population_local_site"))
+  out <- population_local_factor_log_marginal_many(
+    factor = site$base_factor,
+    theta = theta,
+    include_constant = include_constant,
+    block_size = block_size
+  )
+  if (!length(site$corrections)) {
+    return(out)
+  }
+
+  theta_mat <- .as_hyper_matrix(
+    theta,
+    hyper_names = site$population_model$hyper_names,
+    hyper_dim = site$population_model$hyper_dim
+  )
+  correction_total <- rep.int(0, nrow(theta_mat))
+  for (correction in site$corrections) {
+    if (is.null(correction$surrogate) || is.null(correction$hyper_names)) {
+      next
+    }
+    block_values <- theta_mat[, correction$hyper_names, drop = FALSE]
+    correction_total <- correction_total + predict_site_block_surrogate(correction$surrogate, block_values)
+  }
+  as.numeric(out + correction_total)
+}
+
+population_local_site_log_marginal <- function(site, theta, include_constant = TRUE) {
+  population_local_site_log_marginal_many(
+    site = site,
+    theta = theta,
+    include_constant = include_constant
+  )[1L]
+}
+
+.fit_ridge_regression <- function(X, y, ridge = 1e-4, penalize_intercept = FALSE) {
+  X <- as.matrix(X)
+  y <- as.numeric(y)
+  pen <- diag(ncol(X))
+  if (!isTRUE(penalize_intercept) && ncol(X) >= 1L) {
+    pen[1L, 1L] <- 0
+  }
+  XtX <- crossprod(X) + as.numeric(ridge) * pen
+  Xty <- crossprod(X, y)
+  tryCatch(
+    as.numeric(solve(XtX, Xty)),
+    error = function(e) as.numeric(qr.solve(XtX, Xty))
+  )
+}
+
+.make_rbf_features <- function(X, centers, scale) {
+  X <- as.matrix(X)
+  centers <- as.matrix(centers)
+  if (!nrow(X) || !nrow(centers)) {
+    return(matrix(0, nrow = nrow(X), ncol = 0L))
+  }
+  d2 <- outer(
+    seq_len(nrow(X)),
+    seq_len(nrow(centers)),
+    Vectorize(function(i, j) sum((X[i, ] - centers[j, ])^2))
+  )
+  exp(-d2 / (2 * scale^2))
+}
+
+predict_site_block_surrogate <- function(surrogate, block_values) {
+  if (is.null(surrogate)) {
+    return(rep.int(0, nrow(as.matrix(block_values))))
+  }
+  block_values <- as.matrix(block_values)
+  centers <- as.numeric(surrogate$centers %||% rep(0, ncol(block_values)))
+  scales <- as.numeric(surrogate$scales %||% rep(1, ncol(block_values)))
+  scales[!is.finite(scales) | scales < 1e-8] <- 1
+  Xs <- sweep(sweep(block_values, 2L, centers, "-"), 2L, scales, "/")
+  colnames(Xs) <- surrogate$hyper_names %||% colnames(block_values)
+  design <- .build_quadratic_design(Xs)
+  if (!is.null(surrogate$rbf_centers_scaled) &&
+      nrow(as.matrix(surrogate$rbf_centers_scaled)) > 0L &&
+      is.finite(surrogate$rbf_scale) &&
+      surrogate$rbf_scale > 0) {
+    design <- cbind(
+      design,
+      .make_rbf_features(Xs, surrogate$rbf_centers_scaled, surrogate$rbf_scale)
+    )
+  }
+  pred <- as.numeric(design %*% surrogate$coef)
+  clip <- as.numeric(surrogate$clip %||% c(-Inf, Inf))
+  pred <- pmin(pmax(pred, clip[1L]), clip[2L])
+  pred
+}
+
+fit_site_block_surrogate <- function(block_values,
+                                     delta,
+                                     family = c("quadratic_rbf", "quadratic"),
+                                     ridge = 1e-4,
+                                     rbf_scale = NULL,
+                                     clip_expand = 0.5,
+                                     compute_cv = TRUE) {
+  family <- match.arg(family)
+  block_values <- as.matrix(block_values)
+  delta <- as.numeric(delta)
+  if (nrow(block_values) != length(delta)) {
+    stop("block_values and delta must have matching lengths.")
+  }
+  if (!nrow(block_values)) {
+    stop("At least one anchor point is required.")
+  }
+  centers <- colMeans(block_values)
+  scales <- apply(block_values, 2L, stats::sd)
+  scales[!is.finite(scales) | scales < 1e-8] <- 1
+  Xs <- sweep(sweep(block_values, 2L, centers, "-"), 2L, scales, "/")
+  colnames(Xs) <- colnames(block_values)
+
+  design <- .build_quadratic_design(Xs)
+  use_rbf <- identical(family, "quadratic_rbf") && nrow(block_values) >= max(6L, ncol(block_values) + 3L)
+  rbf_centers_scaled <- NULL
+  rbf_scale_eff <- NA_real_
+  if (use_rbf) {
+    if (is.null(rbf_scale)) {
+      dmat <- as.matrix(dist(Xs))
+      dvec <- dmat[upper.tri(dmat)]
+      dvec <- dvec[is.finite(dvec) & dvec > 0]
+      rbf_scale_eff <- if (length(dvec)) stats::median(dvec) else 1
+    } else {
+      rbf_scale_eff <- as.numeric(rbf_scale)
+    }
+    rbf_scale_eff <- max(rbf_scale_eff, 0.25)
+    rbf_centers_scaled <- Xs
+    design <- cbind(
+      design,
+      .make_rbf_features(Xs, rbf_centers_scaled, rbf_scale_eff)
+    )
+  }
+
+  coef <- .fit_ridge_regression(design, delta, ridge = ridge, penalize_intercept = FALSE)
+  fitted <- as.numeric(design %*% coef)
+  delta_range <- diff(range(delta))
+  clip_pad <- max(0.1, as.numeric(clip_expand)) * max(delta_range, 0.05)
+  clip <- c(min(delta) - clip_pad, max(delta) + clip_pad)
+
+  cv_rmse <- NA_real_
+  if (isTRUE(compute_cv) && nrow(block_values) >= 4L) {
+    preds <- numeric(nrow(block_values))
+    for (i in seq_len(nrow(block_values))) {
+      fit_i <- fit_site_block_surrogate(
+        block_values = block_values[-i, , drop = FALSE],
+        delta = delta[-i],
+        family = if (use_rbf) "quadratic_rbf" else "quadratic",
+        ridge = ridge,
+        rbf_scale = if (use_rbf) rbf_scale_eff else NULL,
+        clip_expand = clip_expand,
+        compute_cv = FALSE
+      )
+      preds[i] <- predict_site_block_surrogate(fit_i, block_values[i, , drop = FALSE])[1L]
+    }
+    cv_rmse <- sqrt(mean((delta - preds)^2))
+  }
+
+  structure(
+    list(
+      family = if (use_rbf) "quadratic_rbf" else "quadratic",
+      hyper_names = colnames(block_values),
+      centers = centers,
+      scales = scales,
+      coef = coef,
+      rbf_centers_scaled = rbf_centers_scaled,
+      rbf_scale = rbf_scale_eff,
+      clip = clip,
+      diagnostics = list(
+        rmse = sqrt(mean((delta - fitted)^2)),
+        cv_rmse = cv_rmse,
+        n_anchors = nrow(block_values)
+      )
+    ),
+    class = "site_block_surrogate"
+  )
+}
+
 .pack_alpha_quadratic_terms_t <- function(alpha) {
   alpha <- as.matrix(alpha)
   d <- ncol(alpha)
@@ -361,6 +556,484 @@ population_local_factor_tail_diagnostic <- function(factor, theta, use_psis = TR
   )
 }
 
+.weighted_mean_vec <- function(x, w) {
+  w <- normalize_reference_local_weights(w)
+  as.numeric(sum(as.numeric(x) * w))
+}
+
+.weighted_quantile_outer <- function(x, w, probs) {
+  x <- as.numeric(x)
+  w <- normalize_reference_local_weights(w)
+  ord <- order(x)
+  x_ord <- x[ord]
+  w_ord <- w[ord]
+  cw <- cumsum(w_ord)
+  as.numeric(stats::approx(cw, x_ord, xout = probs, rule = 2)$y)
+}
+
+.weighted_marginal_geometry <- function(x, w) {
+  mu <- .weighted_mean_vec(x, w)
+  xc <- as.numeric(x) - mu
+  var_x <- .weighted_mean_vec(xc * xc, w)
+  sd_x <- sqrt(max(var_x, 1e-12))
+  z <- xc / sd_x
+  skew <- .weighted_mean_vec(z^3, w)
+  kurt_excess <- .weighted_mean_vec(z^4, w) - 3
+  qq <- .weighted_quantile_outer(x, w, probs = c(0.05, 0.25, 0.50, 0.75, 0.95))
+  left_tail <- max(qq[3L] - qq[1L], 1e-8)
+  right_tail <- max(qq[5L] - qq[3L], 1e-8)
+  left_core <- max(qq[3L] - qq[2L], 1e-8)
+  right_core <- max(qq[4L] - qq[3L], 1e-8)
+  tail_asymmetry <- abs(log(right_tail / left_tail))
+  core_asymmetry <- abs(log(right_core / left_core))
+  score <- abs(skew) + 0.35 * abs(kurt_excess) + 0.50 * tail_asymmetry + 0.25 * core_asymmetry
+  list(
+    mean = mu,
+    sd = sd_x,
+    skew = skew,
+    kurt_excess = kurt_excess,
+    tail_asymmetry = tail_asymmetry,
+    core_asymmetry = core_asymmetry,
+    score = score
+  )
+}
+
+.make_hyper_block_id <- function(hyper_names) {
+  paste(as.character(hyper_names), collapse = "__")
+}
+
+.build_quadratic_design <- function(X) {
+  X <- as.matrix(X)
+  d <- ncol(X)
+  cols <- list("(Intercept)" = rep.int(1, nrow(X)))
+  for (j in seq_len(d)) {
+    cols[[colnames(X)[j] %||% paste0("x", j)]] <- X[, j]
+  }
+  for (j in seq_len(d)) {
+    nm <- paste0(colnames(X)[j] %||% paste0("x", j), "^2")
+    cols[[nm]] <- X[, j]^2
+  }
+  if (d > 1L) {
+    for (j in seq_len(d - 1L)) {
+      for (k in (j + 1L):d) {
+        nm <- paste0(colnames(X)[j] %||% paste0("x", j), ":", colnames(X)[k] %||% paste0("x", k))
+        cols[[nm]] <- X[, j] * X[, k]
+      }
+    }
+  }
+  out <- as.matrix(as.data.frame(cols, check.names = FALSE))
+  storage.mode(out) <- "double"
+  out
+}
+
+.fit_quadratic_shape <- function(block_values, log_values) {
+  block_values <- as.matrix(block_values)
+  log_values <- as.numeric(log_values)
+  if (!length(log_values) || !any(is.finite(log_values))) {
+    return(list(scaled_rmse = NA_real_, rank = 0L))
+  }
+  centers <- colMeans(block_values)
+  scales <- apply(block_values, 2L, stats::sd)
+  scales[!is.finite(scales) | scales < 1e-8] <- 1
+  Xs <- sweep(sweep(block_values, 2L, centers, "-"), 2L, scales, "/")
+  colnames(Xs) <- colnames(block_values)
+  design <- .build_quadratic_design(Xs)
+  if (nrow(design) < ncol(design)) {
+    return(list(scaled_rmse = NA_real_, rank = qr(design)$rank))
+  }
+  coef <- tryCatch(qr.solve(design, log_values), error = function(e) NULL)
+  if (is.null(coef)) {
+    return(list(scaled_rmse = NA_real_, rank = qr(design)$rank))
+  }
+  fitted <- as.numeric(design %*% coef)
+  value_range <- diff(range(log_values))
+  scaled_rmse <- sqrt(mean((log_values - fitted)^2)) / max(value_range, 1e-8)
+  list(
+    scaled_rmse = as.numeric(scaled_rmse),
+    rank = qr(design)$rank
+  )
+}
+
+.build_block_grid <- function(theta,
+                              w,
+                              theta_center,
+                              block,
+                              probs_1d = c(0.05, 0.20, 0.50, 0.80, 0.95),
+                              probs_2d = c(0.10, 0.50, 0.90)) {
+  theta <- as.matrix(theta)
+  theta_center <- .as_hyper_matrix(
+    theta_center,
+    hyper_names = colnames(theta),
+    hyper_dim = ncol(theta)
+  )
+  idx <- as.integer(block$indices)
+  dim_block <- length(idx)
+  if (dim_block < 1L || dim_block > 2L) {
+    stop("Only 1D and 2D blocks are supported in phase 1.")
+  }
+
+  if (dim_block == 1L) {
+    vals <- unique(.weighted_quantile_outer(theta[, idx], w, probs = probs_1d))
+    block_values <- matrix(vals, ncol = 1L)
+    colnames(block_values) <- block$hyper_names
+    theta_grid <- matrix(rep(theta_center, each = nrow(block_values)), nrow = nrow(block_values), byrow = FALSE)
+    colnames(theta_grid) <- colnames(theta)
+    theta_grid[, idx] <- vals
+    is_boundary <- seq_len(nrow(block_values)) %in% c(1L, nrow(block_values))
+  } else {
+    vals_list <- lapply(idx, function(j) unique(.weighted_quantile_outer(theta[, j], w, probs = probs_2d)))
+    names(vals_list) <- block$hyper_names
+    grid_df <- expand.grid(vals_list, KEEP.OUT.ATTRS = FALSE, stringsAsFactors = FALSE)
+    block_values <- as.matrix(grid_df)
+    colnames(block_values) <- block$hyper_names
+    theta_grid <- matrix(rep(theta_center, each = nrow(block_values)), nrow = nrow(block_values), byrow = FALSE)
+    colnames(theta_grid) <- colnames(theta)
+    theta_grid[, idx] <- block_values
+    is_boundary <- rep(FALSE, nrow(block_values))
+    for (j in seq_len(ncol(block_values))) {
+      is_boundary <- is_boundary |
+        block_values[, j] %in% range(block_values[, j], finite = TRUE)
+    }
+  }
+
+  list(
+    theta = theta_grid,
+    block_values = block_values,
+    is_boundary = is_boundary
+  )
+}
+
+discover_population_hard_blocks <- function(theta,
+                                            w,
+                                            population_model = NULL,
+                                            max_block_dim = 2L,
+                                            max_single_blocks = 4L,
+                                            max_pair_blocks = 4L,
+                                            single_score_threshold = 0.15,
+                                            pair_score_threshold = 0.25,
+                                            min_abs_corr = 0.10) {
+  theta <- as.matrix(theta)
+  hyper_names <- colnames(theta)
+  if (is.null(hyper_names) && !is.null(population_model)) {
+    hyper_names <- population_model$hyper_names
+    colnames(theta) <- hyper_names
+  }
+  if (is.null(hyper_names)) {
+    hyper_names <- paste0("theta_", seq_len(ncol(theta)))
+    colnames(theta) <- hyper_names
+  }
+  w <- normalize_reference_local_weights(w)
+  max_block_dim <- as.integer(max(1L, max_block_dim))
+
+  singles <- do.call(
+    rbind,
+    lapply(seq_len(ncol(theta)), function(j) {
+      geom <- .weighted_marginal_geometry(theta[, j], w)
+      data.frame(
+        block_id = .make_hyper_block_id(hyper_names[j]),
+        dim = 1L,
+        hyper_names = hyper_names[j],
+        indices = j,
+        geometry_score = as.numeric(geom$score),
+        abs_corr = NA_real_,
+        skew = as.numeric(geom$skew),
+        kurt_excess = as.numeric(geom$kurt_excess),
+        tail_asymmetry = as.numeric(geom$tail_asymmetry),
+        core_asymmetry = as.numeric(geom$core_asymmetry),
+        stringsAsFactors = FALSE
+      )
+    })
+  )
+  singles <- singles[order(-singles$geometry_score, singles$hyper_names), , drop = FALSE]
+  keep_single <- singles$geometry_score >= single_score_threshold
+  if (sum(keep_single) > max_single_blocks) {
+    keep_single <- seq_len(nrow(singles)) %in% head(which(keep_single), max_single_blocks)
+  }
+  singles_selected <- singles[keep_single, , drop = FALSE]
+
+  pairs_selected <- singles[FALSE, , drop = FALSE]
+  if (max_block_dim >= 2L && ncol(theta) >= 2L && max_pair_blocks > 0L) {
+    S <- tryCatch(weighted_cov(theta, w), error = function(e) NULL)
+    if (!is.null(S)) {
+      denom <- sqrt(pmax(diag(S), 1e-12))
+      corr <- S / tcrossprod(denom)
+      corr[!is.finite(corr)] <- 0
+      single_scores <- singles$geometry_score
+      names(single_scores) <- singles$hyper_names
+      pair_rows <- lapply(utils::combn(seq_len(ncol(theta)), 2L, simplify = FALSE), function(idx) {
+        h1 <- hyper_names[idx[1L]]
+        h2 <- hyper_names[idx[2L]]
+        abs_corr <- abs(corr[idx[1L], idx[2L]])
+        pair_score <- abs_corr * (1 + 0.5 * (single_scores[h1] + single_scores[h2]))
+        data.frame(
+          block_id = .make_hyper_block_id(c(h1, h2)),
+          dim = 2L,
+          hyper_names = paste(c(h1, h2), collapse = ","),
+          indices = paste(idx, collapse = ","),
+          geometry_score = as.numeric(pair_score),
+          abs_corr = as.numeric(abs_corr),
+          skew = NA_real_,
+          kurt_excess = NA_real_,
+          tail_asymmetry = NA_real_,
+          core_asymmetry = NA_real_,
+          stringsAsFactors = FALSE
+        )
+      })
+      pairs <- do.call(rbind, pair_rows)
+      if (nrow(pairs)) {
+        pairs <- pairs[order(-pairs$geometry_score, -pairs$abs_corr, pairs$hyper_names), , drop = FALSE]
+        keep_pair <- pairs$geometry_score >= pair_score_threshold & pairs$abs_corr >= min_abs_corr
+        if (sum(keep_pair) > max_pair_blocks) {
+          keep_pair <- seq_len(nrow(pairs)) %in% head(which(keep_pair), max_pair_blocks)
+        }
+        pairs_selected <- pairs[keep_pair, , drop = FALSE]
+      }
+    }
+  }
+
+  selected <- rbind(singles_selected, pairs_selected)
+  if (!nrow(selected)) {
+    return(list(summary = selected, blocks = list()))
+  }
+
+  blocks <- lapply(seq_len(nrow(selected)), function(i) {
+    idx <- if (selected$dim[i] == 1L) {
+      as.integer(selected$indices[i])
+    } else {
+      as.integer(strsplit(selected$indices[i], ",", fixed = TRUE)[[1L]])
+    }
+    list(
+      id = selected$block_id[i],
+      dim = as.integer(selected$dim[i]),
+      indices = idx,
+      hyper_names = hyper_names[idx],
+      geometry_score = as.numeric(selected$geometry_score[i]),
+      abs_corr = as.numeric(selected$abs_corr[i])
+    )
+  })
+  names(blocks) <- selected$block_id
+  list(summary = selected, blocks = blocks)
+}
+
+population_local_site_block_diagnostic <- function(site,
+                                                   theta,
+                                                   w,
+                                                   block,
+                                                   theta_center = NULL,
+                                                   probs_1d = c(0.05, 0.20, 0.50, 0.80, 0.95),
+                                                   probs_2d = c(0.10, 0.50, 0.90),
+                                                   use_psis = TRUE) {
+  stopifnot(inherits(site, "population_local_site"))
+  theta <- .as_hyper_matrix(
+    theta,
+    hyper_names = site$population_model$hyper_names,
+    hyper_dim = site$population_model$hyper_dim
+  )
+  w <- normalize_reference_local_weights(w)
+  theta_center <- theta_center %||% matrix(colSums(theta * w), nrow = 1L)
+  colnames(theta_center) <- colnames(theta)
+
+  grid <- .build_block_grid(
+    theta = theta,
+    w = w,
+    theta_center = theta_center,
+    block = block,
+    probs_1d = probs_1d,
+    probs_2d = probs_2d
+  )
+  log_vals <- population_local_site_log_marginal_many(site, grid$theta, include_constant = TRUE)
+  tail_diag <- lapply(seq_len(nrow(grid$theta)), function(i) {
+    population_local_factor_tail_diagnostic(
+      factor = site$base_factor,
+      theta = grid$theta[i, , drop = FALSE],
+      use_psis = use_psis
+    )
+  })
+  ess <- vapply(tail_diag, `[[`, numeric(1), "ess")
+  pareto_k <- vapply(tail_diag, `[[`, numeric(1), "pareto_k")
+  shape <- .fit_quadratic_shape(grid$block_values, log_vals)
+  n_particles <- max(1L, nrow(site$base_factor$particles))
+  mode_idx <- which.max(log_vals)
+
+  data.frame(
+    local_id = as.integer(site$local_id),
+    block_id = as.character(block$id),
+    dim = as.integer(block$dim),
+    hyper_names = paste(block$hyper_names, collapse = ","),
+    min_ess = min(ess, na.rm = TRUE),
+    min_ess_frac = min(ess, na.rm = TRUE) / n_particles,
+    max_pareto_k = if (any(is.finite(pareto_k))) max(pareto_k, na.rm = TRUE) else NA_real_,
+    scaled_rmse = as.numeric(shape$scaled_rmse),
+    boundary_mode = isTRUE(grid$is_boundary[mode_idx]),
+    grid_n = nrow(grid$theta),
+    stringsAsFactors = FALSE
+  )
+}
+
+summarize_population_site_block_diagnostics <- function(local_diag) {
+  finite_k <- local_diag$max_pareto_k[is.finite(local_diag$max_pareto_k)]
+  finite_rmse <- local_diag$scaled_rmse[is.finite(local_diag$scaled_rmse)]
+  data.frame(
+    min_ess_frac = min(local_diag$min_ess_frac, na.rm = TRUE),
+    q10_ess_frac = as.numeric(stats::quantile(local_diag$min_ess_frac, probs = 0.10, na.rm = TRUE, names = FALSE)),
+    mean_ess_frac = mean(local_diag$min_ess_frac, na.rm = TRUE),
+    max_pareto_k = if (length(finite_k)) max(finite_k) else NA_real_,
+    q90_pareto_k = if (length(finite_k)) as.numeric(stats::quantile(finite_k, probs = 0.90, na.rm = TRUE, names = FALSE)) else NA_real_,
+    boundary_rate = mean(local_diag$boundary_mode, na.rm = TRUE),
+    mean_scaled_rmse = if (length(finite_rmse)) mean(finite_rmse) else NA_real_,
+    q90_scaled_rmse = if (length(finite_rmse)) as.numeric(stats::quantile(finite_rmse, probs = 0.90, na.rm = TRUE, names = FALSE)) else NA_real_,
+    stringsAsFactors = FALSE
+  )
+}
+
+detect_population_hard_blocks <- function(site_set,
+                                          theta,
+                                          w,
+                                          theta_center = NULL,
+                                          max_block_dim = 2L,
+                                          max_single_blocks = 4L,
+                                          max_pair_blocks = 4L,
+                                          single_score_threshold = 0.15,
+                                          pair_score_threshold = 0.25,
+                                          min_abs_corr = 0.10,
+                                          probs_1d = c(0.05, 0.20, 0.50, 0.80, 0.95),
+                                          probs_2d = c(0.10, 0.50, 0.90),
+                                          use_psis = TRUE,
+                                          pareto_k_threshold = 0.70,
+                                          ess_frac_threshold = 0.05,
+                                          rmse_threshold = 0.15,
+                                          boundary_threshold = 0.25) {
+  stopifnot(inherits(site_set, "population_site_set"))
+  theta <- .as_hyper_matrix(
+    theta,
+    hyper_names = site_set$population_model$hyper_names,
+    hyper_dim = site_set$population_model$hyper_dim
+  )
+  w <- normalize_reference_local_weights(w)
+  theta_center <- theta_center %||% matrix(colSums(theta * w), nrow = 1L)
+  colnames(theta_center) <- colnames(theta)
+
+  discovered <- discover_population_hard_blocks(
+    theta = theta,
+    w = w,
+    population_model = site_set$population_model,
+    max_block_dim = max_block_dim,
+    max_single_blocks = max_single_blocks,
+    max_pair_blocks = max_pair_blocks,
+    single_score_threshold = single_score_threshold,
+    pair_score_threshold = pair_score_threshold,
+    min_abs_corr = min_abs_corr
+  )
+  if (!length(discovered$blocks)) {
+    return(list(
+      theta_center = theta_center,
+      candidates = discovered$summary,
+      block_diagnostics = list(),
+      summary = data.frame(),
+      hard_blocks = data.frame()
+    ))
+  }
+
+  block_diagnostics <- lapply(discovered$blocks, function(block) {
+    local_diag <- do.call(
+      rbind,
+      lapply(
+        site_set$sites,
+        population_local_site_block_diagnostic,
+        theta = theta,
+        w = w,
+        block = block,
+        theta_center = theta_center,
+        probs_1d = probs_1d,
+        probs_2d = probs_2d,
+        use_psis = use_psis
+      )
+    )
+    list(
+      block = block,
+      local = local_diag,
+      summary = summarize_population_site_block_diagnostics(local_diag)
+    )
+  })
+  names(block_diagnostics) <- names(discovered$blocks)
+
+  summary_rows <- lapply(names(block_diagnostics), function(block_id) {
+    diag_block <- block_diagnostics[[block_id]]
+    geom_row <- discovered$summary[discovered$summary$block_id == block_id, , drop = FALSE]
+    summ <- diag_block$summary
+    site_score <- max(0, as.numeric(summ$max_pareto_k) - 0.5) +
+      4 * max(0, ess_frac_threshold - as.numeric(summ$q10_ess_frac)) +
+      2 * max(0, as.numeric(summ$q90_scaled_rmse) - 0.10) +
+      max(0, as.numeric(summ$boundary_rate) - 0.10)
+    hard <- (is.finite(summ$max_pareto_k) && summ$max_pareto_k > pareto_k_threshold) ||
+      (is.finite(summ$q10_ess_frac) && summ$q10_ess_frac < ess_frac_threshold) ||
+      (is.finite(summ$q90_scaled_rmse) && summ$q90_scaled_rmse > rmse_threshold) ||
+      (
+        is.finite(summ$boundary_rate) &&
+          summ$boundary_rate > boundary_threshold &&
+          (
+            as.numeric(geom_row$geometry_score[1L]) > 0.5 ||
+              (is.finite(summ$max_pareto_k) && summ$max_pareto_k > 0.7) ||
+              (is.finite(summ$q10_ess_frac) && summ$q10_ess_frac < 0.10)
+          )
+      )
+    data.frame(
+      block_id = block_id,
+      dim = as.integer(diag_block$block$dim),
+      hyper_names = paste(diag_block$block$hyper_names, collapse = ","),
+      geometry_score = as.numeric(geom_row$geometry_score[1L]),
+      abs_corr = as.numeric(geom_row$abs_corr[1L]),
+      min_ess_frac = as.numeric(summ$min_ess_frac),
+      q10_ess_frac = as.numeric(summ$q10_ess_frac),
+      mean_ess_frac = as.numeric(summ$mean_ess_frac),
+      max_pareto_k = as.numeric(summ$max_pareto_k),
+      q90_pareto_k = as.numeric(summ$q90_pareto_k),
+      boundary_rate = as.numeric(summ$boundary_rate),
+      mean_scaled_rmse = as.numeric(summ$mean_scaled_rmse),
+      q90_scaled_rmse = as.numeric(summ$q90_scaled_rmse),
+      site_score = as.numeric(site_score),
+      total_score = as.numeric(geom_row$geometry_score[1L] + site_score),
+      hard = isTRUE(hard),
+      stringsAsFactors = FALSE
+    )
+  })
+  summary_df <- do.call(rbind, summary_rows)
+  summary_df <- summary_df[order(-summary_df$total_score, -summary_df$geometry_score), , drop = FALSE]
+
+  list(
+    theta_center = theta_center,
+    candidates = discovered$summary,
+    block_diagnostics = block_diagnostics,
+    summary = summary_df,
+    hard_blocks = summary_df[summary_df$hard, , drop = FALSE]
+  )
+}
+
+print_population_hard_blocks <- function(block_diag, title = "Detected hard hyper-blocks:") {
+  cat(title, "\n", sep = "")
+  if (is.null(block_diag) || !nrow(block_diag$summary)) {
+    cat("  No hard candidate blocks were detected.\n")
+    return(invisible(NULL))
+  }
+  print(
+    utils::head(
+      block_diag$summary[, c(
+        "block_id",
+        "dim",
+        "geometry_score",
+        "max_pareto_k",
+        "q10_ess_frac",
+        "boundary_rate",
+        "q90_scaled_rmse",
+        "total_score",
+        "hard"
+      ), drop = FALSE],
+      8L
+    )
+  )
+  invisible(NULL)
+}
+
 population_factor_set_local_tail_diagnostics <- function(factor_set, theta, use_psis = TRUE) {
   stopifnot(inherits(factor_set, "population_factor_set"))
   model <- factor_set$population_model
@@ -488,6 +1161,75 @@ build_population_factor_set <- function(local_objects,
   )
 }
 
+build_population_site_set <- function(local_objects,
+                                      population_model,
+                                      particle_block_size = 1024L) {
+  population_model <- normalize_population_model(population_model)
+  sites <- lapply(local_objects, build_population_local_site, population_model = population_model)
+  names(sites) <- names(local_objects)
+  base_factor_set <- build_population_factor_set(
+    local_objects = local_objects,
+    population_model = population_model,
+    particle_block_size = particle_block_size
+  )
+  structure(
+    list(
+      population_model = population_model,
+      sites = sites,
+      n_locals = length(sites),
+      base_factor_set = base_factor_set,
+      log_constant = base_factor_set$log_constant,
+      n_corrections = 0L
+    ),
+    class = "population_site_set"
+  )
+}
+
+population_site_set_add_correction <- function(site_set, local_key, correction) {
+  stopifnot(inherits(site_set, "population_site_set"))
+  local_key_chr <- as.character(local_key)
+  site_idx <- match(local_key_chr, names(site_set$sites))
+  if (is.na(site_idx)) {
+    site_idx <- match(as.integer(local_key), vapply(site_set$sites, `[[`, integer(1), "local_id"))
+  }
+  if (is.na(site_idx)) {
+    stop("Could not find local site for key: ", local_key_chr)
+  }
+  block_id <- as.character(correction$block_id %||% .make_hyper_block_id(correction$hyper_names))
+  site_set$sites[[site_idx]]$corrections[[block_id]] <- correction
+  site_set$n_corrections <- sum(vapply(site_set$sites, function(site) length(site$corrections), integer(1)))
+  site_set
+}
+
+.evaluate_site_set <- function(site_set, theta, include_constant = FALSE, n_cores = 1L) {
+  stopifnot(inherits(site_set, "population_site_set"))
+  base <- population_factor_set_loglik(
+    factor_set = site_set$base_factor_set,
+    theta = theta,
+    include_constant = include_constant,
+    n_cores = n_cores
+  )
+  if (!length(site_set$sites) || !site_set$n_corrections) {
+    return(base)
+  }
+  theta_mat <- .as_hyper_matrix(
+    theta,
+    hyper_names = site_set$population_model$hyper_names,
+    hyper_dim = site_set$population_model$hyper_dim
+  )
+  corr_total <- rep.int(0, nrow(theta_mat))
+  for (site in site_set$sites) {
+    if (!length(site$corrections)) next
+    for (correction in site$corrections) {
+      corr_total <- corr_total + predict_site_block_surrogate(
+        surrogate = correction$surrogate,
+        block_values = theta_mat[, correction$hyper_names, drop = FALSE]
+      )
+    }
+  }
+  as.numeric(base + corr_total)
+}
+
 .evaluate_factor_set_stacked <- function(factor_set, theta, include_constant = FALSE) {
   stopifnot(inherits(factor_set, "population_factor_set"))
   model <- factor_set$population_model
@@ -522,7 +1264,15 @@ build_population_factor_set <- function(local_objects,
 }
 
 population_factor_set_loglik <- function(factor_set, theta, include_constant = FALSE, n_cores = 1L) {
-  stopifnot(inherits(factor_set, "population_factor_set"))
+  stopifnot(inherits(factor_set, "population_factor_set") || inherits(factor_set, "population_site_set"))
+  if (inherits(factor_set, "population_site_set")) {
+    return(.evaluate_site_set(
+      site_set = factor_set,
+      theta = theta,
+      include_constant = include_constant,
+      n_cores = n_cores
+    ))
+  }
   model <- factor_set$population_model
   theta <- .as_hyper_matrix(theta, hyper_names = model$hyper_names, hyper_dim = model$hyper_dim)
   if (!length(factor_set$factors)) {
@@ -562,7 +1312,7 @@ population_factor_set_local_ess <- function(factor_set, theta) {
 }
 
 population_factor_set_logposterior <- function(factor_set, theta, include_constant = TRUE, n_cores = 1L) {
-  stopifnot(inherits(factor_set, "population_factor_set"))
+  stopifnot(inherits(factor_set, "population_factor_set") || inherits(factor_set, "population_site_set"))
   model <- factor_set$population_model
   theta <- .as_hyper_matrix(theta, hyper_names = model$hyper_names, hyper_dim = model$hyper_dim)
   population_model_log_hyperprior(model, theta) +
@@ -781,7 +1531,7 @@ outer_population_smc <- function(factor_set,
                                  n_cores = 1L,
                                  seed = 123L,
                                  verbose = TRUE) {
-  stopifnot(inherits(factor_set, "population_factor_set"))
+  stopifnot(inherits(factor_set, "population_factor_set") || inherits(factor_set, "population_site_set"))
   model <- factor_set$population_model
   vcat <- function(...) if (isTRUE(verbose)) base::cat(...)
 
