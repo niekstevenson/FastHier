@@ -37,66 +37,13 @@ arg_lgl <- function(args, key, default = FALSE) {
   tolower(as.character(val)) %in% c("1", "true", "t", "yes", "y")
 }
 
-config_label_default <- function(refined_method, transport_method, gss_enable, da_enable) {
-  refined_tag <- if (identical(refined_method, "defensive_mixture")) "defmix" else "broad"
-  transport_tag <- if (identical(transport_method, "gaussian_copula")) "gcop" else "tri"
-  mode_tag <- if (gss_enable && da_enable) {
-    "gss_da"
-  } else if (gss_enable) {
-    "gss"
-  } else if (da_enable) {
-    "da"
-  } else {
-    "base"
-  }
-  paste(refined_tag, transport_tag, mode_tag, sep = "_")
-}
-
-build_config_grid <- function(config_set = "full") {
-  config_set <- match.arg(config_set, c("full", "core", "gss"))
-  refined_methods <- c("defensive_mixture", "broadened_gaussian")
-  transport_methods <- c("gaussian_copula", "sparse_triangular")
-
-  configs <- switch(
-    config_set,
-    full = expand.grid(
-      refined_method = refined_methods,
-      transport_method = transport_methods,
-      gss_enable = c(FALSE, TRUE),
-      da_enable = c(FALSE, TRUE),
-      stringsAsFactors = FALSE
-    ),
-    core = expand.grid(
-      refined_method = refined_methods,
-      transport_method = transport_methods,
-      gss_enable = FALSE,
-      da_enable = FALSE,
-      stringsAsFactors = FALSE
-    ),
-    gss = expand.grid(
-      refined_method = refined_methods,
-      transport_method = transport_methods,
-      gss_enable = c(FALSE, TRUE),
-      da_enable = c(FALSE, TRUE),
-      stringsAsFactors = FALSE
-    )
+build_config_grid <- function(config_set = "core") {
+  config_set <- match.arg(config_set, c("core"))
+  data.frame(
+    method = c("static", "refresh_dmis"),
+    label = c("static", "refresh_dmis"),
+    stringsAsFactors = FALSE
   )
-
-  configs$hist_mix_enable <- configs$gss_enable | configs$da_enable
-  configs$label <- mapply(
-    config_label_default,
-    configs$refined_method,
-    configs$transport_method,
-    configs$gss_enable,
-    configs$da_enable,
-    USE.NAMES = FALSE
-  )
-
-  if (identical(config_set, "gss")) {
-    configs <- configs[configs$gss_enable | configs$da_enable, , drop = FALSE]
-  }
-
-  configs[order(configs$label), , drop = FALSE]
 }
 
 draw_quantiles <- function(x, probs = c(0.1, 0.5, 0.9)) {
@@ -111,11 +58,7 @@ summarize_result <- function(result_file, config, plot_file, log_file) {
 
   row <- data.frame(
     label = config$label,
-    refined_method = config$refined_method,
-    transport_method = config$transport_method,
-    hist_mix_enable = config$hist_mix_enable,
-    gss_enable = config$gss_enable,
-    da_enable = config$da_enable,
+    method = config$method,
     results_file = normalizePath(result_file, winslash = "/", mustWork = FALSE),
     plot_file = normalizePath(plot_file, winslash = "/", mustWork = FALSE),
     log_file = normalizePath(log_file, winslash = "/", mustWork = FALSE),
@@ -217,7 +160,7 @@ plot_mu_shift_overlay <- function(result_files, labels, file) {
 }
 
 cli_args <- parse_cli_args(commandArgs(trailingOnly = TRUE))
-config_set <- arg_chr(cli_args, "config_set", "full")
+config_set <- arg_chr(cli_args, "config_set", "core")
 results_dir <- arg_chr(cli_args, "results_dir", file.path("benchmarks", "results", "meta_shifted_gamma"))
 labels_filter <- arg_chr(cli_args, "labels", NULL)
 inner_verbose <- arg_lgl(cli_args, "inner_verbose", FALSE)
@@ -272,11 +215,7 @@ for (i in seq_len(nrow(configs))) {
   args <- c(
     "benchmarks/run_shifted_gamma_hierarchy_compare.R",
     sprintf("--label=%s", label),
-    sprintf("--transport-method=%s", cfg$transport_method),
-    sprintf("--refined-method=%s", cfg$refined_method),
-    sprintf("--hist-mix-enable=%s", tolower(as.character(cfg$hist_mix_enable))),
-    sprintf("--gss-enable=%s", tolower(as.character(cfg$gss_enable))),
-    sprintf("--da-enable=%s", tolower(as.character(cfg$da_enable))),
+    sprintf("--method=%s", cfg$method),
     sprintf("--results-file=%s", result_file),
     sprintf("--plot-file=%s", plot_file),
     sprintf("--verbose=%s", tolower(as.character(inner_verbose))),
@@ -295,11 +234,7 @@ for (i in seq_len(nrow(configs))) {
   } else {
     row <- data.frame(
       label = label,
-      refined_method = cfg$refined_method,
-      transport_method = cfg$transport_method,
-      hist_mix_enable = cfg$hist_mix_enable,
-      gss_enable = cfg$gss_enable,
-      da_enable = cfg$da_enable,
+      method = cfg$method,
       results_file = normalizePath(result_file, winslash = "/", mustWork = FALSE),
       plot_file = normalizePath(plot_file, winslash = "/", mustWork = FALSE),
       log_file = normalizePath(log_file, winslash = "/", mustWork = FALSE),

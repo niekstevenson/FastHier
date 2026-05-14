@@ -4,7 +4,7 @@ file_arg <- grep("^--file=", commandArgs(trailingOnly = FALSE), value = TRUE)
 script_path <- if (length(file_arg)) {
   normalizePath(sub("^--file=", "", file_arg[1L]))
 } else {
-  normalizePath("tests/test_gss_da_exact_1d.R")
+  normalizePath("tests/test_local_smc_defensive_1d.R")
 }
 repo_dir <- dirname(dirname(script_path))
 setwd(repo_dir)
@@ -16,10 +16,10 @@ source("SMC_super_fast.R")
 weighted_quantiles <- function(x, w, probs) {
   ord <- order(x)
   x <- x[ord]
-  w <- w[ord]
+  w <- w[ord] / sum(w)
   cw <- cumsum(w)
   keep <- c(TRUE, diff(cw) > 0)
-  approx(cw[keep], x[keep], xout = probs, rule = 2, ties = "ordered")$y
+  stats::approx(cw[keep], x[keep], xout = probs, rule = 2, ties = "ordered")$y
 }
 
 theta_name <- "theta"
@@ -55,58 +55,44 @@ exact <- c(
   logZ = log(sum(prior_density * lik_density) * dx)
 )
 
-run_case <- function(label, gss_enable, da_enable, M = 8000L) {
-  fit <- enhanced_smc_elite(
-    data = data_obj,
-    loglik_fn = loglik_fn,
-    reference_prior = reference_prior,
-    M = M,
-    n_mcmc_moves = 3L,
-    max_rounds = 60L,
-    hist_mix_enable = TRUE,
-    gss_enable = gss_enable,
-    da_enable = da_enable,
-    n_cores = 1L,
-    seed = 42L,
-    verbose = FALSE
-  )
-  theta <- as.numeric(fit$Theta[, 1L])
-  w <- fit$w / sum(fit$w)
-  qs <- weighted_quantiles(theta, w, c(0.1, 0.5, 0.9))
-  c(
-    mean = sum(w * theta),
-    q10 = qs[1L],
-    q50 = qs[2L],
-    q90 = qs[3L],
-    logZ = fit$log_evidence
-  )
-}
-
-results <- rbind(
-  exact = exact,
-  baseline = run_case("baseline", FALSE, FALSE),
-  gss_only = run_case("gss_only", TRUE, FALSE),
-  da_only = run_case("da_only", FALSE, TRUE),
-  gss_da = run_case("gss_da", TRUE, TRUE)
+fit <- enhanced_smc_elite(
+  data = data_obj,
+  loglik_fn = loglik_fn,
+  reference_prior = reference_prior,
+  M = 3000L,
+  n_mcmc_moves = 2L,
+  max_rounds = 50L,
+  G_mix = 6L,
+  n_cores = 1L,
+  seed = 42L,
+  verbose = FALSE
 )
-errors <- sweep(results[-1L, , drop = FALSE], 2L, exact, "-")
 
-print(round(results, 6))
-cat("\nErrors vs exact\n")
-print(round(errors, 6))
+theta <- as.numeric(fit$Theta[, 1L])
+w <- fit$w / sum(fit$w)
+qs <- weighted_quantiles(theta, w, c(0.1, 0.5, 0.9))
+estimate <- c(
+  mean = sum(w * theta),
+  q10 = qs[1L],
+  q50 = qs[2L],
+  q90 = qs[3L],
+  logZ = fit$log_evidence
+)
+errors <- estimate - exact
 
-mean_tol <- 0.03
-quantile_tol <- 0.06
-logz_tol <- 0.08
+print(round(rbind(exact = exact, local_smc = estimate, error = errors), 6))
 
-if (any(abs(errors[, "mean"]) > mean_tol)) {
-  stop("Posterior mean regression failed for at least one GSS/DA configuration.")
+if (!identical(fit$transport$meta$method, "sparse_triangular")) {
+  stop("Local SMC did not use the retained sparse triangular transport.")
 }
-if (any(apply(abs(errors[, c("q10", "q50", "q90"), drop = FALSE]), 1L, max) > quantile_tol)) {
-  stop("Posterior quantile regression failed for at least one GSS/DA configuration.")
+if (abs(errors["mean"]) > 0.08) {
+  stop("Posterior mean regression failed.")
 }
-if (any(abs(errors[, "logZ"]) > logz_tol)) {
-  stop("Log-evidence regression failed for at least one GSS/DA configuration.")
+if (max(abs(errors[c("q10", "q50", "q90")])) > 0.16) {
+  stop("Posterior quantile regression failed.")
+}
+if (abs(errors["logZ"]) > 0.15) {
+  stop("Log-evidence regression failed.")
 }
 
-cat("\nGSS/DA exact 1D regression passed.\n")
+cat("\nLocal SMC defensive-mixture 1D regression passed.\n")

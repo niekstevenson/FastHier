@@ -53,80 +53,6 @@ if (!exists("%||%", mode = "function")) {
   theta
 }
 
-.pack_gaussian_precision <- function(precision) {
-  precision <- as.array(precision)
-  if (length(dim(precision)) == 2L) {
-    precision <- array(precision, dim = c(nrow(precision), ncol(precision), 1L))
-  }
-  if (length(dim(precision)) != 3L) {
-    stop("precision must be a matrix or a 3D array.")
-  }
-
-  d <- dim(precision)[1L]
-  qdim <- d * (d + 1L) / 2L
-  out <- matrix(0, nrow = dim(precision)[3L], ncol = qdim)
-  pos <- 1L
-  for (j in seq_len(d)) {
-    out[, pos] <- as.numeric(precision[j, j, ])
-    pos <- pos + 1L
-    if (j < d) {
-      for (k in (j + 1L):d) {
-        out[, pos] <- 2 * as.numeric(precision[j, k, ])
-        pos <- pos + 1L
-      }
-    }
-  }
-  out
-}
-
-prepare_gaussian_theta <- function(mean,
-                                   precision,
-                                   logdet_precision,
-                                   alpha_names = colnames(mean)) {
-  mean <- as.matrix(mean)
-  n_theta <- nrow(mean)
-  d <- ncol(mean)
-  precision <- as.array(precision)
-
-  if (length(dim(precision)) == 2L) {
-    precision <- array(precision, dim = c(nrow(precision), ncol(precision), 1L))
-  }
-  if (dim(precision)[1L] != d || dim(precision)[2L] != d) {
-    stop("precision dimensions do not match mean.")
-  }
-  if (dim(precision)[3L] == 1L && n_theta > 1L) {
-    precision <- precision[, , rep.int(1L, n_theta), drop = FALSE]
-  }
-  if (dim(precision)[3L] != n_theta) {
-    stop("precision must provide one matrix per theta row.")
-  }
-
-  logdet_precision <- rep_len(as.numeric(logdet_precision), n_theta)
-  eta <- t(vapply(
-    seq_len(n_theta),
-    function(i) as.numeric(precision[, , i, drop = TRUE] %*% mean[i, ]),
-    numeric(d)
-  ))
-
-  out <- list(
-    family = "gaussian",
-    theta = mean,
-    mean = mean,
-    eta = eta,
-    quadratic_kind = "packed",
-    quadratic_coef = .pack_gaussian_precision(precision),
-    log_kernel_constant = -0.5 * (
-      d * log(2 * pi) -
-        logdet_precision +
-        rowSums(mean * eta)
-    ),
-    alpha_dim = d,
-    alpha_names = alpha_names
-  )
-  colnames(out$eta) <- alpha_names
-  out
-}
-
 prepare_gaussian_theta_diag <- function(mean,
                                         sigma2,
                                         alpha_names = colnames(mean)) {
@@ -268,11 +194,16 @@ population_model_prepare_theta <- function(model, theta) {
 
   if (identical(out$family, "gaussian")) {
     out$eta <- as.matrix(out$eta)
-    out$quadratic_kind <- as.character(out$quadratic_kind %||% "packed")
+    out$quadratic_kind <- as.character(out$quadratic_kind %||% "diag")
+    if (!identical(out$quadratic_kind, "diag")) {
+      stop("Only diagonal Gaussian population models are supported in the fast prepared path.")
+    }
     out$quadratic_coef <- as.matrix(out$quadratic_coef)
     out$log_kernel_constant <- as.numeric(out$log_kernel_constant)
     if (nrow(out$eta) != nrow(theta) ||
         nrow(out$quadratic_coef) != nrow(theta) ||
+        ncol(out$eta) != model$alpha_dim ||
+        ncol(out$quadratic_coef) != model$alpha_dim ||
         length(out$log_kernel_constant) != nrow(theta)) {
       stop("Gaussian prepare_theta() outputs must provide one row per theta row.")
     }

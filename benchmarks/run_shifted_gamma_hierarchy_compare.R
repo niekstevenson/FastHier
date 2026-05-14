@@ -39,19 +39,8 @@ arg_lgl <- function(args, key, default = FALSE) {
   tolower(as.character(val)) %in% c("1", "true", "t", "yes", "y")
 }
 
-config_label_default <- function(refined_method, transport_method, gss_enable, da_enable) {
-  refined_tag <- if (identical(refined_method, "defensive_mixture")) "defmix" else "broad"
-  transport_tag <- if (identical(transport_method, "gaussian_copula")) "gcop" else "tri"
-  mode_tag <- if (gss_enable && da_enable) {
-    "gss_da"
-  } else if (gss_enable) {
-    "gss"
-  } else if (da_enable) {
-    "da"
-  } else {
-    "base"
-  }
-  paste(refined_tag, transport_tag, mode_tag, sep = "_")
+config_label_default <- function(method) {
+  method
 }
 
 suppressPackageStartupMessages({
@@ -62,11 +51,11 @@ set.seed(20260324L)
 
 cli_args <- parse_cli_args(commandArgs(trailingOnly = TRUE))
 
-transport_method <- arg_chr(cli_args, "transport_method", "sparse_triangular")
-refined_method <- arg_chr(cli_args, "refined_method", "defensive_mixture")
-gss_enable <- arg_lgl(cli_args, "gss_enable", FALSE)
-da_enable <- arg_lgl(cli_args, "da_enable", FALSE)
-hist_mix_enable <- arg_lgl(cli_args, "hist_mix_enable", gss_enable || da_enable)
+method <- arg_chr(cli_args, "method", "static")
+if (!(method %in% c("static", "refresh_dmis"))) {
+  stop("method must be 'static' or 'refresh_dmis'.")
+}
+refresh_once <- identical(method, "refresh_dmis")
 run_label <- arg_chr(cli_args, "label", NULL)
 
 stan_results_file <- file.path("benchmarks", "samples", "shifted_gamma_hierarchy_stan_results.rds")
@@ -90,7 +79,7 @@ verbose <- arg_lgl(cli_args, "verbose", TRUE)
 
 if (is.null(run_label)) {
   if (length(commandArgs(trailingOnly = TRUE))) {
-    run_label <- config_label_default(refined_method, transport_method, gss_enable, da_enable)
+    run_label <- config_label_default(method)
   } else {
     run_label <- "current"
   }
@@ -114,9 +103,6 @@ source("smc_core.R")
 source("reference_priors.R")
 source("utilities.R")
 source("SMC_super_fast.R")
-if (identical(transport_method, "gaussian_copula")) {
-  fit_copula_transform <- .fit_gaussian_copula_transform
-}
 source("hierarchical_locals.R")
 source("population_models.R")
 source("outer_population_smc.R")
@@ -191,13 +177,7 @@ stan_draws <- data.frame(
 
 cat(sprintf("Loaded Stan benchmark bundle: %s\n", stan_results_file))
 cat(sprintf("Data: %d subjects x %d trials\n", nrow(y), ncol(y)))
-cat(sprintf("Configuration: label=%s | refined=%s | transport=%s | hist_mix=%s | gss=%s | da=%s\n",
-            run_label,
-            refined_method,
-            transport_method,
-            hist_mix_enable,
-            gss_enable,
-            da_enable))
+cat(sprintf("Configuration: label=%s | method=%s\n", run_label, method))
 cat("Running local-reference stage...\n")
 
 stage <- prepare_reference_local_stage(
@@ -205,38 +185,39 @@ stage <- prepare_reference_local_stage(
   loglik_fn = loglik_shifted_gamma,
   base_mu = base_mu,
   base_Sigma = base_Sigma,
+  population_model = population_model,
   pilot_size = min(pilot_size, length(data_list)),
   broad_scale = 1,
   pilot_particles = pilot_particles,
   full_particles = full_particles,
-  refined_method = refined_method,
   n_jobs = mc.cores,
   base_seed = base_seed,
-  pilot_smc_control = list(
-    max_rounds = 40L,
-    hist_mix_enable = hist_mix_enable,
-    gss_enable = gss_enable,
-    da_enable = da_enable
+  refresh_once = refresh_once,
+  refresh_outer_control = list(
+    N = outer_particles,
+    n_mcmc_moves = outer_mcmc_moves,
+    max_rounds = outer_max_rounds
   ),
-  full_smc_control = list(
-    hist_mix_enable = hist_mix_enable,
-    gss_enable = gss_enable,
-    da_enable = da_enable
+  pilot_smc_control = list(
+    max_rounds = 40L
   )
 )
 
 cat("Running outer population SMC...\n")
 
-factor_set <- build_population_factor_set(stage$local_objects, population_model)
-fit <- outer_population_smc(
-  factor_set = factor_set,
-  N = outer_particles,
-  n_mcmc_moves = outer_mcmc_moves,
-  max_rounds = outer_max_rounds,
-  n_cores = mc.cores,
-  seed = base_seed,
-  verbose = verbose
-)
+fit <- stage$outer_fit
+if (is.null(fit)) {
+  factor_set <- build_population_factor_set(stage$local_objects, population_model)
+  fit <- outer_population_smc(
+    factor_set = factor_set,
+    N = outer_particles,
+    n_mcmc_moves = outer_mcmc_moves,
+    max_rounds = outer_max_rounds,
+    n_cores = mc.cores,
+    seed = base_seed,
+    verbose = verbose
+  )
+}
 
 workflow_theta <- smc_posteriors(
   fit,
@@ -273,11 +254,8 @@ saveRDS(
     workflow_draws = workflow_draws,
     settings = list(
       label = run_label,
-      transport_method = transport_method,
-      refined_method = refined_method,
-      hist_mix_enable = hist_mix_enable,
-      gss_enable = gss_enable,
-      da_enable = da_enable,
+      method = method,
+      refresh_once = refresh_once,
       mc.cores = mc.cores,
       pilot_size = min(pilot_size, length(data_list)),
       pilot_particles = pilot_particles,

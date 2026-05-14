@@ -53,11 +53,20 @@ loglik_emc2 <- function(Theta, data_i) {
   as.numeric(EMC2:::calc_ll_manager(Theta, data_i, model_factory, r_cores = 1L))
 }
 
+population_model <- default_population_model_diag_gaussian(
+  base_mu = base_mu,
+  base_Sigma = base_Sigma,
+  mean_var_scale = 1.0,
+  sigma2_shape = 3.0,
+  sigma2_mean = diag(base_Sigma)
+)
+
 stage <- prepare_reference_local_stage(
   data_list = data_list,
   loglik_fn = loglik_emc2,
   base_mu = base_mu,
   base_Sigma = base_Sigma,
+  population_model = population_model,
   broad_defensive = TRUE,
   n_jobs = mc.cores
 )

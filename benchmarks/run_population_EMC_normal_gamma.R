@@ -76,7 +76,7 @@ if(!file.exists("benchmarks/samples/stage_ELP.RData")){
     base_Sigma = base_Sigma,
     broad_scale = 2,
     n_jobs = n_jobs,
-    pilot_population_model = population_model
+    population_model = population_model
   )
   save(stage, file = "benchmarks/samples/stage_ELP.RData")
 } else{

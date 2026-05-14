@@ -56,6 +56,14 @@ loglik_emc2 <- function(Theta, data_i) {
   as.numeric(EMC2:::calc_ll_manager(Theta, data_i, model_factory, r_cores = 1L))
 }
 
+population_model <- default_population_model_diag_gaussian(
+  base_mu = base_mu,
+  base_Sigma = base_Sigma,
+  mean_var_scale = 1.0,
+  sigma2_shape = 3.0,
+  sigma2_mean = diag(base_Sigma)
+)
+
 load_reference_stage <- function() {
   if (isTRUE(reuse_reference_results) && file.exists(reference_results_file)) {
     obj <- readRDS(reference_results_file)
@@ -67,20 +75,13 @@ load_reference_stage <- function() {
     loglik_fn = loglik_emc2,
     base_mu = base_mu,
     base_Sigma = base_Sigma,
+    population_model = population_model,
     broad_defensive = TRUE,
     n_jobs = mc.cores
   )
 }
 
 stage <- load_reference_stage()
-
-population_model <- default_population_model_diag_gaussian(
-  base_mu = base_mu,
-  base_Sigma = base_Sigma,
-  mean_var_scale = 1.0,
-  sigma2_shape = 3.0,
-  sigma2_mean = diag(base_Sigma)
-)
 
 factor_set <- build_population_factor_set(stage$local_objects, population_model)
 

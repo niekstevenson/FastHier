@@ -32,7 +32,6 @@ outer_mcmc_moves <- 3L
 outer_max_rounds <- 80L
 base_seed <- 20260323L
 verbose <- TRUE
-reference_refinement_source <- "pilot_population_fit"
 
 dir.create(file.path("benchmarks", "samples"), showWarnings = FALSE, recursive = TRUE)
 dir.create(file.path("benchmarks", "results"), showWarnings = FALSE, recursive = TRUE)
@@ -221,17 +220,12 @@ stage <- prepare_reference_local_stage(
   full_particles = full_particles,
   n_jobs = mc.cores,
   base_seed = base_seed,
-  pilot_population_model = if (identical(reference_refinement_source, "pilot_population_fit")) population_model else NULL,
+  population_model = population_model,
   pilot_outer_control = list(
     max_rounds = 40L
   ),
   pilot_smc_control = list(
     max_rounds = 40L
-  ),
-  full_smc_control = list(
-    hist_mix_enable = FALSE,
-    gss_enable = FALSE,
-    da_enable = FALSE
   )
 )
 
@@ -295,8 +289,7 @@ saveRDS(
       outer_particles = outer_particles,
       outer_mcmc_moves = outer_mcmc_moves,
       outer_max_rounds = outer_max_rounds,
-      base_seed = base_seed,
-      reference_refinement_source = reference_refinement_source
+      base_seed = base_seed
     ),
     plot_file = plot_file
   ),

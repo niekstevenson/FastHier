@@ -44,209 +44,17 @@ arg_lgl <- function(args, key, default = FALSE) {
   tolower(as.character(val)) %in% c("1", "true", "t", "yes", "y")
 }
 
-config_label_default <- function(refined_method, transport_method, gss_enable, da_enable) {
-  refined_tag <- if (identical(refined_method, "defensive_mixture")) "defmix" else "broad"
-  transport_tag <- if (identical(transport_method, "gaussian_copula")) "gcop" else "tri"
-  mode_tag <- if (gss_enable && da_enable) {
-    "gss_da"
-  } else if (gss_enable) {
-    "gss"
-  } else if (da_enable) {
-    "da"
-  } else {
-    "base"
-  }
-  paste(refined_tag, transport_tag, mode_tag, sep = "_")
-}
-
-build_config_grid <- function(config_set = "full") {
-  config_set <- match.arg(config_set, c("full", "core", "gss"))
-  refined_methods <- c("defensive_mixture", "broadened_gaussian")
-  transport_methods <- c("gaussian_copula", "sparse_triangular")
-
-  configs <- switch(
-    config_set,
-    full = expand.grid(
-      refined_method = refined_methods,
-      transport_method = transport_methods,
-      gss_enable = c(FALSE, TRUE),
-      da_enable = c(FALSE, TRUE),
-      stringsAsFactors = FALSE
-    ),
-    core = expand.grid(
-      refined_method = refined_methods,
-      transport_method = transport_methods,
-      gss_enable = FALSE,
-      da_enable = FALSE,
-      stringsAsFactors = FALSE
-    ),
-    gss = expand.grid(
-      refined_method = refined_methods,
-      transport_method = transport_methods,
-      gss_enable = c(FALSE, TRUE),
-      da_enable = c(FALSE, TRUE),
-      stringsAsFactors = FALSE
-    )
-  )
-
-  configs$hist_mix_enable <- configs$gss_enable | configs$da_enable
-  configs$label <- mapply(
-    config_label_default,
-    configs$refined_method,
-    configs$transport_method,
-    configs$gss_enable,
-    configs$da_enable,
-    USE.NAMES = FALSE
-  )
-
-  if (identical(config_set, "gss")) {
-    configs <- configs[configs$gss_enable | configs$da_enable, , drop = FALSE]
-  }
-
-  configs[order(configs$label), , drop = FALSE]
-}
-
-draw_quantiles <- function(x, probs = c(0.1, 0.5, 0.9)) {
-  stats::quantile(as.numeric(x), probs = probs, na.rm = TRUE, names = FALSE)
-}
-
-make_emc_theta_center <- function(emc_draws, param_names) {
-  mu_center <- colMeans(emc_draws[, paste0("mu_", param_names), drop = FALSE])
-  sigma2_center <- colMeans(emc_draws[, paste0("sigma2_", param_names), drop = FALSE])
-  theta <- c(mu_center, log(sigma2_center))
-  theta <- matrix(theta, nrow = 1L)
-  colnames(theta) <- c(paste0("mu_", param_names), paste0("log_sigma2_", param_names))
-  theta
-}
-
-make_sv_tail_grid <- function(emc_draws,
-                              probs = c(0.05, 0.25, 0.50, 0.75, 0.90, 0.95, 0.99)) {
-  log(as.numeric(stats::quantile(emc_draws[["sigma2_sv"]], probs = probs, na.rm = TRUE, names = FALSE)))
-}
-
-summarize_local_factor_diagnostics <- function(local_diag) {
-  finite_k <- local_diag$pareto_k[is.finite(local_diag$pareto_k)]
+build_config_grid <- function(config_set = "core") {
+  config_set <- match.arg(config_set, c("core"))
   data.frame(
-    min_ess = min(local_diag$ess, na.rm = TRUE),
-    q10_ess = as.numeric(stats::quantile(local_diag$ess, probs = 0.10, na.rm = TRUE, names = FALSE)),
-    mean_ess = mean(local_diag$ess, na.rm = TRUE),
-    max_pareto_k = if (length(finite_k)) max(finite_k) else NA_real_,
-    q90_pareto_k = if (length(finite_k)) as.numeric(stats::quantile(finite_k, probs = 0.90, na.rm = TRUE, names = FALSE)) else NA_real_,
-    n_k_gt_0_7 = sum(local_diag$pareto_k > 0.7, na.rm = TRUE),
-    n_k_gt_1_0 = sum(local_diag$pareto_k > 1.0, na.rm = TRUE),
+    method = c("static", "refresh_dmis"),
+    label = c("static", "refresh_dmis"),
     stringsAsFactors = FALSE
   )
 }
 
-compute_factor_diagnostics <- function(factor_set, theta_center, sv_grid) {
-  center_local <- population_factor_set_local_tail_diagnostics(
-    factor_set = factor_set,
-    theta = theta_center,
-    use_psis = TRUE
-  )
-  list(
-    center_local = center_local,
-    center_summary = summarize_local_factor_diagnostics(center_local),
-    sv_tail = population_factor_set_sv_tail_grid(
-      factor_set = factor_set,
-      theta_center = theta_center,
-      sv_grid = sv_grid,
-      use_psis = TRUE,
-      top_n = 5L
-    )
-  )
-}
-
-log_factor_diagnostics <- function(diag, label) {
-  cat(label, "\n", sep = "")
-  cat("  Centered at EMC mean:\n")
-  print(round(diag$center_summary, 3))
-  cat("  sv tail grid summary:\n")
-  print(round(diag$sv_tail$summary, 3))
-  if (nrow(diag$sv_tail$worst)) {
-    cat("  Worst locals at largest sigma2_sv grid point:\n")
-    largest_sigma2 <- max(diag$sv_tail$worst$sigma2_sv, na.rm = TRUE)
-    worst <- diag$sv_tail$worst[diag$sv_tail$worst$sigma2_sv == largest_sigma2, , drop = FALSE]
-    print(utils::head(worst, 5L))
-  }
-}
-
-append_factor_diag_summary <- function(row, diag, prefix = "") {
-  if (is.null(diag)) return(row)
-  center <- diag$center_summary
-  tail_summary <- diag$sv_tail$summary
-  right_tail <- tail_summary[which.max(tail_summary$sigma2_sv), , drop = FALSE]
-  finite_tail_k <- tail_summary$max_pareto_k[is.finite(tail_summary$max_pareto_k)]
-
-  row[[paste0(prefix, "center_min_ess")]] <- as.numeric(center$min_ess)
-  row[[paste0(prefix, "center_q10_ess")]] <- as.numeric(center$q10_ess)
-  row[[paste0(prefix, "center_mean_ess")]] <- as.numeric(center$mean_ess)
-  row[[paste0(prefix, "center_max_pareto_k")]] <- as.numeric(center$max_pareto_k)
-  row[[paste0(prefix, "center_q90_pareto_k")]] <- as.numeric(center$q90_pareto_k)
-  row[[paste0(prefix, "center_n_k_gt_0_7")]] <- as.integer(center$n_k_gt_0_7)
-  row[[paste0(prefix, "center_n_k_gt_1_0")]] <- as.integer(center$n_k_gt_1_0)
-  row[[paste0(prefix, "sv_tail_max_pareto_k")]] <- if (length(finite_tail_k)) max(finite_tail_k) else NA_real_
-  row[[paste0(prefix, "sv_tail_rightmost_min_ess")]] <- as.numeric(right_tail$min_ess)
-  row[[paste0(prefix, "sv_tail_rightmost_max_pareto_k")]] <- as.numeric(right_tail$max_pareto_k)
-  row[[paste0(prefix, "sv_tail_rightmost_n_k_gt_0_7")]] <- as.integer(right_tail$n_k_gt_0_7)
-  row
-}
-
-log_site_block_diagnostics <- function(diag, label) {
-  cat(label, "\n", sep = "")
-  if (is.null(diag) || !nrow(diag$summary)) {
-    cat("  No difficult blocks detected.\n")
-    return(invisible(NULL))
-  }
-  print(utils::head(diag$summary, 8L))
-  if (nrow(diag$hard_blocks)) {
-    top_block <- diag$hard_blocks[1L, , drop = FALSE]
-    cat("  Top hard block locals:\n")
-    top_local <- diag$block_diagnostics[[top_block$block_id]]$local
-    ord <- order(
-      ifelse(is.finite(top_local$max_pareto_k), -top_local$max_pareto_k, Inf),
-      top_local$min_ess_frac,
-      -top_local$scaled_rmse
-    )
-    print(utils::head(top_local[ord, , drop = FALSE], 5L))
-  }
-}
-
-append_site_block_diag_summary <- function(row, diag, prefix = "") {
-  if (is.null(diag) || !nrow(diag$summary)) {
-    row[[paste0(prefix, "n_detected_blocks")]] <- 0L
-    row[[paste0(prefix, "n_hard_blocks")]] <- 0L
-    row[[paste0(prefix, "top_block_id")]] <- NA_character_
-    row[[paste0(prefix, "top_block_dim")]] <- NA_integer_
-    row[[paste0(prefix, "top_block_total_score")]] <- NA_real_
-    row[[paste0(prefix, "top_block_max_pareto_k")]] <- NA_real_
-    row[[paste0(prefix, "top_block_q10_ess_frac")]] <- NA_real_
-    return(row)
-  }
-  top <- if (nrow(diag$hard_blocks)) diag$hard_blocks[1L, , drop = FALSE] else diag$summary[1L, , drop = FALSE]
-  row[[paste0(prefix, "n_detected_blocks")]] <- nrow(diag$summary)
-  row[[paste0(prefix, "n_hard_blocks")]] <- nrow(diag$hard_blocks)
-  row[[paste0(prefix, "top_block_id")]] <- as.character(top$block_id)
-  row[[paste0(prefix, "top_block_dim")]] <- as.integer(top$dim)
-  row[[paste0(prefix, "top_block_total_score")]] <- as.numeric(top$total_score)
-  row[[paste0(prefix, "top_block_max_pareto_k")]] <- as.numeric(top$max_pareto_k)
-  row[[paste0(prefix, "top_block_q10_ess_frac")]] <- as.numeric(top$q10_ess_frac)
-  row
-}
-
-append_site_refinement_summary <- function(row, refinement) {
-  if (is.null(refinement) || is.null(refinement$summary) || !nrow(refinement$summary)) {
-    row$n_site_surrogates <- 0L
-    row$mean_site_surrogate_abs_delta <- NA_real_
-    row$max_site_surrogate_abs_delta <- NA_real_
-    row$mean_site_surrogate_cv_rmse <- NA_real_
-    return(row)
-  }
-  row$n_site_surrogates <- nrow(refinement$summary)
-  row$mean_site_surrogate_abs_delta <- mean(refinement$summary$mean_abs_delta, na.rm = TRUE)
-  row$max_site_surrogate_abs_delta <- max(refinement$summary$max_abs_delta, na.rm = TRUE)
-  row$mean_site_surrogate_cv_rmse <- mean(refinement$summary$surrogate_cv_rmse, na.rm = TRUE)
-  row
+draw_quantiles <- function(x, probs = c(0.1, 0.5, 0.9)) {
+  stats::quantile(as.numeric(x), probs = probs, na.rm = TRUE, names = FALSE)
 }
 
 run_with_log <- function(log_file, expr) {
@@ -352,11 +160,7 @@ summarize_result <- function(result_file, config, plot_file, log_file) {
 
   row <- data.frame(
     label = config$label,
-    refined_method = config$refined_method,
-    transport_method = config$transport_method,
-    hist_mix_enable = config$hist_mix_enable,
-    gss_enable = config$gss_enable,
-    da_enable = config$da_enable,
+    method = config$method,
     results_file = normalizePath(result_file, winslash = "/", mustWork = FALSE),
     plot_file = normalizePath(plot_file, winslash = "/", mustWork = FALSE),
     log_file = normalizePath(log_file, winslash = "/", mustWork = FALSE),
@@ -389,16 +193,11 @@ summarize_result <- function(result_file, config, plot_file, log_file) {
   diff_values <- unlist(row[diff_cols], use.names = FALSE)
   row$mean_abs_posterior_diff <- mean(abs(diff_values))
   row$max_abs_posterior_diff <- max(abs(diff_values))
-  row <- append_factor_diag_summary(row, res$factor_diagnostics$final %||% NULL)
-  row <- append_factor_diag_summary(row, res$factor_diagnostics$pre_refresh %||% NULL, prefix = "pre_refresh_")
-  row <- append_site_block_diag_summary(row, res$site_block_diagnostics %||% NULL)
-  row <- append_site_block_diag_summary(row, res$site_block_diagnostics_pre %||% NULL, prefix = "pre_surrogate_")
-  row <- append_site_refinement_summary(row, res$site_refinement %||% NULL)
   row
 }
 
 cli_args <- parse_cli_args(commandArgs(trailingOnly = TRUE))
-config_set <- arg_chr(cli_args, "config_set", "full")
+config_set <- arg_chr(cli_args, "config_set", "core")
 results_dir <- arg_chr(cli_args, "results_dir", file.path("benchmarks", "results", "meta", "emc"))
 labels_filter <- arg_chr(cli_args, "labels", NULL)
 inner_verbose <- arg_lgl(cli_args, "inner_verbose", FALSE)
@@ -424,10 +223,6 @@ outer_max_rounds <- arg_int(cli_args, "outer_max_rounds", 80L)
 base_seed <- arg_int(cli_args, "base_seed", 20260324L)
 broad_scale <- as.numeric(arg_chr(cli_args, "broad_scale", "1"))
 refresh_once <- arg_lgl(cli_args, "refresh_once", TRUE)
-adaptive_surrogate <- arg_lgl(cli_args, "adaptive_surrogate", FALSE)
-surrogate_particles <- arg_int(cli_args, "surrogate_particles", 800L)
-surrogate_max_cases <- arg_int(cli_args, "surrogate_max_cases", 12L)
-
 dir.create(results_dir, showWarnings = FALSE, recursive = TRUE)
 logs_dir <- file.path(results_dir, "logs")
 dir.create(logs_dir, showWarnings = FALSE, recursive = TRUE)
@@ -436,7 +231,6 @@ source("smc_core.R")
 source("reference_priors.R")
 source("utilities.R")
 source("SMC_super_fast.R")
-fit_copula_transform_sparse <- fit_copula_transform
 source("hierarchical_locals.R")
 source("population_models.R")
 source("outer_population_smc.R")
@@ -504,22 +298,10 @@ for (i in seq_len(nrow(configs))) {
 
   cat(sprintf("[%d/%d] %s\n", i, nrow(configs), label))
 
-  if (identical(cfg$transport_method, "gaussian_copula")) {
-    fit_copula_transform <- .fit_gaussian_copula_transform
-  } else {
-    fit_copula_transform <- fit_copula_transform_sparse
-  }
-
   start_time <- proc.time()[["elapsed"]]
   result <- try(
     run_with_log(log_file, {
-      cat(sprintf("Configuration: label=%s | refined=%s | transport=%s | hist_mix=%s | gss=%s | da=%s\n",
-                  label,
-                  cfg$refined_method,
-                  cfg$transport_method,
-                  cfg$hist_mix_enable,
-                  cfg$gss_enable,
-                  cfg$da_enable))
+      cat(sprintf("Configuration: label=%s | method=%s\n", label, cfg$method))
       cat(sprintf("Data: %d subjects\n", length(data_list)))
       cat("Running local-reference stage...\n")
 
@@ -532,11 +314,10 @@ for (i in seq_len(nrow(configs))) {
         broad_scale = broad_scale,
         pilot_particles = pilot_particles,
         full_particles = full_particles,
-        refined_method = cfg$refined_method,
         n_jobs = mc.cores,
         base_seed = base_seed,
-        pilot_population_model = population_model,
-        refresh_once = refresh_once,
+        population_model = population_model,
+        refresh_once = identical(cfg$method, "refresh_dmis"),
         refresh_outer_control = list(
           N = outer_particles,
           n_mcmc_moves = outer_mcmc_moves,
@@ -544,20 +325,11 @@ for (i in seq_len(nrow(configs))) {
         ),
         verbose = inner_verbose,
         pilot_smc_control = list(
-          max_rounds = 40L,
-          hist_mix_enable = cfg$hist_mix_enable,
-          gss_enable = cfg$gss_enable,
-          da_enable = cfg$da_enable
-        ),
-        full_smc_control = list(
-          hist_mix_enable = cfg$hist_mix_enable,
-          gss_enable = cfg$gss_enable,
-          da_enable = cfg$da_enable
+          max_rounds = 40L
         )
       )
 
       factor_set <- build_population_factor_set(stage$local_objects, population_model)
-      site_set <- build_population_site_set(stage$local_objects, population_model)
       pre_refresh_factor_set <- if (!is.null(stage$pre_refresh)) {
         build_population_factor_set(stage$pre_refresh$local_objects, population_model)
       } else {
@@ -580,57 +352,6 @@ for (i in seq_len(nrow(configs))) {
         )
       }
 
-      site_block_diagnostics_pre <- detect_population_hard_blocks(
-        site_set = site_set,
-        theta = fit$theta,
-        w = fit$w,
-        max_block_dim = 2L,
-        max_single_blocks = 4L,
-        max_pair_blocks = 4L,
-        use_psis = TRUE
-      )
-
-      site_refinement <- NULL
-      if (adaptive_surrogate) {
-        cat("Running adaptive site surrogate refinement...\n")
-        site_refinement <- refine_population_site_surrogates(
-          data_list = data_list,
-          loglik_fn = loglik_emc2,
-          local_objects = stage$local_objects,
-          local_fits = stage$local_fits,
-          population_model = population_model,
-          outer_fit = fit,
-          hard_block_diagnostics = site_block_diagnostics_pre,
-          broad_reference = stage$broad_reference,
-          max_cases = surrogate_max_cases,
-          anchor_particles = surrogate_particles,
-          n_jobs = mc.cores,
-          local_n_cores = 1L,
-          base_seed = base_seed + 300000L,
-          verbose = inner_verbose,
-          smc_control = list(
-            n_mcmc_moves = 1L,
-            max_rounds = 35L,
-            hist_mix_enable = cfg$hist_mix_enable,
-            gss_enable = FALSE,
-            da_enable = FALSE
-          )
-        )
-        if (!is.null(site_refinement$summary) && nrow(site_refinement$summary)) {
-          site_set <- site_refinement$site_set
-          cat("Running outer population SMC with surrogate-corrected sites...\n")
-          fit <- outer_population_smc(
-            factor_set = site_set,
-            N = outer_particles,
-            n_mcmc_moves = outer_mcmc_moves,
-            max_rounds = outer_max_rounds,
-            n_cores = mc.cores,
-            seed = base_seed + 2L,
-            verbose = inner_verbose
-          )
-        }
-      }
-
       workflow_parts <- smc_posteriors(
         fit,
         n_draws = nrow(reference_mu_draws),
@@ -649,51 +370,11 @@ for (i in seq_len(nrow(configs))) {
         model = population_model
       )
 
-      emc_theta_center <- make_emc_theta_center(emc_draws, param_names = param_names)
-      sv_tail_grid <- make_sv_tail_grid(emc_draws)
       factor_diagnostics <- list(
-        theta_center = emc_theta_center,
-        sv_grid = data.frame(
-          log_sigma2_sv = sv_tail_grid,
-          sigma2_sv = exp(sv_tail_grid),
-          stringsAsFactors = FALSE
-        ),
-        final = compute_factor_diagnostics(
-          factor_set = factor_set,
-          theta_center = emc_theta_center,
-          sv_grid = sv_tail_grid
-        ),
-        pre_refresh = if (!is.null(pre_refresh_factor_set)) {
-          compute_factor_diagnostics(
-            factor_set = pre_refresh_factor_set,
-            theta_center = emc_theta_center,
-            sv_grid = sv_tail_grid
-          )
-        } else {
-          NULL
-        }
+        final = NULL,
+        pre_refresh = NULL,
+        pre_refresh_factor_set = pre_refresh_factor_set
       )
-
-      site_block_diagnostics <- detect_population_hard_blocks(
-        site_set = site_set,
-        theta = fit$theta,
-        w = fit$w,
-        max_block_dim = 2L,
-        max_single_blocks = 4L,
-        max_pair_blocks = 4L,
-        use_psis = TRUE
-      )
-
-      log_factor_diagnostics(factor_diagnostics$final, "Final factor diagnostics:")
-      if (!is.null(factor_diagnostics$pre_refresh)) {
-        log_factor_diagnostics(factor_diagnostics$pre_refresh, "Pre-refresh factor diagnostics:")
-      }
-      log_site_block_diagnostics(site_block_diagnostics_pre, "Adaptive site block diagnostics (baseline):")
-      if (!is.null(site_refinement) && !is.null(site_refinement$summary) && nrow(site_refinement$summary)) {
-        cat("Adaptive site surrogate summary:\n")
-        print(site_refinement$summary)
-      }
-      log_site_block_diagnostics(site_block_diagnostics, "Adaptive site block diagnostics (post-surrogate):")
 
       plot_config_posteriors(workflow_draws, emc_draws, label, plot_file)
 
@@ -707,16 +388,9 @@ for (i in seq_len(nrow(configs))) {
           workflow_draws = workflow_draws,
           posterior_summary = posterior_summary,
           factor_diagnostics = factor_diagnostics,
-          site_block_diagnostics_pre = site_block_diagnostics_pre,
-          site_block_diagnostics = site_block_diagnostics,
-          site_refinement = site_refinement,
           settings = list(
             label = label,
-            transport_method = cfg$transport_method,
-            refined_method = cfg$refined_method,
-            hist_mix_enable = cfg$hist_mix_enable,
-            gss_enable = cfg$gss_enable,
-            da_enable = cfg$da_enable,
+            method = cfg$method,
             mc.cores = mc.cores,
             pilot_size = min(pilot_size, length(data_list)),
             pilot_particles = pilot_particles,
@@ -726,10 +400,7 @@ for (i in seq_len(nrow(configs))) {
             outer_max_rounds = outer_max_rounds,
             base_seed = base_seed,
             broad_scale = broad_scale,
-            refresh_once = refresh_once,
-            adaptive_surrogate = adaptive_surrogate,
-            surrogate_particles = surrogate_particles,
-            surrogate_max_cases = surrogate_max_cases,
+            refresh_once = identical(cfg$method, "refresh_dmis"),
             elapsed_sec = elapsed_sec
           ),
           elapsed_sec = elapsed_sec,
@@ -753,11 +424,7 @@ for (i in seq_len(nrow(configs))) {
   } else {
     row <- data.frame(
       label = label,
-      refined_method = cfg$refined_method,
-      transport_method = cfg$transport_method,
-      hist_mix_enable = cfg$hist_mix_enable,
-      gss_enable = cfg$gss_enable,
-      da_enable = cfg$da_enable,
+      method = cfg$method,
       results_file = normalizePath(result_file, winslash = "/", mustWork = FALSE),
       plot_file = normalizePath(plot_file, winslash = "/", mustWork = FALSE),
       log_file = normalizePath(log_file, winslash = "/", mustWork = FALSE),
