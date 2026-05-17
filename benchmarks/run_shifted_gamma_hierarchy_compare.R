@@ -52,10 +52,11 @@ set.seed(20260324L)
 cli_args <- parse_cli_args(commandArgs(trailingOnly = TRUE))
 
 method <- arg_chr(cli_args, "method", "static")
-if (!(method %in% c("static", "refresh_dmis"))) {
-  stop("method must be 'static' or 'refresh_dmis'.")
+if (!(method %in% c("static", "refresh_dmis", "certified"))) {
+  stop("method must be 'static', 'refresh_dmis', or 'certified'.")
 }
 refresh_once <- identical(method, "refresh_dmis")
+certified <- identical(method, "certified")
 run_label <- arg_chr(cli_args, "label", NULL)
 
 stan_results_file <- file.path("benchmarks", "samples", "shifted_gamma_hierarchy_stan_results.rds")
@@ -74,6 +75,23 @@ full_particles <- arg_int(cli_args, "full_particles", 2000L)
 outer_particles <- arg_int(cli_args, "outer_particles", 2000L)
 outer_mcmc_moves <- arg_int(cli_args, "outer_mcmc_moves", 3L)
 outer_max_rounds <- arg_int(cli_args, "outer_max_rounds", 80L)
+certification_iterations <- arg_int(cli_args, "certification_iterations", 3L)
+certification_calibration_size <- arg_int(cli_args, "certification_calibration_size", 32L)
+certification_validation_size <- arg_int(cli_args, "certification_validation_size", 24L)
+certification_particles <- arg_int(cli_args, "certification_particles", full_particles)
+certification_enrichment_anchors <- arg_int(cli_args, "certification_enrichment_anchors", 4L)
+certification_estimator <- arg_chr(cli_args, "certification_estimator", "qmc")
+certification_quadrature_order <- arg_int(cli_args, "certification_quadrature_order", 7L)
+certification_qmc_size <- arg_int(cli_args, "certification_qmc_size", 8192L)
+certification_enrichment_particles <- arg_int(cli_args, "certification_enrichment_particles", min(certification_qmc_size, 2048L))
+certification_qmc_randomizations <- arg_int(cli_args, "certification_qmc_randomizations", 2L)
+certification_design_stress_pool_size <- arg_int(cli_args, "certification_design_stress_pool_size", 384L)
+certification_design_stress_scale <- as.numeric(arg_chr(cli_args, "certification_design_stress_scale", "2.5"))
+certification_design_stress_weight <- as.numeric(arg_chr(cli_args, "certification_design_stress_weight", "0.35"))
+certification_design_stress_log_drop <- as.numeric(arg_chr(cli_args, "certification_design_stress_log_drop", "30"))
+certification_validation_rmse_tol <- as.numeric(arg_chr(cli_args, "certification_validation_rmse_tol", "0.75"))
+certification_validation_median_abs_tol <- as.numeric(arg_chr(cli_args, "certification_validation_median_abs_tol", "0.50"))
+certification_require_validation <- arg_lgl(cli_args, "certification_require_validation", FALSE)
 base_seed <- arg_int(cli_args, "base_seed", 20260324L)
 verbose <- arg_lgl(cli_args, "verbose", TRUE)
 
@@ -193,6 +211,7 @@ stage <- prepare_reference_local_stage(
   n_jobs = mc.cores,
   base_seed = base_seed,
   refresh_once = refresh_once,
+  verbose = verbose,
   refresh_outer_control = list(
     N = outer_particles,
     n_mcmc_moves = outer_mcmc_moves,
@@ -206,7 +225,45 @@ stage <- prepare_reference_local_stage(
 cat("Running outer population SMC...\n")
 
 fit <- stage$outer_fit
-if (is.null(fit)) {
+if (certified) {
+  certified_result <- fit_certified_population_model(
+    data_list = data_list,
+    loglik_fn = loglik_shifted_gamma,
+    local_objects = stage$local_objects,
+    population_model = population_model,
+    outer_control = list(
+      N = outer_particles,
+      n_mcmc_moves = outer_mcmc_moves,
+      max_rounds = outer_max_rounds
+    ),
+    certification_control = list(
+      max_iterations = certification_iterations,
+      calibration_size = certification_calibration_size,
+      validation_size = certification_validation_size,
+      certification_estimator = certification_estimator,
+      particles = certification_particles,
+      enrichment_particles = certification_enrichment_particles,
+      enrichment_anchors = certification_enrichment_anchors,
+      quadrature_order = certification_quadrature_order,
+      qmc_size = certification_qmc_size,
+      qmc_randomizations = certification_qmc_randomizations,
+      local_n_cores = 1L,
+      design_stress_pool_size = certification_design_stress_pool_size,
+      design_stress_scale = certification_design_stress_scale,
+      design_stress_weight = certification_design_stress_weight,
+      design_stress_log_drop = certification_design_stress_log_drop,
+      validation_rmse_tol = certification_validation_rmse_tol,
+      validation_median_abs_tol = certification_validation_median_abs_tol,
+      require_validation = certification_require_validation,
+      smc_control = list(max_rounds = 80L, n_mcmc_moves = 3L, G_mix = 12L)
+    ),
+    n_cores = mc.cores,
+    seed = base_seed + 300000L,
+    verbose = verbose
+  )
+  stage$certified <- certified_result
+  fit <- certified_result$fit
+} else if (is.null(fit)) {
   factor_set <- build_population_factor_set(stage$local_objects, population_model)
   fit <- outer_population_smc(
     factor_set = factor_set,
@@ -256,6 +313,7 @@ saveRDS(
       label = run_label,
       method = method,
       refresh_once = refresh_once,
+      certified = certified,
       mc.cores = mc.cores,
       pilot_size = min(pilot_size, length(data_list)),
       pilot_particles = pilot_particles,
@@ -263,6 +321,23 @@ saveRDS(
       outer_particles = outer_particles,
       outer_mcmc_moves = outer_mcmc_moves,
       outer_max_rounds = outer_max_rounds,
+      certification_iterations = certification_iterations,
+      certification_calibration_size = certification_calibration_size,
+      certification_validation_size = certification_validation_size,
+      certification_particles = certification_particles,
+      certification_enrichment_particles = certification_enrichment_particles,
+      certification_enrichment_anchors = certification_enrichment_anchors,
+      certification_estimator = certification_estimator,
+      certification_quadrature_order = certification_quadrature_order,
+      certification_qmc_size = certification_qmc_size,
+      certification_qmc_randomizations = certification_qmc_randomizations,
+      certification_design_stress_pool_size = certification_design_stress_pool_size,
+      certification_design_stress_scale = certification_design_stress_scale,
+      certification_design_stress_weight = certification_design_stress_weight,
+      certification_design_stress_log_drop = certification_design_stress_log_drop,
+      certification_validation_rmse_tol = certification_validation_rmse_tol,
+      certification_validation_median_abs_tol = certification_validation_median_abs_tol,
+      certification_require_validation = certification_require_validation,
       base_seed = base_seed
     ),
     plot_file = plot_file

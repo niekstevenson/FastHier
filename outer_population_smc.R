@@ -51,11 +51,29 @@ validate_reference_local_component <- function(component) {
   log_reference_density <- as.numeric(
     component$log_reference_density %||% reference_prior_logpdf(reference_prior, particles)
   )
+  proposal_type <- as.character(component$proposal_type %||% "posterior_reference")
+  if (!identical(length(proposal_type), 1L) ||
+      !(proposal_type %in% c("posterior_reference", "prior_reference"))) {
+    stop("reference local component proposal_type must be 'posterior_reference' or 'prior_reference'.")
+  }
+  log_likelihood <- component$log_likelihood
+  if (is.null(log_likelihood)) {
+    log_likelihood <- rep(NA_real_, nrow(particles))
+  }
+  log_likelihood <- as.numeric(log_likelihood)
+  if (length(log_likelihood) != nrow(particles)) {
+    stop("reference local component log_likelihood must match the number of particles.")
+  }
+  if (length(log_reference_density) != nrow(particles)) {
+    stop("reference local component log_reference_density must match the number of particles.")
+  }
 
   component$particles <- particles
   component$weights <- weights
   component$reference_prior <- reference_prior
   component$log_reference_density <- log_reference_density
+  component$proposal_type <- proposal_type
+  component$log_likelihood <- log_likelihood
   component$log_evidence <- as.numeric(component$log_evidence %||% NA_real_)
   component$mcse_log_evidence <- as.numeric(component$mcse_log_evidence %||% NA_real_)
   component
@@ -95,6 +113,8 @@ validate_reference_local_object <- function(local_object) {
         mcse_log_evidence = local_object$mcse_log_evidence,
         reference_prior = local_object$reference_prior,
         log_reference_density = local_object$log_reference_density,
+        proposal_type = local_object$proposal_type %||% "posterior_reference",
+        log_likelihood = local_object$log_likelihood,
         diagnostics = local_object$diagnostics %||% list()
       )
     )
@@ -103,7 +123,11 @@ validate_reference_local_object <- function(local_object) {
   local_object
 }
 
-build_population_local_factor <- function(local_object, population_model) {
+build_population_local_factor <- function(local_object,
+                                          population_model,
+                                          data_i = NULL,
+                                          loglik_fn = NULL,
+                                          local_n_cores = 1L) {
   local_object <- validate_reference_local_object(local_object)
   population_model <- normalize_population_model(population_model)
   components <- local_object$components
@@ -121,7 +145,16 @@ build_population_local_factor <- function(local_object, population_model) {
     }
   }
 
-  if (length(components) == 1L) {
+  proposal_types <- vapply(components, `[[`, character(1), "proposal_type")
+  if (any(proposal_types == "prior_reference")) {
+    keep <- proposal_types == "prior_reference"
+    components <- components[keep]
+    local_object$mixture_weights <- normalize_reference_local_weights(local_object$mixture_weights[keep])
+    proposal_types <- proposal_types[keep]
+  }
+  use_proposal_dmis <- any(proposal_types == "prior_reference")
+
+  if (!use_proposal_dmis && length(components) == 1L) {
     component <- components[[1L]]
     alpha <- align_alpha(component$particles)
     log_weights <- log(component$weights)
@@ -132,7 +165,7 @@ build_population_local_factor <- function(local_object, population_model) {
     log_constant <- as.numeric(component$log_evidence %||% 0)
     component_id <- rep.int(1L, nrow(alpha))
     reference_prior <- component$reference_prior
-  } else {
+  } else if (!use_proposal_dmis) {
     eta <- normalize_reference_local_weights(local_object$mixture_weights)
     log_eta <- ifelse(eta > 0, log(eta), -Inf)
     alpha_list <- lapply(components, function(component) align_alpha(component$particles))
@@ -163,6 +196,44 @@ build_population_local_factor <- function(local_object, population_model) {
 
     log_denom <- .rowLogSumExp(sweep(logq_mat, 2L, log_eta - component_logZ, "+"))
     log_base <- log_weights - log_denom
+    log_constant <- 0
+    log_reference_density <- rep(NA_real_, nrow(alpha))
+    reference_prior <- NULL
+  } else {
+    eta <- normalize_reference_local_weights(local_object$mixture_weights)
+    log_eta <- ifelse(eta > 0, log(eta), -Inf)
+    alpha_list <- lapply(components, function(component) align_alpha(component$particles))
+    alpha <- do.call(rbind, alpha_list)
+    component_lengths <- vapply(alpha_list, nrow, integer(1))
+    component_id <- rep.int(seq_along(alpha_list), component_lengths)
+
+    cached_loglik <- unlist(lapply(components, `[[`, "log_likelihood"), use.names = FALSE)
+    if (length(cached_loglik) != nrow(alpha) || anyNA(cached_loglik)) {
+      if (is.null(data_i) || is.null(loglik_fn)) {
+        stop("Proposal-density DMIS local factors require data_i and loglik_fn unless every component stores log_likelihood.")
+      }
+      cached_loglik <- ll_parallel(
+        alpha,
+        data_i,
+        loglik_fn,
+        n_cores = as.integer(max(1L, local_n_cores))
+      )
+    }
+    log_likelihood <- as.numeric(cached_loglik)
+    log_likelihood[is.na(log_likelihood)] <- -Inf
+
+    logh_mat <- vapply(seq_along(components), function(j) {
+      component <- components[[j]]
+      as.numeric(reference_prior_logpdf(component$reference_prior, alpha))
+    }, numeric(nrow(alpha)))
+    if (!is.matrix(logh_mat)) {
+      logh_mat <- matrix(logh_mat, ncol = length(components))
+    }
+
+    log_hmix <- .rowLogSumExp(sweep(logh_mat, 2L, log_eta, "+"))
+    log_sample_weights <- unlist(lapply(components, function(component) log(component$weights)), use.names = FALSE)
+    log_weights <- log_sample_weights + log_eta[component_id]
+    log_base <- log_weights + log_likelihood - log_hmix
     log_constant <- 0
     log_reference_density <- rep(NA_real_, nrow(alpha))
     reference_prior <- NULL
@@ -331,9 +402,35 @@ population_local_factor_tail_diagnostic <- function(factor, theta, use_psis = TR
 
 build_population_factor_set <- function(local_objects,
                                         population_model,
-                                        particle_block_size = 1024L) {
+                                        particle_block_size = 1024L,
+                                        data_list = NULL,
+                                        loglik_fn = NULL,
+                                        local_n_cores = 1L) {
   population_model <- normalize_population_model(population_model)
-  factors <- lapply(local_objects, build_population_local_factor, population_model = population_model)
+  local_names <- names(local_objects)
+  data_for_local <- function(local_object, pos) {
+    if (is.null(data_list)) return(NULL)
+    if (!is.null(local_names) &&
+        !is.na(local_names[pos]) &&
+        nzchar(local_names[pos]) &&
+        local_names[pos] %in% names(data_list)) {
+      return(data_list[[local_names[pos]]])
+    }
+    local_id <- as.integer(local_object$local_id %||% pos)
+    if (is.finite(local_id) && local_id >= 1L && local_id <= length(data_list)) {
+      return(data_list[[local_id]])
+    }
+    data_list[[pos]]
+  }
+  factors <- lapply(seq_along(local_objects), function(i) {
+    build_population_local_factor(
+      local_objects[[i]],
+      population_model = population_model,
+      data_i = data_for_local(local_objects[[i]], i),
+      loglik_fn = loglik_fn,
+      local_n_cores = local_n_cores
+    )
+  })
   names(factors) <- names(local_objects)
   particle_block_size <- as.integer(max(1L, particle_block_size))
 
@@ -452,6 +549,39 @@ population_factor_set_loglik <- function(factor_set, theta, include_constant = F
     out[batches[[i]]] <- parts[[i]]
   }
   if (isTRUE(include_constant)) out <- out + factor_set$log_constant
+  out
+}
+
+population_factor_set_loglik_by_local <- function(factor_set,
+                                                  theta,
+                                                  include_constant = TRUE,
+                                                  n_cores = 1L) {
+  stopifnot(inherits(factor_set, "population_factor_set"))
+  model <- factor_set$population_model
+  theta <- .as_hyper_matrix(theta, hyper_names = model$hyper_names, hyper_dim = model$hyper_dim)
+  if (!length(factor_set$factors)) {
+    return(matrix(numeric(0), nrow = nrow(theta), ncol = 0L))
+  }
+
+  eval_one <- function(factor) {
+    population_local_factor_log_marginal_many(
+      factor,
+      theta = theta,
+      include_constant = include_constant
+    )
+  }
+
+  parts <- if (as.integer(n_cores) <= 1L || length(factor_set$factors) <= 1L) {
+    lapply(factor_set$factors, eval_one)
+  } else {
+    parallel::mclapply(
+      factor_set$factors,
+      eval_one,
+      mc.cores = as.integer(min(n_cores, length(factor_set$factors)))
+    )
+  }
+  out <- do.call(cbind, parts)
+  colnames(out) <- names(factor_set$factors) %||% paste0("local_", seq_along(factor_set$factors))
   out
 }
 
