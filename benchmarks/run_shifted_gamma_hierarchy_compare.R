@@ -1,118 +1,33 @@
 rm(list = ls())
-file_arg <- grep("^--file=", commandArgs(trailingOnly = FALSE), value = TRUE)
-script_path <- if (length(file_arg)) {
-  normalizePath(sub("^--file=", "", file_arg[1L]))
-} else {
-  normalizePath("benchmarks/run_shifted_gamma_hierarchy_compare.R")
-}
-repo_dir <- dirname(dirname(script_path))
-setwd(repo_dir)
-
-parse_cli_args <- function(args) {
-  out <- list()
-  if (!length(args)) return(out)
-  for (arg in args) {
-    if (!startsWith(arg, "--")) next
-    arg <- sub("^--", "", arg)
-    parts <- strsplit(arg, "=", fixed = TRUE)[[1L]]
-    key <- gsub("-", "_", parts[1L])
-    value <- if (length(parts) > 1L) paste(parts[-1L], collapse = "=") else "true"
-    out[[key]] <- value
-  }
-  out
-}
-
-arg_chr <- function(args, key, default = NULL) {
-  val <- args[[key]]
-  if (is.null(val) || !nzchar(val)) default else as.character(val)
-}
-
-arg_int <- function(args, key, default) {
-  val <- args[[key]]
-  if (is.null(val) || !nzchar(val)) return(as.integer(default))
-  as.integer(val)
-}
-
-arg_lgl <- function(args, key, default = FALSE) {
-  val <- args[[key]]
-  if (is.null(val) || !nzchar(val)) return(isTRUE(default))
-  tolower(as.character(val)) %in% c("1", "true", "t", "yes", "y")
-}
-
-config_label_default <- function(method) {
-  method
-}
 
 suppressPackageStartupMessages({
   library(parallel)
 })
 
-set.seed(20260324L)
-
-cli_args <- parse_cli_args(commandArgs(trailingOnly = TRUE))
-
-method <- arg_chr(cli_args, "method", "static")
-if (!(method %in% c("static", "refresh_dmis", "certified"))) {
-  stop("method must be 'static', 'refresh_dmis', or 'certified'.")
+if (!file.exists("smc_core.R")) {
+  stop("Run this script from the FastHierarchical repository root.")
 }
-refresh_once <- identical(method, "refresh_dmis")
-certified <- identical(method, "certified")
-run_label <- arg_chr(cli_args, "label", NULL)
 
-stan_results_file <- file.path("benchmarks", "samples", "shifted_gamma_hierarchy_stan_results.rds")
-results_file <- arg_chr(cli_args, "results_file", file.path("benchmarks", "results", "shifted_gamma_hierarchy_current_results.rds"))
-plot_file <- arg_chr(cli_args, "plot_file", file.path("benchmarks", "results", "shifted_gamma_hierarchy_current_posteriors.png"))
+method <- "certified"
+if (!(method %in% c("static", "refresh", "certified"))) {
+  stop("method must be 'static', 'refresh', or 'certified'.")
+}
 
 detected_cores <- suppressWarnings(parallel::detectCores(logical = TRUE))
-if (!is.finite(detected_cores) || detected_cores < 1L) {
-  detected_cores <- 1L
-}
+if (!is.finite(detected_cores) || detected_cores < 1L) detected_cores <- 1L
 
-mc.cores <- as.integer(max(1L, min(arg_int(cli_args, "mc_cores", 4L), detected_cores)))
-pilot_size <- arg_int(cli_args, "pilot_size", 10L)
-pilot_particles <- arg_int(cli_args, "pilot_particles", 800L)
-full_particles <- arg_int(cli_args, "full_particles", 2000L)
-outer_particles <- arg_int(cli_args, "outer_particles", 2000L)
-outer_mcmc_moves <- arg_int(cli_args, "outer_mcmc_moves", 3L)
-outer_max_rounds <- arg_int(cli_args, "outer_max_rounds", 80L)
-certification_iterations <- arg_int(cli_args, "certification_iterations", 3L)
-certification_calibration_size <- arg_int(cli_args, "certification_calibration_size", 32L)
-certification_validation_size <- arg_int(cli_args, "certification_validation_size", 24L)
-certification_particles <- arg_int(cli_args, "certification_particles", full_particles)
-certification_enrichment_anchors <- arg_int(cli_args, "certification_enrichment_anchors", 4L)
-certification_estimator <- arg_chr(cli_args, "certification_estimator", "qmc")
-certification_quadrature_order <- arg_int(cli_args, "certification_quadrature_order", 7L)
-certification_qmc_size <- arg_int(cli_args, "certification_qmc_size", 8192L)
-certification_enrichment_particles <- arg_int(cli_args, "certification_enrichment_particles", min(certification_qmc_size, 2048L))
-certification_qmc_randomizations <- arg_int(cli_args, "certification_qmc_randomizations", 2L)
-certification_design_stress_pool_size <- arg_int(cli_args, "certification_design_stress_pool_size", 384L)
-certification_design_stress_scale <- as.numeric(arg_chr(cli_args, "certification_design_stress_scale", "2.5"))
-certification_design_stress_weight <- as.numeric(arg_chr(cli_args, "certification_design_stress_weight", "0.35"))
-certification_design_stress_log_drop <- as.numeric(arg_chr(cli_args, "certification_design_stress_log_drop", "30"))
-certification_validation_rmse_tol <- as.numeric(arg_chr(cli_args, "certification_validation_rmse_tol", "0.75"))
-certification_validation_median_abs_tol <- as.numeric(arg_chr(cli_args, "certification_validation_median_abs_tol", "0.50"))
-certification_require_validation <- arg_lgl(cli_args, "certification_require_validation", FALSE)
-base_seed <- arg_int(cli_args, "base_seed", 20260324L)
-verbose <- arg_lgl(cli_args, "verbose", TRUE)
+run_label <- method
+base_seed <- 20260324L
+cores <- as.integer(min(4L, detected_cores))
+verbose <- TRUE
 
-if (is.null(run_label)) {
-  if (length(commandArgs(trailingOnly = TRUE))) {
-    run_label <- config_label_default(method)
-  } else {
-    run_label <- "current"
-  }
-}
+stan_results_file <- file.path("benchmarks", "samples", "shifted_gamma_hierarchy_stan_results.rds")
+results_file <- file.path("benchmarks", "results", sprintf("shifted_gamma_%s_results.rds", run_label))
+plot_file <- file.path("benchmarks", "results", sprintf("shifted_gamma_%s_posteriors.png", run_label))
 
-if (is.null(cli_args[["results_file"]])) {
-  if (!identical(run_label, "current")) {
-    results_file <- file.path("benchmarks", "results", sprintf("shifted_gamma_%s_results.rds", run_label))
-  }
-}
-if (is.null(cli_args[["plot_file"]])) {
-  if (!identical(run_label, "current")) {
-    plot_file <- file.path("benchmarks", "results", sprintf("shifted_gamma_%s_posteriors.png", run_label))
-  }
-}
+local_control <- list()
+outer_control <- list()
+certification_control <- list()
 
 dir.create(file.path("benchmarks", "samples"), showWarnings = FALSE, recursive = TRUE)
 dir.create(file.path("benchmarks", "results"), showWarnings = FALSE, recursive = TRUE)
@@ -129,22 +44,17 @@ if (!file.exists(stan_results_file)) {
   stop("Missing Stan benchmark results: ", stan_results_file)
 }
 
+set.seed(base_seed)
 bundle <- readRDS(stan_results_file)
 
 y <- bundle$data$y
-m0 <- as.numeric(bundle$priors$m0)
-s0 <- as.numeric(bundle$priors$s0)
-a0 <- as.numeric(bundle$priors$a0)
-b0 <- as.numeric(bundle$priors$b0)
-
-alpha_names <- c("eta_shape", "eta_scale", "eta_shift")
-
 data_list <- lapply(seq_len(nrow(y)), function(i) y[i, ])
 
-names(m0) <- alpha_names
-names(s0) <- alpha_names
-names(a0) <- alpha_names
-names(b0) <- alpha_names
+alpha_names <- c("eta_shape", "eta_scale", "eta_shift")
+m0 <- stats::setNames(as.numeric(bundle$priors$m0), alpha_names)
+s0 <- stats::setNames(as.numeric(bundle$priors$s0), alpha_names)
+a0 <- stats::setNames(as.numeric(bundle$priors$a0), alpha_names)
+b0 <- stats::setNames(as.numeric(bundle$priors$b0), alpha_names)
 
 base_mu <- m0
 base_var <- s0 + b0 / (a0 - 1)
@@ -163,9 +73,7 @@ loglik_shifted_gamma <- function(Theta, y_i) {
 
   out <- rep(-1e12, nrow(Theta))
   ok <- shift < min_y
-  if (!any(ok)) {
-    return(out)
-  }
+  if (!any(ok)) return(out)
 
   for (i in which(ok)) {
     out[i] <- sum(stats::dgamma(y_i - shift[i], shape = shape[i], scale = scale[i], log = TRUE))
@@ -195,84 +103,61 @@ stan_draws <- data.frame(
 
 cat(sprintf("Loaded Stan benchmark bundle: %s\n", stan_results_file))
 cat(sprintf("Data: %d subjects x %d trials\n", nrow(y), ncol(y)))
-cat(sprintf("Configuration: label=%s | method=%s\n", run_label, method))
-cat("Running local-reference stage...\n")
+cat(sprintf("Run: label=%s | method=%s | cores=%d | seed=%d\n", run_label, method, cores, base_seed))
+cat("Running local reference stage...\n")
 
-stage <- prepare_reference_local_stage(
-  data_list = data_list,
-  loglik_fn = loglik_shifted_gamma,
-  base_mu = base_mu,
-  base_Sigma = base_Sigma,
-  population_model = population_model,
-  pilot_size = min(pilot_size, length(data_list)),
-  broad_scale = 1,
-  pilot_particles = pilot_particles,
-  full_particles = full_particles,
-  n_jobs = mc.cores,
-  base_seed = base_seed,
-  refresh_once = refresh_once,
-  verbose = verbose,
-  refresh_outer_control = list(
-    N = outer_particles,
-    n_mcmc_moves = outer_mcmc_moves,
-    max_rounds = outer_max_rounds
-  ),
-  pilot_smc_control = list(
-    max_rounds = 40L
+stage <- do.call(
+  prepare_reference_local_stage,
+  c(
+    list(
+      data_list = data_list,
+      loglik_fn = loglik_shifted_gamma,
+      base_mu = base_mu,
+      base_Sigma = base_Sigma,
+      population_model = population_model,
+      n_jobs = cores,
+      base_seed = base_seed,
+      refresh_once = identical(method, "refresh"),
+      refresh_outer_control = outer_control,
+      verbose = verbose
+    ),
+    local_control
   )
 )
 
-cat("Running outer population SMC...\n")
+cat("Running population stage...\n")
 
 fit <- stage$outer_fit
-if (certified) {
-  certified_result <- fit_certified_population_model(
-    data_list = data_list,
-    loglik_fn = loglik_shifted_gamma,
-    local_objects = stage$local_objects,
-    population_model = population_model,
-    outer_control = list(
-      N = outer_particles,
-      n_mcmc_moves = outer_mcmc_moves,
-      max_rounds = outer_max_rounds
-    ),
-    certification_control = list(
-      max_iterations = certification_iterations,
-      calibration_size = certification_calibration_size,
-      validation_size = certification_validation_size,
-      certification_estimator = certification_estimator,
-      particles = certification_particles,
-      enrichment_particles = certification_enrichment_particles,
-      enrichment_anchors = certification_enrichment_anchors,
-      quadrature_order = certification_quadrature_order,
-      qmc_size = certification_qmc_size,
-      qmc_randomizations = certification_qmc_randomizations,
-      local_n_cores = 1L,
-      design_stress_pool_size = certification_design_stress_pool_size,
-      design_stress_scale = certification_design_stress_scale,
-      design_stress_weight = certification_design_stress_weight,
-      design_stress_log_drop = certification_design_stress_log_drop,
-      validation_rmse_tol = certification_validation_rmse_tol,
-      validation_median_abs_tol = certification_validation_median_abs_tol,
-      require_validation = certification_require_validation,
-      smc_control = list(max_rounds = 80L, n_mcmc_moves = 3L, G_mix = 12L)
-    ),
-    n_cores = mc.cores,
-    seed = base_seed + 300000L,
-    verbose = verbose
+if (identical(method, "certified")) {
+  certified_result <- do.call(
+    fit_certified_population_model,
+    list(
+      data_list = data_list,
+      loglik_fn = loglik_shifted_gamma,
+      local_objects = stage$local_objects,
+      population_model = population_model,
+      outer_control = outer_control,
+      certification_control = certification_control,
+      n_cores = cores,
+      seed = base_seed + 300000L,
+      verbose = verbose
+    )
   )
   stage$certified <- certified_result
   fit <- certified_result$fit
 } else if (is.null(fit)) {
   factor_set <- build_population_factor_set(stage$local_objects, population_model)
-  fit <- outer_population_smc(
-    factor_set = factor_set,
-    N = outer_particles,
-    n_mcmc_moves = outer_mcmc_moves,
-    max_rounds = outer_max_rounds,
-    n_cores = mc.cores,
-    seed = base_seed,
-    verbose = verbose
+  fit <- do.call(
+    outer_population_smc,
+    c(
+      list(
+        factor_set = factor_set,
+        n_cores = cores,
+        seed = base_seed,
+        verbose = verbose
+      ),
+      outer_control
+    )
   )
 }
 
@@ -312,33 +197,11 @@ saveRDS(
     settings = list(
       label = run_label,
       method = method,
-      refresh_once = refresh_once,
-      certified = certified,
-      mc.cores = mc.cores,
-      pilot_size = min(pilot_size, length(data_list)),
-      pilot_particles = pilot_particles,
-      full_particles = full_particles,
-      outer_particles = outer_particles,
-      outer_mcmc_moves = outer_mcmc_moves,
-      outer_max_rounds = outer_max_rounds,
-      certification_iterations = certification_iterations,
-      certification_calibration_size = certification_calibration_size,
-      certification_validation_size = certification_validation_size,
-      certification_particles = certification_particles,
-      certification_enrichment_particles = certification_enrichment_particles,
-      certification_enrichment_anchors = certification_enrichment_anchors,
-      certification_estimator = certification_estimator,
-      certification_quadrature_order = certification_quadrature_order,
-      certification_qmc_size = certification_qmc_size,
-      certification_qmc_randomizations = certification_qmc_randomizations,
-      certification_design_stress_pool_size = certification_design_stress_pool_size,
-      certification_design_stress_scale = certification_design_stress_scale,
-      certification_design_stress_weight = certification_design_stress_weight,
-      certification_design_stress_log_drop = certification_design_stress_log_drop,
-      certification_validation_rmse_tol = certification_validation_rmse_tol,
-      certification_validation_median_abs_tol = certification_validation_median_abs_tol,
-      certification_require_validation = certification_require_validation,
-      base_seed = base_seed
+      cores = cores,
+      seed = base_seed,
+      local_control = local_control,
+      outer_control = outer_control,
+      certification_control = certification_control
     ),
     plot_file = plot_file
   ),
