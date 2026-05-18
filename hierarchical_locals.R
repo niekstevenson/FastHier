@@ -461,7 +461,8 @@ build_qmc_population_anchor_local_objects <- function(data_list,
                                                       seed = 123L,
                                                       n_jobs = 1L,
                                                       local_n_cores = 1L,
-                                                      label = "qmc_population_anchor") {
+                                                      label = "qmc_population_anchor",
+                                                      diagnostics = list()) {
   model <- normalize_population_model(population_model)
   theta <- .as_hyper_matrix(theta, hyper_names = model$hyper_names, hyper_dim = model$hyper_dim)
   if (nrow(theta) != 1L) stop("QMC anchor components require one theta row.")
@@ -509,6 +510,15 @@ build_qmc_population_anchor_local_objects <- function(data_list,
       ll_all <- unlist(ll_reps, use.names = FALSE)
       log_evidence <- logsumexp(ll_all) - log(length(ll_all))
       mcse <- if (length(logm_rep) > 1L) stats::sd(logm_rep) / sqrt(length(logm_rep)) else NA_real_
+      component_diagnostics <- modifyList(
+        list(
+          method = "qmc_population_anchor",
+          qmc_size = qmc_size,
+          qmc_randomizations = qmc_randomizations,
+          theta = stats::setNames(as.numeric(theta[1L, ]), model$hyper_names)
+        ),
+        diagnostics
+      )
       component <- list(
         label = as.character(label),
         particles = alpha_all,
@@ -519,11 +529,7 @@ build_qmc_population_anchor_local_objects <- function(data_list,
         mcse_log_evidence = as.numeric(mcse),
         reference_prior = reference_prior,
         log_reference_density = log_reference_density,
-        diagnostics = list(
-          method = "qmc_population_anchor",
-          qmc_size = qmc_size,
-          qmc_randomizations = qmc_randomizations
-        )
+        diagnostics = component_diagnostics
       )
       structure(
         list(
@@ -589,7 +595,11 @@ build_planned_anchor_local_objects <- function(data_list,
       seed = seed + 1000L * a,
       n_jobs = n_jobs,
       local_n_cores = local_n_cores,
-      label = sprintf("%s_%d", label, a)
+      label = sprintf("%s_%d", label, a),
+      diagnostics = list(
+        role = "planned_anchor",
+        anchor_rank = a
+      )
     )
     local_objects <- if (is.null(local_objects)) {
       anchor$local_objects
@@ -638,6 +648,254 @@ rebalance_local_reference_object_components <- function(local_object,
   }
   local_object$mixture_weights <- weights
   local_object
+}
+
+.reference_local_component_count <- function(local_object) {
+  if (.is_compressed_population_local_object(local_object)) {
+    return(as.integer(local_object$diagnostics$n_source_components %||% 1L))
+  }
+  length(validate_reference_local_object(local_object)$components)
+}
+
+.reference_local_particle_count <- function(local_object) {
+  if (.is_compressed_population_local_object(local_object)) {
+    return(as.integer(nrow(local_object$factor_particles)))
+  }
+  components <- validate_reference_local_object(local_object)$components
+  as.integer(sum(vapply(components, function(component) nrow(component$particles), integer(1))))
+}
+
+.reference_local_budget_summary <- function(local_objects) {
+  data.frame(
+    local = vapply(local_objects, function(x) as.integer(x$local_id %||% NA_integer_), integer(1)),
+    components = vapply(local_objects, .reference_local_component_count, integer(1)),
+    particles = vapply(local_objects, .reference_local_particle_count, integer(1)),
+    check.names = FALSE
+  )
+}
+
+.stratified_resample_n <- function(w, n, deterministic = TRUE) {
+  n <- as.integer(n)
+  if (n <= 0L) return(integer(0))
+  w <- normalize_reference_local_weights(w)
+  cw <- c(0, cumsum(w))
+  u0 <- if (isTRUE(deterministic)) 0.5 / n else stats::runif(1L) / n
+  u <- u0 + (0:(n - 1L)) / n
+  as.integer(findInterval(u, cw, rightmost.closed = TRUE))
+}
+
+.local_particle_order <- function(particles) {
+  particles <- as.matrix(particles)
+  if (nrow(particles) <= 1L) return(seq_len(nrow(particles)))
+  Z <- scale(particles)
+  Z[!is.finite(Z)] <- 0
+  order(rowSums(Z))
+}
+
+.reference_component_theta <- function(component, population_model) {
+  diagnostics <- component$diagnostics %||% list()
+  theta <- diagnostics$theta %||% diagnostics$anchor_theta
+  if (is.null(theta)) return(NULL)
+  theta <- as.numeric(theta)
+  model <- normalize_population_model(population_model)
+  if (length(theta) != model$hyper_dim || any(!is.finite(theta))) return(NULL)
+  names(theta) <- model$hyper_names
+  theta
+}
+
+.local_object_anchor_theta_design <- function(local_objects,
+                                              population_model,
+                                              extra_theta = NULL,
+                                              max_rows = 32L) {
+  model <- normalize_population_model(population_model)
+  rows <- list()
+  for (obj in local_objects) {
+    if (.is_compressed_population_local_object(obj) || is.null(obj$components)) next
+    components <- validate_reference_local_object(obj)$components
+    for (component in components) {
+      theta <- .reference_component_theta(component, model)
+      if (!is.null(theta)) rows[[length(rows) + 1L]] <- theta
+    }
+  }
+  if (!is.null(extra_theta)) {
+    extra_theta <- .as_hyper_matrix(extra_theta, hyper_names = model$hyper_names, hyper_dim = model$hyper_dim)
+    for (i in seq_len(nrow(extra_theta))) {
+      rows[[length(rows) + 1L]] <- extra_theta[i, ]
+    }
+  }
+  if (!length(rows)) stop("No theta design is available for local factor compression.")
+  theta <- unique(as.data.frame(do.call(rbind, rows), check.names = FALSE))
+  theta <- as.matrix(theta)
+  colnames(theta) <- model$hyper_names
+  max_rows <- as.integer(max(1L, max_rows))
+  if (nrow(theta) > max_rows) {
+    theta <- theta[seq_len(max_rows), , drop = FALSE]
+  }
+  theta
+}
+
+.compress_population_local_factor <- function(factor,
+                                              theta_design,
+                                              max_particles,
+                                              defensive_weight = 0.05) {
+  stopifnot(inherits(factor, "population_local_factor"))
+  n <- nrow(factor$particles)
+  max_particles <- as.integer(max_particles)
+  if (!is.finite(max_particles) || max_particles <= 0L || n <= max_particles) {
+    return(structure(list(
+      local_id = factor$local_id,
+      factor_particles = factor$particles,
+      factor_log_base = factor$log_base,
+      factor_log_constant = factor$log_constant,
+      diagnostics = list(
+        mode = "compressed_population_factor",
+        n_source_components = as.integer(length(unique(factor$component_id))),
+        compressed_from = as.integer(n),
+        compressed_to = as.integer(n),
+        compression_draws = as.integer(n)
+      )
+    ), class = "compressed_population_local_object"))
+  }
+
+  theta_design <- .as_hyper_matrix(
+    theta_design,
+    hyper_names = factor$population_model$hyper_names,
+    hyper_dim = factor$population_model$hyper_dim
+  )
+  ord <- .local_particle_order(factor$particles)
+  alpha <- factor$particles[ord, , drop = FALSE]
+  log_base <- as.numeric(factor$log_base[ord])
+
+  theta_prepared <- population_model_prepare_theta(factor$population_model, theta_design)
+  log_terms <- .population_log_alpha_given_theta_many(
+    model = factor$population_model,
+    alpha = alpha,
+    theta_prepared = theta_prepared
+  )
+  log_terms <- sweep(log_terms, 2L, log_base, "+")
+  log_norm <- apply(log_terms, 1L, logsumexp)
+  log_influence <- sweep(log_terms, 1L, log_norm, "-")
+  log_q_influence <- .rowLogSumExp(t(log_influence)) - log(nrow(log_influence))
+  log_q_base <- log_base - logsumexp(log_base)
+
+  defensive_weight <- pmin(pmax(as.numeric(defensive_weight), 0), 1)
+  log_q <- rlogsumexp2(
+    log1p(-defensive_weight) + log_q_influence,
+    log(defensive_weight) + log_q_base
+  )
+  q <- exp(log_q - logsumexp(log_q))
+  q[!is.finite(q)] <- 0
+  q <- pmax(q, .Machine$double.xmin)
+  q <- q / sum(q)
+
+  idx <- .stratified_resample_n(q, max_particles, deterministic = TRUE)
+  counts <- tabulate(idx, nbins = n)
+  keep <- which(counts > 0L)
+  compressed_log_base <- log_base[keep] + log(counts[keep]) - log(max_particles) - log(q[keep])
+
+  structure(list(
+    local_id = factor$local_id,
+    factor_particles = alpha[keep, , drop = FALSE],
+    factor_log_base = as.numeric(compressed_log_base),
+    factor_log_constant = factor$log_constant,
+    diagnostics = list(
+      mode = "compressed_population_factor",
+      n_source_components = as.integer(length(unique(factor$component_id))),
+      compressed_from = as.integer(n),
+      compressed_to = as.integer(length(keep)),
+      compression_draws = as.integer(max_particles),
+      compression_design_rows = as.integer(nrow(theta_design)),
+      compression_defensive_weight = as.numeric(defensive_weight)
+    )
+  ), class = "compressed_population_local_object")
+}
+
+compress_reference_local_objects_to_factors <- function(local_objects,
+                                                        population_model,
+                                                        theta_design,
+                                                        data_list = NULL,
+                                                        loglik_fn = NULL,
+                                                        local_ids = NULL,
+                                                        existing = NULL,
+                                                        max_particles = 5000L,
+                                                        defensive_weight = 0.05,
+                                                        local_n_cores = 1L) {
+  out <- existing %||% vector("list", length(local_objects))
+  names(out) <- names(local_objects)
+  object_ids <- vapply(local_objects, function(x) as.integer(x$local_id %||% NA_integer_), integer(1))
+  idx <- if (is.null(local_ids)) {
+    seq_along(local_objects)
+  } else {
+    match(sort(unique(as.integer(local_ids))), object_ids)
+  }
+  idx <- idx[!is.na(idx)]
+  local_names <- names(local_objects)
+  for (i in idx) {
+    factor <- build_population_local_factor(
+      local_objects[[i]],
+      population_model = population_model,
+      data_i = .data_for_local_object(local_objects[[i]], i, data_list, local_names),
+      loglik_fn = loglik_fn,
+      local_n_cores = local_n_cores
+    )
+    out[[i]] <- .compress_population_local_factor(
+      factor = factor,
+      theta_design = theta_design,
+      max_particles = max_particles,
+      defensive_weight = defensive_weight
+    )
+  }
+  out
+}
+
+budget_reference_local_object <- function(local_object,
+                                          max_components = Inf) {
+  local_object <- validate_reference_local_object(local_object)
+  components <- local_object$components
+  if (!length(components)) stop("local object must contain at least one component.")
+
+  priority <- vapply(seq_along(components), function(j) {
+    component <- components[[j]]
+    if (identical(component$proposal_type, "posterior_reference")) return(Inf)
+    diagnostics <- component$diagnostics %||% list()
+    if (identical(as.character(diagnostics$role %||% ""), "planned_anchor")) return(1e6 - j)
+    as.numeric(diagnostics$anchor_score %||% 0)
+  }, numeric(1))
+
+  if (!is.null(max_components) && is.finite(max_components) && length(components) > max_components) {
+    keep <- order(priority, decreasing = TRUE)[seq_len(as.integer(max_components))]
+    keep <- sort(keep)
+    components <- components[keep]
+  }
+
+  local_object$components <- components
+  local_object <- rebalance_local_reference_object_components(local_object)
+
+  local_object$diagnostics <- modifyList(
+    local_object$diagnostics %||% list(),
+    list(mode = "component_budget", n_components = length(components))
+  )
+  rebalance_local_reference_object_components(local_object)
+}
+
+budget_reference_local_objects <- function(local_objects,
+                                           max_components = Inf,
+                                           local_ids = NULL) {
+  out <- local_objects
+  object_ids <- vapply(out, function(x) as.integer(x$local_id %||% NA_integer_), integer(1))
+  idx <- if (is.null(local_ids)) {
+    seq_along(out)
+  } else {
+    match(sort(unique(as.integer(local_ids))), object_ids)
+  }
+  idx <- idx[!is.na(idx)]
+  for (i in idx) {
+    out[[i]] <- budget_reference_local_object(
+      out[[i]],
+      max_components = max_components
+    )
+  }
+  out
 }
 
 add_local_reference_components_dmis <- function(local_objects,
@@ -985,9 +1243,15 @@ fit_certified_population_model <- function(data_list,
       audit_local_size = NULL,
       qmc_size = 8192L,
       qmc_randomizations = 2L,
-      repair_anchors = 8L,
+      max_components_per_local = 10L,
+      max_particles_per_local = 5000L,
+      factor_compression_defensive_weight = 0.05,
+      factor_compression_design_size = 32L,
+      repair_anchors = NULL,
       repair_particles = NULL,
       repair_qmc_randomizations = NULL,
+      repair_theta_delta_coverage = 0.90,
+      repair_min_anchors = 1L,
       repair_local_delta_coverage = 0.90,
       repair_local_delta_min = 0.10,
       repair_local_ess_threshold = 50,
@@ -1005,13 +1269,28 @@ fit_certified_population_model <- function(data_list,
     certification_control
   )
 
-  local_objects_current <- local_objects
-  current_factor_set <- build_population_factor_set(
-    local_objects_current,
-    model,
+  proposal_objects_current <- budget_reference_local_objects(
+    local_objects,
+    max_components = control$max_components_per_local
+  )
+  compression_theta <- .local_object_anchor_theta_design(
+    proposal_objects_current,
+    population_model = model,
+    max_rows = control$factor_compression_design_size
+  )
+  local_objects_current <- compress_reference_local_objects_to_factors(
+    proposal_objects_current,
+    population_model = model,
+    theta_design = compression_theta,
     data_list = data_list,
     loglik_fn = loglik_fn,
+    max_particles = control$max_particles_per_local,
+    defensive_weight = control$factor_compression_defensive_weight,
     local_n_cores = control$local_n_cores
+  )
+  current_factor_set <- build_population_factor_set(
+    local_objects_current,
+    model
   )
   outer_args <- modifyList(
     list(
@@ -1031,8 +1310,8 @@ fit_certified_population_model <- function(data_list,
   history <- list()
   certification_bank <- NULL
   max_repairs <- as.integer(max(0L, control$max_repairs))
-  repair_particles <- as.integer(control$repair_particles %||% min(as.integer(control$qmc_size), 2048L))
   repair_qmc_randomizations <- as.integer(control$repair_qmc_randomizations %||% control$qmc_randomizations)
+  repair_particle_ceiling <- as.integer(control$repair_particles %||% min(as.integer(control$qmc_size), 2048L))
 
   choose_audit_locals <- function(iter) {
     if (!is.null(control$local_subset)) {
@@ -1103,6 +1382,54 @@ fit_certified_population_model <- function(data_list,
     )
   }
 
+  local_objects_for_ids <- function(local_objects_in, local_ids) {
+    local_ids <- sort(unique(as.integer(local_ids)))
+    object_ids <- vapply(local_objects_in, function(x) as.integer(x$local_id %||% NA_integer_), integer(1))
+    idx <- match(local_ids, object_ids)
+    idx <- idx[!is.na(idx)]
+    local_objects_in[idx]
+  }
+
+  repair_anchor_budget <- function(audited, local_objects_in) {
+    theta_score <- abs(audited$audit$total$delta)
+    if (all(!is.finite(theta_score)) || !any(theta_score > 0)) {
+      theta_score <- rep(1, length(theta_score))
+    }
+    ord <- order(theta_score, decreasing = TRUE)
+    target <- as.numeric(control$repair_theta_delta_coverage) * sum(theta_score[ord])
+    residual_need <- if (target > 0) {
+      which(cumsum(theta_score[ord]) >= target)[1L]
+    } else {
+      as.integer(control$repair_min_anchors)
+    }
+    residual_need <- max(as.integer(control$repair_min_anchors), residual_need %||% 1L)
+
+    component_capacity <- length(theta_score)
+    if (!is.null(control$max_components_per_local) && is.finite(control$max_components_per_local)) {
+      audited_objects <- local_objects_for_ids(local_objects_in, audited$audit_locals)
+      if (!length(audited_objects)) return(0L)
+      reserved_count <- vapply(audited_objects, function(obj) {
+        components <- validate_reference_local_object(obj)$components
+        as.integer(sum(vapply(components, function(component) {
+          diagnostics <- component$diagnostics %||% list()
+          identical(component$proposal_type, "posterior_reference") ||
+            identical(as.character(diagnostics$role %||% ""), "planned_anchor")
+        }, logical(1))))
+      }, integer(1))
+      component_capacity <- max(0L, min(as.integer(control$max_components_per_local) - reserved_count))
+    }
+    requested <- control$repair_anchors
+    if (!is.null(requested)) residual_need <- min(residual_need, as.integer(requested))
+    as.integer(max(0L, min(length(theta_score), residual_need, component_capacity)))
+  }
+
+  repair_particle_budget <- function(local_objects_in, changed_locals, n_anchors) {
+    if (!length(changed_locals) || n_anchors <= 0L) return(0L)
+    qmc_size <- repair_particle_ceiling
+    if (!is.finite(qmc_size) || qmc_size < 16L) return(0L)
+    as.integer(qmc_size)
+  }
+
   select_repair_plan <- function(certification, factor_set, max_anchors) {
     theta <- certification$theta
     total_delta <- certification$total$delta
@@ -1112,6 +1439,14 @@ fit_certified_population_model <- function(data_list,
     }
     Z <- tryCatch(.outer_whiten_theta(theta, w = rep(1 / nrow(theta), nrow(theta))), error = function(e) scale(theta))
     Z[!is.finite(Z)] <- 0
+    max_anchors <- as.integer(max(0L, min(max_anchors, length(score))))
+    if (max_anchors <= 0L) {
+      return(list(
+        anchors = data.frame(),
+        locals = data.frame()
+      ))
+    }
+
     first <- which.max(score)
     anchor_order <- first
     while (length(anchor_order) < min(length(score), as.integer(max_anchors))) {
@@ -1188,7 +1523,7 @@ fit_certified_population_model <- function(data_list,
     )
   }
 
-  repair_from_plan <- function(local_objects_in, theta, plan, iter) {
+  repair_from_plan <- function(local_objects_in, theta, plan, iter, qmc_size) {
     local_objects_out <- local_objects_in
     components_by_anchor <- vector("list", nrow(plan$anchors))
     for (a in seq_len(nrow(plan$anchors))) {
@@ -1201,12 +1536,19 @@ fit_certified_population_model <- function(data_list,
         population_model = model,
         theta = theta_anchor,
         local_ids = local_ids,
-        qmc_size = repair_particles,
+        qmc_size = qmc_size,
         qmc_randomizations = repair_qmc_randomizations,
         seed = seed + 60000L * iter + 1000L * a,
         n_jobs = n_cores,
         local_n_cores = control$local_n_cores,
-        label = sprintf("audit_repair%d_anchor%d", iter, a)
+        label = sprintf("audit_repair%d_anchor%d", iter, a),
+        diagnostics = list(
+          role = "audit_repair",
+          audit_iteration = iter,
+          theta_row = theta_row,
+          anchor_score = plan$anchors$score[a],
+          total_delta = plan$anchors$total_delta[a]
+        )
       )
       local_objects_out <- add_local_reference_components_dmis(
         local_objects_out,
@@ -1266,27 +1608,80 @@ fit_certified_population_model <- function(data_list,
     }
     if (iter >= max_repairs) break
 
+    max_repair_anchors <- repair_anchor_budget(
+      audited,
+      local_objects_in = proposal_objects_current
+    )
+    if (max_repair_anchors <= 0L) {
+      if (isTRUE(verbose)) {
+        cat(sprintf(
+          "Population audit %d: no repair capacity left under the local factor budget.\n",
+          iter
+        ))
+      }
+      break
+    }
+
     repair_plan <- select_repair_plan(
       audit,
       factor_set = current_factor_set,
-      max_anchors = control$repair_anchors
+      max_anchors = max_repair_anchors
     )
+    changed_locals <- sort(unique(repair_plan$locals$local))
+    repair_particles <- repair_particle_budget(
+      local_objects_current,
+      changed_locals = changed_locals,
+      n_anchors = nrow(repair_plan$anchors)
+    )
+    if (!nrow(repair_plan$anchors) || !length(changed_locals) || repair_particles <= 0L) {
+      if (isTRUE(verbose)) {
+        cat(sprintf(
+          "Population audit %d: repair skipped because the local factor particle budget is exhausted.\n",
+          iter
+        ))
+      }
+      break
+    }
     if (isTRUE(verbose)) {
       cat(sprintf(
-        "Population audit %d: repairing %d anchors and %d local factor shards.\n",
+        "Population audit %d: repairing %d anchors and %d local factor shards (%d QMC particles x %d randomizations each).\n",
         iter,
         nrow(repair_plan$anchors),
-        length(unique(repair_plan$locals$local))
+        length(changed_locals),
+        repair_particles,
+        repair_qmc_randomizations
       ))
     }
     repair <- repair_from_plan(
-      local_objects_in = local_objects_current,
+      local_objects_in = proposal_objects_current,
       theta = audit$theta,
       plan = repair_plan,
-      iter = iter + 1L
+      iter = iter + 1L,
+      qmc_size = repair_particles
     )
-    local_objects_current <- repair$local_objects
-    changed_locals <- sort(unique(repair_plan$locals$local))
+    proposal_objects_current <- budget_reference_local_objects(
+      repair$local_objects,
+      max_components = control$max_components_per_local,
+      local_ids = changed_locals
+    )
+    compression_theta <- .local_object_anchor_theta_design(
+      proposal_objects_current,
+      population_model = model,
+      extra_theta = audit$theta[repair_plan$anchors$theta_row, , drop = FALSE],
+      max_rows = control$factor_compression_design_size
+    )
+    local_objects_current <- compress_reference_local_objects_to_factors(
+      proposal_objects_current,
+      population_model = model,
+      theta_design = compression_theta,
+      data_list = data_list,
+      loglik_fn = loglik_fn,
+      local_ids = changed_locals,
+      existing = local_objects_current,
+      max_particles = control$max_particles_per_local,
+      defensive_weight = control$factor_compression_defensive_weight,
+      local_n_cores = control$local_n_cores
+    )
     old_factor_set <- current_factor_set
     current_factor_set <- update_population_factor_set_locals(
       factor_set = current_factor_set,
@@ -1346,6 +1741,49 @@ fit_certified_population_model <- function(data_list,
   )
 }
 
+compact_certified_population_result <- function(result) {
+  compact_repair <- function(repair) {
+    if (is.null(repair)) return(NULL)
+    list(
+      components = lapply(repair$components %||% list(), function(component) {
+        list(
+          theta_row = component$theta_row,
+          theta = component$theta,
+          local_ids = component$local_ids
+        )
+      })
+    )
+  }
+
+  compact_history <- lapply(result$history %||% list(), function(h) {
+    list(
+      iteration = h$iteration,
+      design = h$design,
+      audit = h$audit,
+      audit_locals = h$audit_locals,
+      validation_residual = h$validation_residual,
+      validation_summary = h$validation_summary,
+      repair_plan = h$repair_plan,
+      repair = compact_repair(h$repair)
+    )
+  })
+
+  list(
+    mode = result$mode,
+    status = result$status,
+    validated = result$validated,
+    selected_iteration = result$selected_iteration,
+    control = result$control,
+    local_objects = result$local_objects,
+    fit = result$fit,
+    base_fit = result$base_fit,
+    certification_bank = result$certification_bank,
+    history = compact_history,
+    factor_budget = .reference_local_budget_summary(result$local_objects),
+    base_factor_budget = .reference_local_budget_summary(result$history[[1L]]$local_objects)
+  )
+}
+
 prepare_reference_local_stage <- function(data_list,
                                           loglik_fn,
                                           base_mu,
@@ -1366,7 +1804,8 @@ prepare_reference_local_stage <- function(data_list,
                                           feature_fn = default_local_feature_vector,
                                           n_strata = NULL,
                                           pilot_reference_support_size = 8L,
-                                          planned_anchor_count = 4L,
+                                          max_components_per_local = 10L,
+                                          planned_anchor_count = NULL,
                                           planned_anchor_qmc_size = 2048L,
                                           planned_anchor_qmc_randomizations = 2L,
                                           pilot_outer_control = list(N = 1000L, n_mcmc_moves = 2L, max_rounds = 50L),
@@ -1429,6 +1868,17 @@ prepare_reference_local_stage <- function(data_list,
     support_seed = base_seed + 50001L
   )
 
+  if (is.null(planned_anchor_count)) {
+    planned_anchor_count <- if (!is.null(max_components_per_local) && is.finite(max_components_per_local)) {
+      min(4L, max(1L, floor(0.45 * (as.integer(max_components_per_local) - 1L))))
+    } else {
+      4L
+    }
+  }
+  planned_anchor_count <- as.integer(max(1L, planned_anchor_count))
+  planned_anchor_qmc_size <- as.integer(planned_anchor_qmc_size)
+  planned_anchor_qmc_size <- as.integer(max(16L, planned_anchor_qmc_size))
+
   planned_anchor_theta <- select_population_anchor_support(
     population_fit = pilot_population_fit,
     population_model = population_model,
@@ -1467,6 +1917,10 @@ prepare_reference_local_stage <- function(data_list,
   local_objects <- add_local_reference_components_dmis(
     build_local_reference_objects(local_fits, reference_prior = refined_reference),
     planned_anchor_library$local_objects
+  )
+  local_objects <- budget_reference_local_objects(
+    local_objects,
+    max_components = max_components_per_local
   )
 
   list(

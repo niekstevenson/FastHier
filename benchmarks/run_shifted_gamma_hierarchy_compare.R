@@ -134,7 +134,6 @@ certified_result <- do.call(
     verbose = verbose
   )
 )
-stage$certified <- certified_result
 fit <- certified_result$fit
 
 workflow_theta <- smc_posteriors(
@@ -163,11 +162,16 @@ plot_posteriors(
 )
 grDevices::dev.off()
 
+certified_compact <- compact_certified_population_result(certified_result)
+
 saveRDS(
   list(
     stan_source = stan_results_file,
-    stage = stage,
-    fit = fit,
+    certified = certified_compact,
+    stage = list(
+      pilot_indices = stage$pilot$selection$indices,
+      local_budget = .reference_local_budget_summary(stage$local_objects)
+    ),
     stan_draws = stan_draws,
     workflow_draws = workflow_draws,
     settings = list(

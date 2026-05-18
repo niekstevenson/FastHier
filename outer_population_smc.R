@@ -123,11 +123,55 @@ validate_reference_local_object <- function(local_object) {
   local_object
 }
 
+.is_compressed_population_local_object <- function(local_object) {
+  is.list(local_object) &&
+    !is.null(local_object$factor_particles) &&
+    !is.null(local_object$factor_log_base)
+}
+
+build_compressed_population_local_factor <- function(local_object,
+                                                     population_model) {
+  population_model <- normalize_population_model(population_model)
+  alpha <- as.matrix(local_object$factor_particles)
+  if (ncol(alpha) != population_model$alpha_dim) {
+    stop("Compressed local factor particle dimension does not match the population model.")
+  }
+  if (!is.null(colnames(alpha)) && setequal(colnames(alpha), population_model$alpha_names)) {
+    alpha <- alpha[, population_model$alpha_names, drop = FALSE]
+  } else {
+    colnames(alpha) <- population_model$alpha_names
+  }
+
+  log_base <- as.numeric(local_object$factor_log_base)
+  if (length(log_base) != nrow(alpha)) {
+    stop("Compressed local factor log_base must match the number of particles.")
+  }
+
+  structure(
+    list(
+      local_id = as.integer(local_object$local_id %||% NA_integer_),
+      population_model = population_model,
+      particles = alpha,
+      log_weights = rep(NA_real_, nrow(alpha)),
+      log_reference_density = rep(NA_real_, nrow(alpha)),
+      log_base = log_base,
+      log_constant = as.numeric(local_object$factor_log_constant %||% 0),
+      reference_prior = NULL,
+      component_id = rep.int(1L, nrow(alpha))
+    ),
+    class = "population_local_factor"
+  )
+}
+
 build_population_local_factor <- function(local_object,
                                           population_model,
                                           data_i = NULL,
                                           loglik_fn = NULL,
                                           local_n_cores = 1L) {
+  if (.is_compressed_population_local_object(local_object)) {
+    return(build_compressed_population_local_factor(local_object, population_model))
+  }
+
   local_object <- validate_reference_local_object(local_object)
   population_model <- normalize_population_model(population_model)
   components <- local_object$components
