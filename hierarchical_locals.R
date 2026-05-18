@@ -1,9 +1,10 @@
 #!/usr/bin/env Rscript
 # ============================================================================
 # Hierarchical local-reference workflow
-# - Broad pilot reference
-# - Population-informed refined defensive mixture
-# - Full local pass, optionally followed by exactly one DMIS refresh
+# - Broad pilot locals
+# - Pilot population fit
+# - One population-informed full local pass with planned anchor components
+# - Outer SMC with stratified audit and targeted factor repair
 # ============================================================================
 
 if (!exists("%||%", mode = "function") ||
@@ -433,85 +434,6 @@ build_local_reference_objects <- function(local_fits, reference_prior) {
   objs
 }
 
-.local_reference_object_components <- function(local_object) {
-  if (!is.null(local_object$components)) {
-    return(local_object$components)
-  }
-  list(
-    list(
-      label = "",
-      particles = as.matrix(local_object$particles),
-      weights = normalize_particle_weights(local_object$weights),
-      proposal_type = as.character(local_object$proposal_type %||% "posterior_reference"),
-      log_likelihood = as.numeric(local_object$log_likelihood %||% rep(NA_real_, nrow(local_object$particles))),
-      log_evidence = as.numeric(local_object$log_evidence %||% NA_real_),
-      mcse_log_evidence = as.numeric(local_object$mcse_log_evidence %||% NA_real_),
-      reference_prior = normalize_reference_prior(reference_prior = local_object$reference_prior),
-      log_reference_density = as.numeric(
-        local_object$log_reference_density %||%
-          reference_prior_logpdf(local_object$reference_prior, local_object$particles)
-      ),
-      diagnostics = local_object$diagnostics %||% list()
-    )
-  )
-}
-
-merge_local_reference_objects_dmis <- function(primary_objects,
-                                               secondary_objects,
-                                               mixture_weights = c(0.5, 0.5),
-                                               labels = c("initial", "refreshed")) {
-  if (!length(primary_objects) || !length(secondary_objects)) {
-    stop("Both primary_objects and secondary_objects must be non-empty.")
-  }
-  if (!identical(names(primary_objects), names(secondary_objects))) {
-    stop("primary_objects and secondary_objects must have identical names for DMIS merging.")
-  }
-  mixture_weights <- normalize_particle_weights(mixture_weights)
-  if (length(mixture_weights) != 2L) {
-    stop("mixture_weights must have length 2 for DMIS merging.")
-  }
-  labels <- rep_len(as.character(labels), 2L)
-
-  merged <- lapply(names(primary_objects), function(nm) {
-    primary_components <- .local_reference_object_components(primary_objects[[nm]])
-    secondary_components <- .local_reference_object_components(secondary_objects[[nm]])
-    components <- c(primary_components, secondary_components)
-
-    group_labels <- c(
-      rep.int(labels[1L], length(primary_components)),
-      rep.int(labels[2L], length(secondary_components))
-    )
-    if (length(components) > 1L) {
-      for (idx in seq_along(components)) {
-        components[[idx]]$label <- if (sum(group_labels == group_labels[idx]) > 1L) {
-          paste0(group_labels[idx], "_", idx)
-        } else {
-          group_labels[idx]
-        }
-      }
-    } else {
-      components[[1L]]$label <- labels[1L]
-    }
-
-    component_weights <- c(
-      rep(mixture_weights[1L] / length(primary_components), length(primary_components)),
-      rep(mixture_weights[2L] / length(secondary_components), length(secondary_components))
-    )
-
-    structure(
-      list(
-        local_id = as.integer(primary_objects[[nm]]$local_id %||% secondary_objects[[nm]]$local_id %||% NA_integer_),
-        components = components,
-        mixture_weights = component_weights,
-        diagnostics = list(mode = "dmis_merge")
-      ),
-      class = "reference_local_object"
-    )
-  })
-  names(merged) <- names(primary_objects)
-  merged
-}
-
 make_population_reference_prior_from_theta <- function(population_model,
                                                        theta,
                                                        label = "population_reference") {
@@ -624,6 +546,84 @@ build_qmc_population_anchor_local_objects <- function(data_list,
   )
 }
 
+select_population_anchor_support <- function(population_fit,
+                                             population_model,
+                                             n_anchors = 4L,
+                                             seed = 123L) {
+  model <- normalize_population_model(population_model)
+  theta <- .as_hyper_matrix(population_fit$theta, hyper_names = model$hyper_names, hyper_dim = model$hyper_dim)
+  w <- normalize_particle_weights(population_fit$w)
+  n_anchors <- as.integer(max(1L, min(n_anchors, nrow(theta))))
+  idx <- .certification_theta_design(theta = theta, w = w, size = n_anchors, seed = seed)
+  theta[idx, , drop = FALSE]
+}
+
+build_planned_anchor_local_objects <- function(data_list,
+                                               loglik_fn,
+                                               population_model,
+                                               anchor_theta,
+                                               local_ids = seq_along(data_list),
+                                               qmc_size = 2048L,
+                                               qmc_randomizations = 2L,
+                                               seed = 123L,
+                                               n_jobs = 1L,
+                                               local_n_cores = 1L,
+                                               label = "planned_anchor") {
+  local_ids <- sort(unique(as.integer(local_ids)))
+  local_ids <- local_ids[local_ids >= 1L & local_ids <= length(data_list)]
+  if (!length(local_ids)) stop("No valid locals selected for planned anchors.")
+  anchor_theta <- as.matrix(anchor_theta)
+  if (!nrow(anchor_theta)) stop("anchor_theta must contain at least one row.")
+
+  local_objects <- NULL
+  anchors <- vector("list", nrow(anchor_theta))
+  for (a in seq_len(nrow(anchor_theta))) {
+    anchor <- build_qmc_population_anchor_local_objects(
+      data_list = data_list,
+      loglik_fn = loglik_fn,
+      population_model = population_model,
+      theta = anchor_theta[a, , drop = FALSE],
+      local_ids = local_ids,
+      qmc_size = qmc_size,
+      qmc_randomizations = qmc_randomizations,
+      seed = seed + 1000L * a,
+      n_jobs = n_jobs,
+      local_n_cores = local_n_cores,
+      label = sprintf("%s_%d", label, a)
+    )
+    local_objects <- if (is.null(local_objects)) {
+      anchor$local_objects
+    } else {
+      add_local_reference_components_dmis(local_objects, anchor$local_objects)
+    }
+    anchors[[a]] <- anchor
+  }
+
+  list(
+    local_objects = local_objects,
+    anchors = anchors,
+    theta = anchor_theta,
+    local_ids = local_ids
+  )
+}
+
+.default_reference_component_weights <- function(components) {
+  proposal_types <- vapply(components, function(component) {
+    as.character(component$proposal_type %||% "posterior_reference")
+  }, character(1))
+  posterior <- proposal_types == "posterior_reference"
+  prior <- proposal_types == "prior_reference"
+  if (any(posterior) && any(prior)) {
+    # Posterior-reference SMC components carry local logZ error; calibrated QMC anchors should dominate the mixture density.
+    posterior_total <- 0.01
+    out <- numeric(length(components))
+    out[posterior] <- posterior_total / sum(posterior)
+    out[prior] <- (1 - posterior_total) / sum(prior)
+    return(out)
+  }
+  rep(1 / length(components), length(components))
+}
+
 rebalance_local_reference_object_components <- function(local_object,
                                                         component_weights = NULL) {
   if (!is.list(local_object) || is.null(local_object$components)) {
@@ -632,7 +632,7 @@ rebalance_local_reference_object_components <- function(local_object,
     local_object$components <- lapply(local_object$components, validate_reference_local_component)
   }
   n_components <- length(local_object$components)
-  weights <- normalize_particle_weights(component_weights %||% rep(1, n_components))
+  weights <- normalize_particle_weights(component_weights %||% .default_reference_component_weights(local_object$components))
   if (length(weights) != n_components) {
     stop("component_weights must match the number of local components.")
   }
@@ -662,15 +662,9 @@ add_local_reference_components_dmis <- function(local_objects,
 
     current <- validate_reference_local_object(out[[target_name]])
     current$components <- c(current$components, added$components)
-    component_types <- vapply(current$components, function(component) {
-      as.character(component$proposal_type %||% "posterior_reference")
-    }, character(1))
-    if (any(component_types == "prior_reference")) {
-      current$components <- current$components[component_types == "prior_reference"]
-    }
     current$diagnostics <- modifyList(
       current$diagnostics %||% list(),
-      list(mode = "adaptive_dmis", n_components = length(current$components))
+      list(mode = "component_merge", n_components = length(current$components))
     )
     out[[target_name]] <- rebalance_local_reference_object_components(
       current,
@@ -869,196 +863,6 @@ select_population_certification_points <- function(population_fit,
   )
 }
 
-run_local_marginal_certification <- function(data_list,
-                                             loglik_fn,
-                                             factor_set,
-                                             population_model,
-                                             theta,
-                                             particles = 4000L,
-                                             local_subset = NULL,
-                                             n_jobs = 1L,
-                                             local_n_cores = 1L,
-                                             base_seed = 123L,
-                                             smc_control = list(),
-                                             verbose = TRUE) {
-  model <- normalize_population_model(population_model)
-  theta <- .as_hyper_matrix(theta, hyper_names = model$hyper_names, hyper_dim = model$hyper_dim)
-  local_subset <- sort(unique(as.integer(local_subset %||% seq_along(data_list))))
-  local_subset <- local_subset[local_subset >= 1L & local_subset <= length(data_list)]
-  if (!length(local_subset)) stop("local_subset selected no valid locals.")
-
-  base_by_local <- population_factor_set_loglik_by_local(
-    factor_set,
-    theta = theta,
-    include_constant = TRUE,
-    n_cores = n_jobs
-  )
-
-  tasks <- expand.grid(
-    theta_row = seq_len(nrow(theta)),
-    local = local_subset,
-    KEEP.OUT.ATTRS = FALSE
-  )
-  tasks <- tasks[order(tasks$theta_row, tasks$local), , drop = FALSE]
-  particles <- as.integer(particles)
-  if (particles <= 1L) stop("particles must be greater than one.")
-
-  task_results <- parallel::mclapply(
-    seq_len(nrow(tasks)),
-    function(task_id) {
-      task <- tasks[task_id, , drop = FALSE]
-      theta_row <- theta[task$theta_row, , drop = FALSE]
-      reference_prior <- make_population_reference_prior_from_theta(
-        population_model = model,
-        theta = theta_row,
-        label = sprintf("cert_theta%d_local%d", task$theta_row, task$local)
-      )
-      fit_args <- modifyList(
-        list(
-          data = data_list[[task$local]],
-          loglik_fn = loglik_fn,
-          reference_prior = reference_prior,
-          M = particles,
-          n_cores = as.integer(local_n_cores),
-          seed = as.integer(base_seed + task_id - 1L),
-          verbose = verbose
-        ),
-        smc_control
-      )
-      fit <- do.call(enhanced_smc_elite, fit_args)
-      data.frame(
-        theta_row = as.integer(task$theta_row),
-        local = as.integer(task$local),
-        base_logm = as.numeric(base_by_local[task$theta_row, task$local]),
-        certified_logm = as.numeric(fit$log_evidence),
-        delta = as.numeric(fit$log_evidence - base_by_local[task$theta_row, task$local]),
-        certified_mcse = as.numeric(fit$mcse_logZ %||% NA_real_),
-        rounds = as.integer(fit$meta$rounds %||% NA_integer_),
-        final_lambda = as.numeric(fit$final_lambda %||% NA_real_),
-        check.names = FALSE
-      )
-    },
-    mc.cores = as.integer(max(1L, n_jobs))
-  )
-
-  summary <- do.call(rbind, task_results)
-  total <- do.call(rbind, lapply(seq_len(nrow(theta)), function(k) {
-    rows <- summary[summary$theta_row == k, , drop = FALSE]
-    data.frame(
-      theta_row = k,
-      base_loglik = sum(rows$base_logm),
-      certified_loglik = sum(rows$certified_logm),
-      delta = sum(rows$delta),
-      certified_mcse = sqrt(sum(rows$certified_mcse^2, na.rm = TRUE)),
-      n_locals = nrow(rows),
-      check.names = FALSE
-    )
-  }))
-
-  list(
-    theta = theta,
-    local = summary,
-    total = total
-  )
-}
-
-.gauss_hermite_rule_standard_normal <- function(order) {
-  order <- as.integer(order)
-  if (order < 2L) stop("Gauss-Hermite order must be at least two.")
-  J <- matrix(0, order, order)
-  off <- sqrt(seq_len(order - 1L) / 2)
-  J[cbind(seq_len(order - 1L), 2:order)] <- off
-  J[cbind(2:order, seq_len(order - 1L))] <- off
-  eig <- eigen(J, symmetric = TRUE)
-  ord <- order(eig$values)
-  nodes <- sqrt(2) * eig$values[ord]
-  weights <- (eig$vectors[1L, ord]^2)
-  weights <- weights / sum(weights)
-  list(nodes = as.numeric(nodes), weights = as.numeric(weights))
-}
-
-.standard_normal_tensor_grid <- function(dim, order) {
-  rule <- .gauss_hermite_rule_standard_normal(order)
-  grid_index <- expand.grid(rep(list(seq_along(rule$nodes)), dim))
-  z <- as.matrix(data.frame(lapply(grid_index, function(idx) rule$nodes[idx])))
-  logw <- rowSums(as.matrix(data.frame(lapply(grid_index, function(idx) log(rule$weights[idx])))))
-  colnames(z) <- paste0("z", seq_len(dim))
-  list(z = z, logw = as.numeric(logw))
-}
-
-run_local_marginal_quadrature_certification <- function(data_list,
-                                                        loglik_fn,
-                                                        factor_set,
-                                                        population_model,
-                                                        theta,
-                                                        order = 7L,
-                                                        local_subset = NULL,
-                                                        n_jobs = 1L,
-                                                        local_n_cores = 1L) {
-  model <- normalize_population_model(population_model)
-  theta <- .as_hyper_matrix(theta, hyper_names = model$hyper_names, hyper_dim = model$hyper_dim)
-  theta_prepared <- population_model_prepare_theta(model, theta)
-  if (!identical(theta_prepared$family, "gaussian") ||
-      !identical(theta_prepared$quadratic_kind, "diag")) {
-    stop("Gauss-Hermite certification requires a diagonal Gaussian population model.")
-  }
-  local_subset <- sort(unique(as.integer(local_subset %||% seq_along(data_list))))
-  local_subset <- local_subset[local_subset >= 1L & local_subset <= length(data_list)]
-  if (!length(local_subset)) stop("local_subset selected no valid locals.")
-
-  base_by_local <- population_factor_set_loglik_by_local(
-    factor_set,
-    theta = theta,
-    include_constant = TRUE,
-    n_cores = n_jobs
-  )
-
-  grid <- .standard_normal_tensor_grid(model$alpha_dim, order = order)
-  local_results <- parallel::mclapply(
-    local_subset,
-    function(local_id) {
-      rows <- vector("list", nrow(theta))
-      for (k in seq_len(nrow(theta))) {
-        sigma <- sqrt(1 / theta_prepared$quadratic_coef[k, ])
-        alpha <- sweep(grid$z, 2L, sigma, "*")
-        alpha <- sweep(alpha, 2L, theta_prepared$mean[k, ], "+")
-        colnames(alpha) <- model$alpha_names
-        ll <- ll_parallel(alpha, data_list[[local_id]], loglik_fn, n_cores = local_n_cores)
-        ll[!is.finite(ll)] <- -Inf
-        certified <- logsumexp(grid$logw + ll)
-        rows[[k]] <- data.frame(
-          theta_row = k,
-          local = as.integer(local_id),
-          base_logm = as.numeric(base_by_local[k, local_id]),
-          certified_logm = as.numeric(certified),
-          delta = as.numeric(certified - base_by_local[k, local_id]),
-          certified_mcse = 0,
-          rounds = NA_integer_,
-          final_lambda = 1,
-          check.names = FALSE
-        )
-      }
-      do.call(rbind, rows)
-    },
-    mc.cores = as.integer(max(1L, n_jobs))
-  )
-  summary <- do.call(rbind, local_results)
-  summary <- summary[order(summary$theta_row, summary$local), , drop = FALSE]
-  total <- do.call(rbind, lapply(seq_len(nrow(theta)), function(k) {
-    rows <- summary[summary$theta_row == k, , drop = FALSE]
-    data.frame(
-      theta_row = k,
-      base_loglik = sum(rows$base_logm),
-      certified_loglik = sum(rows$certified_logm),
-      delta = sum(rows$delta),
-      certified_mcse = 0,
-      n_locals = nrow(rows),
-      check.names = FALSE
-    )
-  }))
-  list(theta = theta, local = summary, total = total)
-}
-
 run_local_marginal_qmc_certification <- function(data_list,
                                                  loglik_fn,
                                                  factor_set,
@@ -1176,26 +980,20 @@ fit_certified_population_model <- function(data_list,
   model <- normalize_population_model(population_model)
   control <- modifyList(
     list(
-      max_iterations = 3L,
-      calibration_size = 32L,
-      validation_size = 24L,
-      certification_estimator = "qmc",
-      particles = 4000L,
-      enrichment_particles = NULL,
-      enrichment_qmc_randomizations = NULL,
-      enrichment_anchors = 4L,
-      enrichment_local_delta_coverage = 0.90,
-      enrichment_local_delta_min = 0.10,
-      enrichment_local_ess_threshold = 50,
-      enrichment_min_locals_per_anchor = 1L,
-      enrichment_max_locals_per_anchor = Inf,
-      enrich_all_locals = FALSE,
-      quadrature_order = 7L,
+      max_repairs = 1L,
+      audit_theta_size = 24L,
+      audit_local_size = NULL,
       qmc_size = 8192L,
       qmc_randomizations = 2L,
-      local_subset = NULL,
+      repair_anchors = 8L,
+      repair_particles = NULL,
+      repair_qmc_randomizations = NULL,
+      repair_local_delta_coverage = 0.90,
+      repair_local_delta_min = 0.10,
+      repair_local_ess_threshold = 50,
+      repair_min_locals_per_anchor = 1L,
+      repair_max_locals_per_anchor = Inf,
       local_n_cores = 1L,
-      smc_control = list(max_rounds = 80L, n_mcmc_moves = 3L, G_mix = 12L),
       design_stress_pool_size = 384L,
       design_stress_scale = 2.5,
       design_stress_weight = 0.35,
@@ -1208,7 +1006,7 @@ fit_certified_population_model <- function(data_list,
   )
 
   local_objects_current <- local_objects
-  base_factor_set <- build_population_factor_set(
+  current_factor_set <- build_population_factor_set(
     local_objects_current,
     model,
     data_list = data_list,
@@ -1217,7 +1015,7 @@ fit_certified_population_model <- function(data_list,
   )
   outer_args <- modifyList(
     list(
-      factor_set = base_factor_set,
+      factor_set = current_factor_set,
       N = 2000L,
       n_mcmc_moves = 3L,
       max_rounds = 80L,
@@ -1227,65 +1025,85 @@ fit_certified_population_model <- function(data_list,
     ),
     outer_control
   )
-  base_fit <- do.call(outer_population_smc, outer_args)
-  current_fit <- base_fit
-  current_factor_set <- base_factor_set
+  current_fit <- do.call(outer_population_smc, outer_args)
+  base_fit <- current_fit
+  base_factor_set <- current_factor_set
   history <- list()
   certification_bank <- NULL
-  max_iterations <- as.integer(max(1L, control$max_iterations))
-  enrichment_particles <- as.integer(control$enrichment_particles %||% min(as.integer(control$qmc_size), 2048L))
-  enrichment_qmc_randomizations <- as.integer(control$enrichment_qmc_randomizations %||% control$qmc_randomizations)
+  max_repairs <- as.integer(max(0L, control$max_repairs))
+  repair_particles <- as.integer(control$repair_particles %||% min(as.integer(control$qmc_size), 2048L))
+  repair_qmc_randomizations <- as.integer(control$repair_qmc_randomizations %||% control$qmc_randomizations)
 
-  certify_points <- function(theta, factor_set, seed_offset) {
-    estimator <- match.arg(
-      as.character(control$certification_estimator),
-      choices = c("qmc", "gh_quadrature", "smc")
-    )
-    if (identical(estimator, "qmc")) {
-      run_local_marginal_qmc_certification(
-        data_list = data_list,
-        loglik_fn = loglik_fn,
-        factor_set = factor_set,
-        population_model = model,
-        theta = theta,
-        qmc_size = control$qmc_size,
-        qmc_randomizations = control$qmc_randomizations,
-        local_subset = control$local_subset,
-        n_jobs = n_cores,
-        local_n_cores = control$local_n_cores,
-        seed = seed + seed_offset
-      )
-    } else if (identical(estimator, "gh_quadrature")) {
-      run_local_marginal_quadrature_certification(
-        data_list = data_list,
-        loglik_fn = loglik_fn,
-        factor_set = factor_set,
-        population_model = model,
-        theta = theta,
-        order = control$quadrature_order,
-        local_subset = control$local_subset,
-        n_jobs = n_cores,
-        local_n_cores = control$local_n_cores
-      )
+  choose_audit_locals <- function(iter) {
+    if (!is.null(control$local_subset)) {
+      out <- sort(unique(as.integer(control$local_subset)))
     } else {
-      run_local_marginal_certification(
-        data_list = data_list,
-        loglik_fn = loglik_fn,
-        factor_set = factor_set,
-        population_model = model,
-        theta = theta,
-        particles = control$particles,
-        local_subset = control$local_subset,
-        n_jobs = n_cores,
-        local_n_cores = control$local_n_cores,
-        base_seed = seed + seed_offset,
-        smc_control = control$smc_control,
-        verbose = verbose
-      )
+      audit_size <- control$audit_local_size %||% if (length(data_list) <= 64L) length(data_list) else 64L
+      audit_size <- as.integer(max(1L, min(audit_size, length(data_list))))
+      out <- if (audit_size >= length(data_list)) {
+        seq_along(data_list)
+      } else {
+        select_stratified_pilot_subset(
+          data_list = data_list,
+          pilot_size = audit_size,
+          seed = seed + 70000L + iter
+        )$indices
+      }
     }
+    out[out >= 1L & out <= length(data_list)]
   }
 
-  select_enrichment_plan <- function(certification, factor_set, max_anchors) {
+  audit_current_fit <- function(iter, factor_set, fit) {
+    audit_locals <- choose_audit_locals(iter)
+    design <- select_population_certification_design(
+      population_fit = fit,
+      factor_set = factor_set,
+      population_model = model,
+      size = control$audit_theta_size,
+      seed = seed + 10000L * (iter + 1L),
+      stress_pool_size = control$design_stress_pool_size,
+      stress_scale = control$design_stress_scale,
+      stress_weight = control$design_stress_weight,
+      stress_log_drop = control$design_stress_log_drop,
+      n_cores = n_cores
+    )
+    audit <- run_local_marginal_qmc_certification(
+      data_list = data_list,
+      loglik_fn = loglik_fn,
+      factor_set = factor_set,
+      population_model = model,
+      theta = design$theta,
+      qmc_size = control$qmc_size,
+      qmc_randomizations = control$qmc_randomizations,
+      local_subset = audit_locals,
+      n_jobs = n_cores,
+      local_n_cores = control$local_n_cores,
+      seed = seed + 20000L * (iter + 1L)
+    )
+    scale <- length(data_list) / length(audit_locals)
+    residual <- audit$total$delta * scale
+    local_residual <- audit$local$delta
+    summary <- data.frame(
+      iteration = iter,
+      audit_locals = length(audit_locals),
+      rmse = sqrt(mean(residual^2)),
+      median_abs = median(abs(residual)),
+      max_abs = max(abs(residual)),
+      mean = mean(residual),
+      local_rmse = sqrt(mean(local_residual^2)),
+      certified_mcse = sqrt(mean((audit$total$certified_mcse * scale)^2)),
+      check.names = FALSE
+    )
+    list(
+      design = design,
+      audit = audit,
+      audit_locals = audit_locals,
+      scaled_residual = residual,
+      validation_summary = summary
+    )
+  }
+
+  select_repair_plan <- function(certification, factor_set, max_anchors) {
     theta <- certification$theta
     total_delta <- certification$total$delta
     score <- abs(total_delta)
@@ -1315,36 +1133,31 @@ fit_certified_population_model <- function(data_list,
       local_ess <- population_factor_set_local_ess(factor_set, theta_one)
       local_ess <- local_ess[local_id]
 
-      if (isTRUE(control$enrich_all_locals)) {
-        selected_local <- local_id
-        reason <- rep("all", length(selected_local))
+      local_score <- abs(local_delta)
+      ord <- order(local_score, decreasing = TRUE)
+      total_abs <- sum(local_score)
+      max_locals <- if (is.finite(control$repair_max_locals_per_anchor)) {
+        as.integer(control$repair_max_locals_per_anchor)
       } else {
-        local_score <- abs(local_delta)
-        ord <- order(local_score, decreasing = TRUE)
-        total_abs <- sum(local_score)
-        max_locals <- if (is.finite(control$enrichment_max_locals_per_anchor)) {
-          as.integer(control$enrichment_max_locals_per_anchor)
-        } else {
-          length(ord)
-        }
-        cover_n <- if (total_abs > 0) {
-          which(cumsum(local_score[ord]) >= as.numeric(control$enrichment_local_delta_coverage) * total_abs)[1L]
-        } else {
-          as.integer(control$enrichment_min_locals_per_anchor)
-        }
-        cover_n <- max(as.integer(control$enrichment_min_locals_per_anchor), cover_n %||% 0L)
-        cover_n <- min(length(ord), cover_n, max_locals)
-        selected <- ord[seq_len(max(1L, cover_n))]
-        low_ess <- which(local_ess < as.numeric(control$enrichment_local_ess_threshold))
-        high_delta <- which(local_score >= as.numeric(control$enrichment_local_delta_min))
-        selected <- sort(unique(c(selected, low_ess, high_delta)))
-        if (is.finite(control$enrichment_max_locals_per_anchor)) {
-          selected <- selected[order(local_score[selected], decreasing = TRUE)]
-          selected <- selected[seq_len(min(length(selected), as.integer(control$enrichment_max_locals_per_anchor)))]
-        }
-        selected_local <- local_id[selected]
-        reason <- ifelse(local_ess[selected] < as.numeric(control$enrichment_local_ess_threshold), "low_ess", "delta")
+        length(ord)
       }
+      cover_n <- if (total_abs > 0) {
+        which(cumsum(local_score[ord]) >= as.numeric(control$repair_local_delta_coverage) * total_abs)[1L]
+      } else {
+        as.integer(control$repair_min_locals_per_anchor)
+      }
+      cover_n <- max(as.integer(control$repair_min_locals_per_anchor), cover_n %||% 0L)
+      cover_n <- min(length(ord), cover_n, max_locals)
+      selected <- ord[seq_len(max(1L, cover_n))]
+      low_ess <- which(local_ess < as.numeric(control$repair_local_ess_threshold))
+      high_delta <- which(local_score >= as.numeric(control$repair_local_delta_min))
+      selected <- sort(unique(c(selected, low_ess, high_delta)))
+      if (is.finite(control$repair_max_locals_per_anchor)) {
+        selected <- selected[order(local_score[selected], decreasing = TRUE)]
+        selected <- selected[seq_len(min(length(selected), as.integer(control$repair_max_locals_per_anchor)))]
+      }
+      selected_local <- local_id[selected]
+      reason <- ifelse(local_ess[selected] < as.numeric(control$repair_local_ess_threshold), "low_ess", "delta")
 
       anchor_rows[[a]] <- data.frame(
         anchor = a,
@@ -1375,7 +1188,7 @@ fit_certified_population_model <- function(data_list,
     )
   }
 
-  enrich_from_plan <- function(local_objects_in, theta, plan, iter) {
+  repair_from_plan <- function(local_objects_in, theta, plan, iter) {
     local_objects_out <- local_objects_in
     components_by_anchor <- vector("list", nrow(plan$anchors))
     for (a in seq_len(nrow(plan$anchors))) {
@@ -1388,12 +1201,12 @@ fit_certified_population_model <- function(data_list,
         population_model = model,
         theta = theta_anchor,
         local_ids = local_ids,
-        qmc_size = enrichment_particles,
-        qmc_randomizations = enrichment_qmc_randomizations,
+        qmc_size = repair_particles,
+        qmc_randomizations = repair_qmc_randomizations,
         seed = seed + 60000L * iter + 1000L * a,
         n_jobs = n_cores,
         local_n_cores = control$local_n_cores,
-        label = sprintf("adaptive_iter%d_anchor%d", iter, a)
+        label = sprintf("audit_repair%d_anchor%d", iter, a)
       )
       local_objects_out <- add_local_reference_components_dmis(
         local_objects_out,
@@ -1413,142 +1226,87 @@ fit_certified_population_model <- function(data_list,
   selected_iteration <- NA_integer_
   validated <- FALSE
 
-  for (iter in seq_len(max_iterations)) {
-    design <- select_population_certification_design(
-      population_fit = current_fit,
-      factor_set = current_factor_set,
-      population_model = model,
-      size = control$calibration_size,
-      seed = seed + 10000L * iter,
-      stress_pool_size = control$design_stress_pool_size,
-      stress_scale = control$design_stress_scale,
-      stress_weight = control$design_stress_weight,
-      stress_log_drop = control$design_stress_log_drop,
-      n_cores = n_cores
-    )
+  for (iter in seq.int(0L, max_repairs)) {
+    audited <- audit_current_fit(iter, current_factor_set, current_fit)
+    audit <- audited$audit
+    validation_summary <- audited$validation_summary
     if (isTRUE(verbose)) {
       cat(sprintf(
-        "Adaptive DMIS iteration %d: certifying %d theta points across %d locals.\n",
-        iter,
-        nrow(design$theta),
-        length(control$local_subset %||% data_list)
-      ))
-    }
-    calibration <- certify_points(
-      design$theta,
-      factor_set = current_factor_set,
-      seed_offset = 20000L * iter
-    )
-    certification_bank <- .append_certification_bank(
-      certification_bank,
-      calibration,
-      weights = design$source_weights
-    )
-    enrichment_plan <- select_enrichment_plan(
-      calibration,
-      factor_set = current_factor_set,
-      max_anchors = control$enrichment_anchors
-    )
-    if (isTRUE(verbose)) {
-      cat(sprintf(
-        "Adaptive DMIS iteration %d: enriching %d anchors and %d local components.\n",
-        iter,
-        nrow(enrichment_plan$anchors),
-        nrow(enrichment_plan$locals)
-      ))
-    }
-    enrichment <- enrich_from_plan(
-      local_objects_in = local_objects_current,
-      theta = calibration$theta,
-      plan = enrichment_plan,
-      iter = iter
-    )
-    local_objects_current <- enrichment$local_objects
-    current_factor_set <- build_population_factor_set(
-      local_objects_current,
-      model,
-      data_list = data_list,
-      loglik_fn = loglik_fn,
-      local_n_cores = control$local_n_cores
-    )
-    fit_args <- modifyList(
-      list(
-        factor_set = current_factor_set,
-        N = 2000L,
-        n_mcmc_moves = 3L,
-        max_rounds = 80L,
-        n_cores = as.integer(n_cores),
-        seed = as.integer(seed + 30000L * iter),
-        verbose = verbose
-      ),
-      outer_control
-    )
-    current_fit <- do.call(outer_population_smc, fit_args)
-
-    validation_design <- select_population_certification_design(
-      population_fit = current_fit,
-      factor_set = current_factor_set,
-      population_model = model,
-      size = control$validation_size,
-      seed = seed + 40000L * iter,
-      stress_pool_size = max(control$validation_size * 8L, control$design_stress_pool_size %/% 2L),
-      stress_scale = control$design_stress_scale,
-      stress_weight = control$design_stress_weight,
-      stress_log_drop = control$design_stress_log_drop,
-      n_cores = n_cores
-    )
-    validation <- certify_points(
-      validation_design$theta,
-      factor_set = current_factor_set,
-      seed_offset = 50000L * iter
-    )
-    residual <- validation$total$delta
-    validation_summary <- data.frame(
-      iteration = iter,
-      rmse = sqrt(mean(residual^2)),
-      median_abs = median(abs(residual)),
-      max_abs = max(abs(residual)),
-      mean = mean(residual),
-      certified_mcse = sqrt(mean(validation$total$certified_mcse^2)),
-      check.names = FALSE
-    )
-    if (isTRUE(verbose)) {
-      cat(sprintf(
-        "Adaptive DMIS validation %d: rmse=%.3f median_abs=%.3f max_abs=%.3f\n",
+        "Population audit %d: rmse=%.3f median_abs=%.3f max_abs=%.3f across %d locals.\n",
         iter,
         validation_summary$rmse,
         validation_summary$median_abs,
-        validation_summary$max_abs
+        validation_summary$max_abs,
+        validation_summary$audit_locals
       ))
     }
 
-    history[[iter]] <- list(
+    history[[iter + 1L]] <- list(
       iteration = iter,
-      design = design,
-      calibration = calibration,
-      enrichment_plan = enrichment_plan,
-      enrichment = enrichment,
+      design = audited$design,
+      audit = audit,
+      audit_locals = audited$audit_locals,
       local_objects = local_objects_current,
       factor_set = current_factor_set,
       fit = current_fit,
-      validation_design = validation_design,
-      validation = validation,
-      validation_residual = residual,
+      validation_residual = audited$scaled_residual,
       validation_summary = validation_summary
     )
-
     certification_bank <- .append_certification_bank(
       certification_bank,
-      validation,
-      weights = validation_design$source_weights
+      audit,
+      weights = audited$design$source_weights
     )
     passed <- validation_summary$rmse <= control$validation_rmse_tol &&
       validation_summary$median_abs <= control$validation_median_abs_tol
     if (passed) {
-      selected_iteration <- iter
+      selected_iteration <- iter + 1L
       validated <- TRUE
       break
     }
+    if (iter >= max_repairs) break
+
+    repair_plan <- select_repair_plan(
+      audit,
+      factor_set = current_factor_set,
+      max_anchors = control$repair_anchors
+    )
+    if (isTRUE(verbose)) {
+      cat(sprintf(
+        "Population audit %d: repairing %d anchors and %d local factor shards.\n",
+        iter,
+        nrow(repair_plan$anchors),
+        length(unique(repair_plan$locals$local))
+      ))
+    }
+    repair <- repair_from_plan(
+      local_objects_in = local_objects_current,
+      theta = audit$theta,
+      plan = repair_plan,
+      iter = iter + 1L
+    )
+    local_objects_current <- repair$local_objects
+    changed_locals <- sort(unique(repair_plan$locals$local))
+    old_factor_set <- current_factor_set
+    current_factor_set <- update_population_factor_set_locals(
+      factor_set = current_factor_set,
+      local_objects = local_objects_current,
+      local_ids = changed_locals,
+      data_list = data_list,
+      loglik_fn = loglik_fn,
+      local_n_cores = control$local_n_cores
+    )
+    current_fit <- update_outer_population_fit(
+      fit = current_fit,
+      old_factor_set = old_factor_set,
+      new_factor_set = current_factor_set,
+      n_mcmc_moves = outer_control$n_mcmc_moves %||% 3L,
+      n_cores = n_cores,
+      seed = seed + 30000L * (iter + 1L),
+      verbose = verbose
+    )
+    history[[iter + 1L]]$repair_plan <- repair_plan
+    history[[iter + 1L]]$repair <- repair
   }
 
   validation_scores <- vapply(history, function(h) {
@@ -1573,7 +1331,7 @@ fit_certified_population_model <- function(data_list,
   }
 
   list(
-    mode = "adaptive_dmis",
+    mode = "planned_anchor_audit",
     base_factor_set = base_factor_set,
     factor_set = current_factor_set,
     local_objects = local_objects_current,
@@ -1588,23 +1346,11 @@ fit_certified_population_model <- function(data_list,
   )
 }
 
-.resolve_population_model <- function(population_model, pilot_population_model) {
-  if (!is.null(population_model) && !is.null(pilot_population_model) && !identical(population_model, pilot_population_model)) {
-    stop("Pass only population_model. pilot_population_model is kept as a compatibility alias.")
-  }
-  model <- population_model %||% pilot_population_model
-  if (is.null(model)) {
-    stop("prepare_reference_local_stage now requires population_model; pooled local-moment refinement was removed.")
-  }
-  normalize_population_model(model)
-}
-
 prepare_reference_local_stage <- function(data_list,
                                           loglik_fn,
                                           base_mu,
                                           base_Sigma,
-                                          population_model = NULL,
-                                          pilot_population_model = NULL,
+                                          population_model,
                                           pilot_size = 10L,
                                           broad_scale = 1,
                                           broad_defensive = FALSE,
@@ -1620,14 +1366,14 @@ prepare_reference_local_stage <- function(data_list,
                                           feature_fn = default_local_feature_vector,
                                           n_strata = NULL,
                                           pilot_reference_support_size = 8L,
+                                          planned_anchor_count = 4L,
+                                          planned_anchor_qmc_size = 2048L,
+                                          planned_anchor_qmc_randomizations = 2L,
                                           pilot_outer_control = list(N = 1000L, n_mcmc_moves = 2L, max_rounds = 50L),
-                                          refresh_once = FALSE,
-                                          refresh_outer_control = list(),
                                           verbose = TRUE,
                                           pilot_smc_control = list(max_rounds = 40L),
                                           full_smc_control = list()) {
-  population_model <- .resolve_population_model(population_model, pilot_population_model)
-  refresh_once <- isTRUE(refresh_once)
+  population_model <- normalize_population_model(population_model)
 
   broad_reference <- make_broad_reference_prior(
     mu = base_mu,
@@ -1683,89 +1429,45 @@ prepare_reference_local_stage <- function(data_list,
     support_seed = base_seed + 50001L
   )
 
-  run_full_local_pass <- function(reference_prior, seed_offset) {
-    full_args <- modifyList(
-      list(
-        data_list = data_list,
-        loglik_fn = loglik_fn,
-        reference_prior = reference_prior,
-        indices = seq_along(data_list),
-        M = full_particles,
-        n_jobs = n_jobs,
-        local_n_cores = full_local_n_cores,
-        base_seed = base_seed + as.integer(seed_offset),
-        verbose = verbose
-      ),
-      full_smc_control
-    )
-    local_fits <- do.call(run_reference_local_smc, full_args)
-    list(
-      local_fits = local_fits,
-      local_objects = build_local_reference_objects(local_fits, reference_prior = reference_prior)
-    )
-  }
-
-  full_pass <- run_full_local_pass(
-    reference_prior = refined_reference,
-    seed_offset = 100000L
+  planned_anchor_theta <- select_population_anchor_support(
+    population_fit = pilot_population_fit,
+    population_model = population_model,
+    n_anchors = planned_anchor_count,
+    seed = base_seed + 50002L
   )
-  local_fits <- full_pass$local_fits
-  local_objects <- full_pass$local_objects
-  outer_fit <- NULL
-  pre_refresh <- NULL
-  refresh_merge_method <- NULL
+  planned_anchor_library <- build_planned_anchor_local_objects(
+    data_list = data_list,
+    loglik_fn = loglik_fn,
+    population_model = population_model,
+    anchor_theta = planned_anchor_theta,
+    local_ids = seq_along(data_list),
+    qmc_size = planned_anchor_qmc_size,
+    qmc_randomizations = planned_anchor_qmc_randomizations,
+    seed = base_seed + 60000L,
+    n_jobs = n_jobs,
+    local_n_cores = full_local_n_cores,
+    label = "planned_population_anchor"
+  )
 
-  if (refresh_once) {
-    initial_outer_fit <- fit_population_model_from_local_objects(
-      local_objects = local_objects,
-      population_model = population_model,
-      outer_control = refresh_outer_control,
-      n_cores = n_jobs,
-      seed = base_seed + 150000L,
+  full_args <- modifyList(
+    list(
+      data_list = data_list,
+      loglik_fn = loglik_fn,
+      reference_prior = refined_reference,
+      indices = seq_along(data_list),
+      M = full_particles,
+      n_jobs = n_jobs,
+      local_n_cores = full_local_n_cores,
+      base_seed = base_seed + 100000L,
       verbose = verbose
-    )
-
-    refreshed_reference <- build_refined_reference_prior_from_population_fit(
-      population_fit = initial_outer_fit,
-      population_model = population_model,
-      inflation = inflation,
-      defensive_weight = defensive_weight,
-      broad_reference = broad_reference,
-      defensive_scale = defensive_scale,
-      support_size = pilot_reference_support_size,
-      support_seed = base_seed + 150001L
-    )
-
-    pre_refresh <- list(
-      refined_reference = refined_reference,
-      local_fits = local_fits,
-      local_objects = local_objects,
-      outer_fit = initial_outer_fit
-    )
-
-    refreshed_pass <- run_full_local_pass(
-      reference_prior = refreshed_reference,
-      seed_offset = 200000L
-    )
-    refined_reference <- refreshed_reference
-    local_fits <- refreshed_pass$local_fits
-    local_objects <- merge_local_reference_objects_dmis(
-      primary_objects = pre_refresh$local_objects,
-      secondary_objects = refreshed_pass$local_objects,
-      mixture_weights = c(0.5, 0.5),
-      labels = c("initial", "refreshed")
-    )
-    refresh_merge_method <- "dmis"
-
-    outer_fit <- fit_population_model_from_local_objects(
-      local_objects = local_objects,
-      population_model = population_model,
-      outer_control = refresh_outer_control,
-      n_cores = n_jobs,
-      seed = base_seed + 250000L,
-      verbose = verbose
-    )
-  }
+    ),
+    full_smc_control
+  )
+  local_fits <- do.call(run_reference_local_smc, full_args)
+  local_objects <- add_local_reference_components_dmis(
+    build_local_reference_objects(local_fits, reference_prior = refined_reference),
+    planned_anchor_library$local_objects
+  )
 
   list(
     broad_reference = broad_reference,
@@ -1777,10 +1479,9 @@ prepare_reference_local_stage <- function(data_list,
       refinement_source = "pilot_population_fit"
     ),
     refined_reference = refined_reference,
+    planned_anchor_library = planned_anchor_library,
     local_fits = local_fits,
     local_objects = local_objects,
-    outer_fit = outer_fit,
-    pre_refresh = pre_refresh,
-    refresh_merge_method = refresh_merge_method
+    outer_fit = NULL
   )
 }

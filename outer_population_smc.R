@@ -146,15 +146,8 @@ build_population_local_factor <- function(local_object,
   }
 
   proposal_types <- vapply(components, `[[`, character(1), "proposal_type")
-  if (any(proposal_types == "prior_reference")) {
-    keep <- proposal_types == "prior_reference"
-    components <- components[keep]
-    local_object$mixture_weights <- normalize_reference_local_weights(local_object$mixture_weights[keep])
-    proposal_types <- proposal_types[keep]
-  }
-  use_proposal_dmis <- any(proposal_types == "prior_reference")
 
-  if (!use_proposal_dmis && length(components) == 1L) {
+  if (length(components) == 1L && identical(proposal_types, "posterior_reference")) {
     component <- components[[1L]]
     alpha <- align_alpha(component$particles)
     log_weights <- log(component$weights)
@@ -165,40 +158,6 @@ build_population_local_factor <- function(local_object,
     log_constant <- as.numeric(component$log_evidence %||% 0)
     component_id <- rep.int(1L, nrow(alpha))
     reference_prior <- component$reference_prior
-  } else if (!use_proposal_dmis) {
-    eta <- normalize_reference_local_weights(local_object$mixture_weights)
-    log_eta <- ifelse(eta > 0, log(eta), -Inf)
-    alpha_list <- lapply(components, function(component) align_alpha(component$particles))
-    alpha <- do.call(rbind, alpha_list)
-    component_lengths <- vapply(alpha_list, nrow, integer(1))
-    component_id <- rep.int(seq_along(alpha_list), component_lengths)
-
-    log_weights <- unlist(
-      Map(function(component, eta_r) log(component$weights) + eta_r, components, as.list(log_eta)),
-      use.names = FALSE
-    )
-
-    component_logZ <- vapply(components, function(component) {
-      as.numeric(component$log_evidence %||% NA_real_)
-    }, numeric(1))
-    if (any(!is.finite(component_logZ))) {
-      stop("DMIS local factors require finite log_evidence for every component.")
-    }
-
-    logq_mat <- vapply(
-      components,
-      function(component) as.numeric(reference_prior_logpdf(component$reference_prior, alpha)),
-      numeric(nrow(alpha))
-    )
-    if (!is.matrix(logq_mat)) {
-      logq_mat <- matrix(logq_mat, ncol = length(components))
-    }
-
-    log_denom <- .rowLogSumExp(sweep(logq_mat, 2L, log_eta - component_logZ, "+"))
-    log_base <- log_weights - log_denom
-    log_constant <- 0
-    log_reference_density <- rep(NA_real_, nrow(alpha))
-    reference_prior <- NULL
   } else {
     eta <- normalize_reference_local_weights(local_object$mixture_weights)
     log_eta <- ifelse(eta > 0, log(eta), -Inf)
@@ -210,7 +169,7 @@ build_population_local_factor <- function(local_object,
     cached_loglik <- unlist(lapply(components, `[[`, "log_likelihood"), use.names = FALSE)
     if (length(cached_loglik) != nrow(alpha) || anyNA(cached_loglik)) {
       if (is.null(data_i) || is.null(loglik_fn)) {
-        stop("Proposal-density DMIS local factors require data_i and loglik_fn unless every component stores log_likelihood.")
+        stop("Multi-component local factors require data_i and loglik_fn unless every component stores log_likelihood.")
       }
       cached_loglik <- ll_parallel(
         alpha,
@@ -222,18 +181,42 @@ build_population_local_factor <- function(local_object,
     log_likelihood <- as.numeric(cached_loglik)
     log_likelihood[is.na(log_likelihood)] <- -Inf
 
-    logh_mat <- vapply(seq_along(components), function(j) {
+    logq_mat <- vapply(seq_along(components), function(j) {
       component <- components[[j]]
       as.numeric(reference_prior_logpdf(component$reference_prior, alpha))
     }, numeric(nrow(alpha)))
-    if (!is.matrix(logh_mat)) {
-      logh_mat <- matrix(logh_mat, ncol = length(components))
+    if (!is.matrix(logq_mat)) {
+      logq_mat <- matrix(logq_mat, ncol = length(components))
     }
 
+    component_logZ <- vapply(components, function(component) {
+      as.numeric(component$log_evidence %||% NA_real_)
+    }, numeric(1))
+    needs_logZ <- proposal_types == "posterior_reference"
+    if (any(needs_logZ & !is.finite(component_logZ))) {
+      stop("Posterior-reference DMIS components require finite log_evidence.")
+    }
+
+    logh_mat <- logq_mat
+    if (any(needs_logZ)) {
+      logh_mat[, needs_logZ] <- sweep(
+        logh_mat[, needs_logZ, drop = FALSE],
+        1L,
+        log_likelihood,
+        "+"
+      )
+      logh_mat[, needs_logZ] <- sweep(
+        logh_mat[, needs_logZ, drop = FALSE],
+        2L,
+        component_logZ[needs_logZ],
+        "-"
+      )
+    }
     log_hmix <- .rowLogSumExp(sweep(logh_mat, 2L, log_eta, "+"))
     log_sample_weights <- unlist(lapply(components, function(component) log(component$weights)), use.names = FALSE)
     log_weights <- log_sample_weights + log_eta[component_id]
     log_base <- log_weights + log_likelihood - log_hmix
+    log_base[!is.finite(log_base)] <- -Inf
     log_constant <- 0
     log_reference_density <- rep(NA_real_, nrow(alpha))
     reference_prior <- NULL
@@ -400,38 +383,10 @@ population_local_factor_tail_diagnostic <- function(factor, theta, use_psis = TR
   )
 }
 
-build_population_factor_set <- function(local_objects,
-                                        population_model,
-                                        particle_block_size = 1024L,
-                                        data_list = NULL,
-                                        loglik_fn = NULL,
-                                        local_n_cores = 1L) {
+.population_factor_set_from_factors <- function(factors,
+                                                population_model,
+                                                particle_block_size = 1024L) {
   population_model <- normalize_population_model(population_model)
-  local_names <- names(local_objects)
-  data_for_local <- function(local_object, pos) {
-    if (is.null(data_list)) return(NULL)
-    if (!is.null(local_names) &&
-        !is.na(local_names[pos]) &&
-        nzchar(local_names[pos]) &&
-        local_names[pos] %in% names(data_list)) {
-      return(data_list[[local_names[pos]]])
-    }
-    local_id <- as.integer(local_object$local_id %||% pos)
-    if (is.finite(local_id) && local_id >= 1L && local_id <= length(data_list)) {
-      return(data_list[[local_id]])
-    }
-    data_list[[pos]]
-  }
-  factors <- lapply(seq_along(local_objects), function(i) {
-    build_population_local_factor(
-      local_objects[[i]],
-      population_model = population_model,
-      data_i = data_for_local(local_objects[[i]], i),
-      loglik_fn = loglik_fn,
-      local_n_cores = local_n_cores
-    )
-  })
-  names(factors) <- names(local_objects)
   particle_block_size <- as.integer(max(1L, particle_block_size))
 
   if (length(factors)) {
@@ -475,6 +430,76 @@ build_population_factor_set <- function(local_objects,
       )
     ),
     class = "population_factor_set"
+  )
+}
+
+.data_for_local_object <- function(local_object, pos, data_list, local_names = NULL) {
+  if (is.null(data_list)) return(NULL)
+  if (!is.null(local_names) &&
+      !is.na(local_names[pos]) &&
+      nzchar(local_names[pos]) &&
+      local_names[pos] %in% names(data_list)) {
+    return(data_list[[local_names[pos]]])
+  }
+  local_id <- as.integer(local_object$local_id %||% pos)
+  if (is.finite(local_id) && local_id >= 1L && local_id <= length(data_list)) {
+    return(data_list[[local_id]])
+  }
+  data_list[[pos]]
+}
+
+build_population_factor_set <- function(local_objects,
+                                        population_model,
+                                        particle_block_size = 1024L,
+                                        data_list = NULL,
+                                        loglik_fn = NULL,
+                                        local_n_cores = 1L) {
+  population_model <- normalize_population_model(population_model)
+  local_names <- names(local_objects)
+  factors <- lapply(seq_along(local_objects), function(i) {
+    build_population_local_factor(
+      local_objects[[i]],
+      population_model = population_model,
+      data_i = .data_for_local_object(local_objects[[i]], i, data_list, local_names),
+      loglik_fn = loglik_fn,
+      local_n_cores = local_n_cores
+    )
+  })
+  names(factors) <- names(local_objects)
+  .population_factor_set_from_factors(
+    factors = factors,
+    population_model = population_model,
+    particle_block_size = particle_block_size
+  )
+}
+
+update_population_factor_set_locals <- function(factor_set,
+                                                local_objects,
+                                                local_ids,
+                                                data_list = NULL,
+                                                loglik_fn = NULL,
+                                                local_n_cores = 1L) {
+  stopifnot(inherits(factor_set, "population_factor_set"))
+  local_ids <- sort(unique(as.integer(local_ids)))
+  local_ids <- local_ids[local_ids >= 1L & local_ids <= length(local_objects)]
+  if (!length(local_ids)) return(factor_set)
+
+  factors <- factor_set$factors
+  local_names <- names(local_objects)
+  for (i in local_ids) {
+    factors[[i]] <- build_population_local_factor(
+      local_objects[[i]],
+      population_model = factor_set$population_model,
+      data_i = .data_for_local_object(local_objects[[i]], i, data_list, local_names),
+      loglik_fn = loglik_fn,
+      local_n_cores = local_n_cores
+    )
+  }
+  names(factors) <- names(local_objects)
+  .population_factor_set_from_factors(
+    factors = factors,
+    population_model = factor_set$population_model,
+    particle_block_size = factor_set$stack$particle_block_size
   )
 }
 
@@ -788,6 +813,100 @@ population_factor_set_logposterior <- function(factor_set, theta, include_consta
     cumulative_accept = cumulative_accept,
     rw_scale = exp(log_rw_scale)
   )
+}
+
+update_outer_population_fit <- function(fit,
+                                        old_factor_set,
+                                        new_factor_set,
+                                        n_mcmc_moves = 3L,
+                                        min_mcmc_moves = 1L,
+                                        resample_threshold = 0.5,
+                                        rw_scale = NULL,
+                                        n_cores = 1L,
+                                        seed = 123L,
+                                        verbose = TRUE) {
+  stopifnot(inherits(old_factor_set, "population_factor_set"))
+  stopifnot(inherits(new_factor_set, "population_factor_set"))
+  theta <- as.matrix(fit$theta)
+  w_old <- normalize_reference_local_weights(fit$w)
+  old_loglik <- as.numeric(fit$loglik_dynamic %||%
+    population_factor_set_loglik(old_factor_set, theta, include_constant = FALSE, n_cores = n_cores))
+  new_loglik <- population_factor_set_loglik(
+    new_factor_set,
+    theta = theta,
+    include_constant = FALSE,
+    n_cores = n_cores
+  )
+
+  log_ratio <- new_loglik - old_loglik
+  ok <- is.finite(log_ratio)
+  if (!any(ok)) stop("Population factor update produced no finite correction weights.")
+  log_ratio[!ok] <- min(log_ratio[ok])
+  logw <- log(pmax(w_old, .Machine$double.eps)) + log_ratio
+  lse <- logsumexp(logw)
+  w <- exp(logw - lse)
+  w <- w / sum(w)
+  ess_frac <- ESS(w) / length(w)
+  resampled <- FALSE
+
+  model <- new_factor_set$population_model
+  logprior <- as.numeric(fit$logprior %||% population_model_log_hyperprior(model, theta))
+  if (ess_frac < as.numeric(resample_threshold)) {
+    sort_info <- .outer_resample_sort_order(theta = theta, w = w, ess_frac = ess_frac)
+    ord <- sort_info$order
+    idx <- ord[stratified_resample_sorted(w[ord])]
+    theta <- theta[idx, , drop = FALSE]
+    logprior <- logprior[idx]
+    new_loglik <- new_loglik[idx]
+    w <- rep(1 / nrow(theta), nrow(theta))
+    resampled <- TRUE
+  }
+
+  rejuvenated <- .outer_rejuvenate(
+    theta = theta,
+    logprior = logprior,
+    loglik_dynamic = new_loglik,
+    beta = 1,
+    factor_set = new_factor_set,
+    w = w,
+    min_n_moves = min_mcmc_moves,
+    max_n_moves = n_mcmc_moves,
+    rw_scale = as.numeric(rw_scale %||% tail(fit$meta$rw_scale_hist %||% 0.8, 1L)),
+    n_cores = n_cores,
+    resampled = resampled,
+    seed = seed
+  )
+  if (isTRUE(verbose)) {
+    cat(sprintf(
+      "Population factor update: ESS=%.3f | rejuvenation accept=%.3f%s\n",
+      ess_frac,
+      rejuvenated$accept_rate,
+      if (resampled) " | resampled" else ""
+    ))
+  }
+
+  fit$theta <- rejuvenated$theta
+  fit$w <- if (isTRUE(resampled)) {
+    rep(1 / nrow(rejuvenated$theta), nrow(rejuvenated$theta))
+  } else {
+    w
+  }
+  fit$logprior <- rejuvenated$logprior
+  fit$loglik_dynamic <- rejuvenated$loglik_dynamic
+  fit$population_model <- model
+  fit$log_evidence_dynamic <- as.numeric(fit$log_evidence_dynamic %||% 0) + lse
+  fit$log_evidence_constant <- new_factor_set$log_constant
+  fit$log_evidence <- fit$log_evidence_dynamic + new_factor_set$log_constant
+  fit$meta$factor_update <- c(
+    fit$meta$factor_update %||% list(),
+    list(list(
+      ess = ess_frac,
+      resampled = resampled,
+      accept_rate = rejuvenated$accept_rate,
+      moves = rejuvenated$n_moves_used
+    ))
+  )
+  fit
 }
 
 outer_population_smc <- function(factor_set,

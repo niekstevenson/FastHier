@@ -8,15 +8,10 @@ if (!file.exists("smc_core.R")) {
   stop("Run this script from the FastHierarchical repository root.")
 }
 
-method <- "certified"
-if (!(method %in% c("static", "refresh", "certified"))) {
-  stop("method must be 'static', 'refresh', or 'certified'.")
-}
-
 detected_cores <- suppressWarnings(parallel::detectCores(logical = TRUE))
 if (!is.finite(detected_cores) || detected_cores < 1L) detected_cores <- 1L
 
-run_label <- method
+run_label <- "planned_anchor_audit"
 base_seed <- 20260324L
 cores <- as.integer(min(4L, detected_cores))
 verbose <- TRUE
@@ -103,7 +98,7 @@ stan_draws <- data.frame(
 
 cat(sprintf("Loaded Stan benchmark bundle: %s\n", stan_results_file))
 cat(sprintf("Data: %d subjects x %d trials\n", nrow(y), ncol(y)))
-cat(sprintf("Run: label=%s | method=%s | cores=%d | seed=%d\n", run_label, method, cores, base_seed))
+cat(sprintf("Run: label=%s | cores=%d | seed=%d\n", run_label, cores, base_seed))
 cat("Running local reference stage...\n")
 
 stage <- do.call(
@@ -117,8 +112,6 @@ stage <- do.call(
       population_model = population_model,
       n_jobs = cores,
       base_seed = base_seed,
-      refresh_once = identical(method, "refresh"),
-      refresh_outer_control = outer_control,
       verbose = verbose
     ),
     local_control
@@ -127,39 +120,22 @@ stage <- do.call(
 
 cat("Running population stage...\n")
 
-fit <- stage$outer_fit
-if (identical(method, "certified")) {
-  certified_result <- do.call(
-    fit_certified_population_model,
-    list(
-      data_list = data_list,
-      loglik_fn = loglik_shifted_gamma,
-      local_objects = stage$local_objects,
-      population_model = population_model,
-      outer_control = outer_control,
-      certification_control = certification_control,
-      n_cores = cores,
-      seed = base_seed + 300000L,
-      verbose = verbose
-    )
+certified_result <- do.call(
+  fit_certified_population_model,
+  list(
+    data_list = data_list,
+    loglik_fn = loglik_shifted_gamma,
+    local_objects = stage$local_objects,
+    population_model = population_model,
+    outer_control = outer_control,
+    certification_control = certification_control,
+    n_cores = cores,
+    seed = base_seed + 300000L,
+    verbose = verbose
   )
-  stage$certified <- certified_result
-  fit <- certified_result$fit
-} else if (is.null(fit)) {
-  factor_set <- build_population_factor_set(stage$local_objects, population_model)
-  fit <- do.call(
-    outer_population_smc,
-    c(
-      list(
-        factor_set = factor_set,
-        n_cores = cores,
-        seed = base_seed,
-        verbose = verbose
-      ),
-      outer_control
-    )
-  )
-}
+)
+stage$certified <- certified_result
+fit <- certified_result$fit
 
 workflow_theta <- smc_posteriors(
   fit,
@@ -196,7 +172,6 @@ saveRDS(
     workflow_draws = workflow_draws,
     settings = list(
       label = run_label,
-      method = method,
       cores = cores,
       seed = base_seed,
       local_control = local_control,
