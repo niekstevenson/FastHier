@@ -14,13 +14,15 @@ if (!is.finite(detected_cores) || detected_cores < 1L) detected_cores <- 1L
 run_label <- "planned_anchor_audit"
 base_seed <- 20260324L
 cores <- as.integer(min(4L, detected_cores))
-verbose <- TRUE
+verbose <- FALSE
 
 stan_results_file <- file.path("benchmarks", "samples", "shifted_gamma_hierarchy_stan_results.rds")
 results_file <- file.path("benchmarks", "results", sprintf("shifted_gamma_%s_results.rds", run_label))
 plot_file <- file.path("benchmarks", "results", sprintf("shifted_gamma_%s_posteriors.png", run_label))
 
-local_control <- list()
+local_control <- list(
+  planned_anchor_count = 4L
+)
 outer_control <- list()
 certification_control <- list()
 
@@ -101,6 +103,8 @@ cat(sprintf("Data: %d subjects x %d trials\n", nrow(y), ncol(y)))
 cat(sprintf("Run: label=%s | cores=%d | seed=%d\n", run_label, cores, base_seed))
 cat("Running local reference stage...\n")
 
+start_time <- proc.time()[["elapsed"]]
+
 stage <- do.call(
   prepare_reference_local_stage,
   c(
@@ -135,6 +139,7 @@ certified_result <- do.call(
   )
 )
 fit <- certified_result$fit
+elapsed_sec <- proc.time()[["elapsed"]] - start_time
 
 workflow_theta <- smc_posteriors(
   fit,
@@ -180,7 +185,8 @@ saveRDS(
       seed = base_seed,
       local_control = local_control,
       outer_control = outer_control,
-      certification_control = certification_control
+      certification_control = certification_control,
+      elapsed_sec = elapsed_sec
     ),
     plot_file = plot_file
   ),
@@ -189,3 +195,4 @@ saveRDS(
 
 cat("Saved results to:", results_file, "\n")
 cat("Saved plot to:", plot_file, "\n")
+cat(sprintf("Elapsed: %.1f seconds\n", elapsed_sec))

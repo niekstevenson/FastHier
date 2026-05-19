@@ -479,15 +479,15 @@ population_local_factor_tail_diagnostic <- function(factor, theta, use_psis = TR
 
 .data_for_local_object <- function(local_object, pos, data_list, local_names = NULL) {
   if (is.null(data_list)) return(NULL)
+  local_id <- as.integer(local_object$local_id %||% NA_integer_)
+  if (is.finite(local_id) && local_id >= 1L && local_id <= length(data_list)) {
+    return(data_list[[local_id]])
+  }
   if (!is.null(local_names) &&
       !is.na(local_names[pos]) &&
       nzchar(local_names[pos]) &&
       local_names[pos] %in% names(data_list)) {
     return(data_list[[local_names[pos]]])
-  }
-  local_id <- as.integer(local_object$local_id %||% pos)
-  if (is.finite(local_id) && local_id >= 1L && local_id <= length(data_list)) {
-    return(data_list[[local_id]])
   }
   data_list[[pos]]
 }

@@ -162,7 +162,33 @@ prune_merge_mixture_Z <- function(meansZ, covsZ, wZ,
   list(meansZ = meansZ, covsZ = covsZ, wZ = wZ, cache = mix_cache)
 }
 
-# ----------------------------- mixture defaults -----------------------------
+inflate_cov_along_dims <- function(S, idx, factor = 3) {
+  if (!length(idx)) return(S)
+  S[idx, idx] <- S[idx, idx] * factor
+  S
+}
+
+inflate_mixture_along_dims <- function(mix, weak_idx, factor = 3, min_eig = 3e-3, cond_cap = 5e3) {
+  if (is.null(mix) || is.null(mix$covsZ) || !length(mix$covsZ)) return(mix)
+  for (g in seq_along(mix$covsZ)) {
+    S <- mix$covsZ[[g]]
+    S <- inflate_cov_along_dims(S, weak_idx, factor)
+    mix$covsZ[[g]] <- regularize_cov(S, min_eig = min_eig, cond_cap = cond_cap)
+  }
+  mix$cache <- prep_mix_cache(mix$meansZ, mix$covsZ, mix$wZ)
+  mix
+}
+
+# ------------------------ weak-dimension identification ------------------------
+weak_dims_from_mat <- function(X, w, frac = 0.25, min_keep = 1L) {
+  w <- pmax(w, 0); w <- w / sum(w)
+  mu <- colSums(X * w)
+  v  <- colSums((sweep(X, 2L, mu, `-`)^2) * w)
+  ord <- order(v, decreasing = FALSE)
+  head(ord, max(min_keep, ceiling(length(v) * frac)))
+}
+
+# ------------------------ mixtures: defaults and blending ------------------------
 # Default standard normal mixture in d dimensions
 .default_std_normal_mix <- function(d) {
   mu0 <- rep(0, d)
@@ -174,6 +200,20 @@ prune_merge_mixture_Z <- function(meansZ, covsZ, wZ,
 # Check emptiness of mixture
 .is_empty_mix <- function(mix) {
   is.null(mix) || is.null(mix$meansZ) || !length(mix$meansZ)
+}
+
+# Blend a base mixture into an existing mixture with weight eps
+blend_mixes <- function(mix, base, eps = 0.05) {
+  if (.is_empty_mix(base)) return(mix)
+  if (.is_empty_mix(mix)) {
+    base$cache <- prep_mix_cache(base$meansZ, base$covsZ, base$wZ)
+    return(base)
+  }
+  meansZ <- c(mix$meansZ, base$meansZ)
+  covsZ  <- c(mix$covsZ,  base$covsZ)
+  wZ     <- c((1 - eps) * mix$wZ, eps * base$wZ)
+  wZ     <- wZ / sum(wZ)
+  list(meansZ = meansZ, covsZ = covsZ, wZ = wZ, cache = prep_mix_cache(meansZ, covsZ, wZ))
 }
 
 # --------------------- elite mixture fitting (whitened EM) ----------------------
@@ -303,6 +343,61 @@ fit_elite_mixture_Z <- function(Z, w, elite_quantile = 0.4, G = 12,
     mix_cache <- prep_mix_cache(meansZ, covsZ, wZ)
     list(meansZ = meansZ, covsZ = covsZ, wZ = wZ, cache = mix_cache)
   }
+}
+
+# ---------------------- history mixture builder ----------------------------
+combine_elite_mixtures <- function(elite_mixtures, weights = c(0.6, 0.3, 0.1),
+                                   housekeeping = TRUE, min_G_keep = 2, merge_thresh = 0.10,
+                                   min_eig = 3e-3,
+                                   verbose = FALSE) {
+  n_mix <- length(elite_mixtures); if (!n_mix) return(NULL)
+  valid_mixtures <- list()
+  for (i in seq_len(n_mix)) {
+    mix <- elite_mixtures[[i]]
+    if (!is.null(mix) && length(mix$meansZ) > 0 && length(mix$covsZ) > 0 && length(mix$wZ) > 0) {
+      d_check <- sapply(mix$meansZ, length)
+      if (all(d_check == d_check[1]) && d_check[1] > 0) valid_mixtures[[length(valid_mixtures) + 1]] <- mix
+    }
+  }
+  if (!length(valid_mixtures)) return(NULL)
+  w_hist <- weights[seq_len(min(length(valid_mixtures), length(weights)))]; w_hist <- w_hist / sum(w_hist)
+  all_meansZ <- list(); all_covsZ <- list(); all_wZ <- c()
+  for (i in seq_len(length(valid_mixtures))) {
+    mix <- valid_mixtures[[i]]; comp_weights <- w_hist[i] * mix$wZ
+    all_meansZ <- c(all_meansZ, mix$meansZ); all_covsZ <- c(all_covsZ, mix$covsZ); all_wZ <- c(all_wZ, comp_weights)
+  }
+  if (!length(all_meansZ)) return(NULL)
+  if (housekeeping) {
+    prune_merge_mixture_Z(all_meansZ, all_covsZ, all_wZ,
+                          w_floor=0.003, merge_thresh=merge_thresh,
+                          max_G=48, min_eig=min_eig, cond_cap=1e4,
+                          min_G_keep=min_G_keep, verbose=verbose)
+  } else {
+    all_wZ <- all_wZ / sum(all_wZ); mix_cache <- prep_mix_cache(all_meansZ, all_covsZ, all_wZ)
+    list(meansZ = all_meansZ, covsZ = all_covsZ, wZ = all_wZ, cache = mix_cache)
+  }
+}
+
+build_hist_mixture <- function(elite_history, lambda,
+                               hist_mix_lambda_thresh, hist_mix_prob,
+                               min_G_keep, merge_thresh,
+                               min_eig = 3e-3,
+                               force = FALSE) {
+  if (!force && (lambda < hist_mix_lambda_thresh || length(elite_history) == 0)) return(NULL)
+  ramp <- (lambda - hist_mix_lambda_thresh) / max(1 - hist_mix_lambda_thresh, 1e-8)
+  ramp <- pmin(pmax(ramp, 0), 1)
+  floor_prob <- min(0.10, 0.5 * hist_mix_prob)
+  hist_prob_eff <- floor_prob + (hist_mix_prob - floor_prob) * ramp
+  eh <- elite_history
+  if (length(eh) > 6) eh <- tail(eh, 6L)
+  w_hist <- c(0.40, 0.25, 0.15, 0.10, 0.06, 0.04)
+  w_hist <- w_hist[seq_len(min(length(eh), length(w_hist)))]
+  combined_mix <- combine_elite_mixtures(
+    eh, weights = w_hist,
+    housekeeping = TRUE, min_G_keep = min_G_keep,
+    merge_thresh = merge_thresh, min_eig = min_eig, verbose = FALSE
+  )
+  if (!is.null(combined_mix)) list(mix = combined_mix, prob = hist_prob_eff) else NULL
 }
 
 # ------------------------------ resampling ---------------------------------
