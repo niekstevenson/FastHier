@@ -1646,13 +1646,24 @@ bank_smc_select_theta_design <- function(population_fit,
   center <- .bank_weighted_mean(theta, w)
   names(center) <- model$hyper_names
 
+  max_points <- as.integer(max(1L, max_points))
+  profile_dims <- as.integer(max(0L, profile_dims))
+  S <- if (nrow(theta) > 1L) {
+    tryCatch(weighted_cov(theta, w), error = function(e) stats::cov(theta))
+  } else {
+    matrix(0, nrow = model$hyper_dim, ncol = model$hyper_dim)
+  }
+  S <- regularize_cov(S, min_eig = 1e-8, cond_cap = 1e8)
+  spread <- sqrt(pmax(diag(S), 0))
+  spread[!is.finite(spread)] <- 0
+
+  protected <- list()
+  if (isTRUE(include_center)) protected[[length(protected) + 1L]] <- center
+
   rows <- list()
-  if (isTRUE(include_center)) rows[[length(rows) + 1L]] <- center
 
   support_points <- as.integer(max(0L, support_points))
   if (support_points > 0L && nrow(theta) > 1L) {
-    S <- tryCatch(weighted_cov(theta, w), error = function(e) stats::cov(theta))
-    S <- regularize_cov(S, min_eig = 1e-8, cond_cap = 1e8)
     eig <- eigen(S, symmetric = TRUE)
     score <- as.numeric(scale(theta, center = center, scale = FALSE) %*% eig$vectors[, 1L])
     q <- .bank_weighted_quantile(score, w, seq(0.15, 0.85, length.out = support_points))
@@ -1662,10 +1673,7 @@ bank_smc_select_theta_design <- function(population_fit,
     }
   }
 
-  profile_dims <- as.integer(max(0L, profile_dims))
   if (profile_dims > 0L) {
-    spread <- sqrt(pmax(diag(tryCatch(weighted_cov(theta, w), error = function(e) stats::cov(theta))), 0))
-    spread[!is.finite(spread)] <- 0
     dims <- head(order(spread, decreasing = TRUE), profile_dims)
     for (j in dims) {
       vals <- .bank_weighted_quantile(theta[, j], w, tail_probs)
@@ -1687,11 +1695,21 @@ bank_smc_select_theta_design <- function(population_fit,
     rows <- c(rows, lapply(seq_len(nrow(extra_theta)), function(i) extra_theta[i, , drop = FALSE]))
   }
 
-  out <- do.call(rbind, rows)
+  protected_mat <- if (length(protected)) {
+    .bank_unique_theta_rows(do.call(rbind, protected), model)
+  } else {
+    matrix(numeric(0), nrow = 0L, ncol = model$hyper_dim, dimnames = list(NULL, model$hyper_names))
+  }
+  n_protected <- nrow(protected_mat)
+  out <- if (length(rows)) {
+    rbind(protected_mat, do.call(rbind, rows))
+  } else {
+    protected_mat
+  }
   colnames(out) <- model$hyper_names
   out <- .bank_unique_theta_rows(out, model)
   if (!is.null(banks)) {
-    keep_first <- if (isTRUE(include_center)) 1L else integer(0)
+    keep_first <- seq_len(min(n_protected, nrow(out)))
     score <- .bank_score_theta_design_with_banks(
       theta = out,
       banks = banks,
@@ -1704,7 +1722,7 @@ bank_smc_select_theta_design <- function(population_fit,
     take <- unique(c(keep_first, ranked))
     out <- out[take, , drop = FALSE]
   }
-  out[seq_len(min(nrow(out), as.integer(max_points))), , drop = FALSE]
+  out[seq_len(min(nrow(out), max_points)), , drop = FALSE]
 }
 
 bank_smc_initial_banks <- function(data_list,
@@ -2066,7 +2084,13 @@ fit_bank_smc_population_model <- function(data_list,
     initial_tail_probs = c(0.01, 0.025, 0.1, 0.9, 0.975, 0.99)
   )
   shape_defaults <- list(n_alpha_configs = 128L, draws_per_config = 1L, ell_grid_size = 96L)
-  audit_defaults <- list(max_points = 5L, target_ess_frac = 0.05, max_pareto_k = 0.7, max_repairs = 20L, refine_rounds = 3L)
+  audit_defaults <- list(
+    max_points = 5L,
+    target_ess_frac = 0.05,
+    max_pareto_k = 0.7,
+    max_repairs = 20L,
+    refine_rounds = 3L
+  )
   local_control <- modifyList(local_defaults, local_control)
   anchor_control <- modifyList(anchor_defaults, anchor_control)
   anchor_control$M <- as.integer(anchor_control$M %||% min(400L, local_control$M))
@@ -2075,7 +2099,7 @@ fit_bank_smc_population_model <- function(data_list,
   node_budget <- if (is.finite(local_control$max_nodes)) as.integer(local_control$max_nodes) else 5L
   design_control$max_points <- as.integer(
     design_control$max_points %||%
-      max(2L, min(5L, node_budget - 2L))
+      max(2L, min(5L, node_budget - 1L))
   )
   audit_control <- modifyList(audit_defaults, audit_control)
 
