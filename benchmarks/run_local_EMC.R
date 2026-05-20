@@ -52,11 +52,13 @@ loglik_emc2 <- function(Theta, data_i) {
 }
 
 run_one_subject <- function(data_i, subject_id) {
-  enhanced_smc_elite(
-    data = data_i,
-    loglik_fn = loglik_emc2,
-    mu_ref = mu_ref,
-    Sigma_ref = Sigma_ref,
+  run_tempered_smc(
+    bridge_stat_fn = function(Theta) loglik_emc2(Theta, data_i),
+    reference_prior = make_reference_prior_gaussian(
+      mu = mu_ref,
+      Sigma = Sigma_ref,
+      param_names = param_names
+    ),
     M = M,
     n_cores = 1L,
     seed = base_seed + subject_id - 1L,

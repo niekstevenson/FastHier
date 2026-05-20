@@ -55,9 +55,8 @@ exact <- c(
   logZ = log(sum(prior_density * lik_density) * dx)
 )
 
-fit <- enhanced_smc_elite(
-  data = data_obj,
-  loglik_fn = loglik_fn,
+fit <- run_tempered_smc(
+  bridge_stat_fn = function(Theta) loglik_fn(Theta, data_obj),
   reference_prior = reference_prior,
   M = 3000L,
   n_mcmc_moves = 2L,

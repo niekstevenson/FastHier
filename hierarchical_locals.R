@@ -20,7 +20,7 @@ if (!exists("normalize_reference_prior", mode = "function") ||
     !exists("reference_prior_logpdf", mode = "function")) {
   source("reference_priors.R")
 }
-if (!exists("enhanced_smc_elite", mode = "function")) {
+if (!exists("run_tempered_smc", mode = "function")) {
   source("SMC_super_fast.R")
 }
 if (!exists("normalize_population_model", mode = "function") ||
@@ -255,7 +255,7 @@ run_reference_local_smc <- function(data_list,
                                     ...) {
   reference_prior <- normalize_reference_prior(reference_prior = reference_prior)
   extra_args <- list(...)
-  blocked <- intersect(names(extra_args), c("data", "loglik_fn", "reference_prior", "M", "n_cores", "seed", "verbose"))
+  blocked <- intersect(names(extra_args), c("bridge_stat_fn", "base_logpdf_fn", "reference_prior", "M", "n_cores", "seed", "verbose"))
   if (length(blocked)) {
     stop("Pass ", paste(blocked, collapse = ", "), " via the dedicated run_reference_local_smc arguments.")
   }
@@ -265,8 +265,7 @@ run_reference_local_smc <- function(data_list,
     function(i) {
       fit_args <- modifyList(
         list(
-          data = data_list[[i]],
-          loglik_fn = loglik_fn,
+          bridge_stat_fn = function(Theta) ll_parallel(Theta, data_list[[i]], loglik_fn, n_cores = as.integer(local_n_cores)),
           reference_prior = reference_prior,
           M = as.integer(M),
           n_cores = as.integer(local_n_cores),
@@ -275,7 +274,7 @@ run_reference_local_smc <- function(data_list,
         ),
         extra_args
       )
-      fit <- do.call(enhanced_smc_elite, fit_args)
+      fit <- do.call(run_tempered_smc, fit_args)
       fit$local_id <- as.integer(i)
       fit$reference_prior_label <- reference_prior$label
       fit

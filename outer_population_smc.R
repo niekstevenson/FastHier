@@ -125,25 +125,193 @@ validate_reference_local_object <- function(local_object) {
 
 .is_compressed_population_local_object <- function(local_object) {
   is.list(local_object) &&
-    !is.null(local_object$factor_particles) &&
+    (!is.null(local_object$factor_particles) || !is.null(local_object$factor_sufficient_stats)) &&
     !is.null(local_object$factor_log_base)
+}
+
+population_sufficient_stats_from_alpha <- function(population_model, alpha) {
+  model <- normalize_population_model(population_model)
+  alpha <- as.matrix(alpha)
+  if (ncol(alpha) != model$alpha_dim) {
+    stop("Sufficient-statistic alpha dimension does not match the population model.")
+  }
+  if (!is.null(colnames(alpha)) && setequal(colnames(alpha), model$alpha_names)) {
+    alpha <- alpha[, model$alpha_names, drop = FALSE]
+  } else {
+    colnames(alpha) <- model$alpha_names
+  }
+
+  if (identical(model$fast_family %||% NULL, "gaussian")) {
+    return(structure(
+      list(
+        family = "gaussian_diag",
+        linear = alpha,
+        quadratic_diag = alpha * alpha,
+        n = as.integer(nrow(alpha)),
+        alpha_names = model$alpha_names
+      ),
+      class = "population_sufficient_stats"
+    ))
+  }
+
+  structure(
+    list(
+      family = "raw_alpha",
+      alpha = alpha,
+      n = as.integer(nrow(alpha)),
+      alpha_names = model$alpha_names
+    ),
+    class = "population_sufficient_stats"
+  )
+}
+
+population_sufficient_stats_n <- function(sufficient_stats) {
+  as.integer(sufficient_stats$n %||%
+    if (!is.null(sufficient_stats$linear)) nrow(sufficient_stats$linear) else nrow(sufficient_stats$alpha))
+}
+
+validate_population_sufficient_stats <- function(sufficient_stats, population_model) {
+  model <- normalize_population_model(population_model)
+  if (!is.list(sufficient_stats) || is.null(sufficient_stats$family)) {
+    stop("population sufficient statistics must be a list with a family.")
+  }
+  family <- as.character(sufficient_stats$family)
+
+  if (identical(family, "gaussian_diag")) {
+    linear <- as.matrix(sufficient_stats$linear)
+    quadratic_diag <- as.matrix(sufficient_stats$quadratic_diag)
+    if (ncol(linear) != model$alpha_dim ||
+        ncol(quadratic_diag) != model$alpha_dim ||
+        nrow(linear) != nrow(quadratic_diag)) {
+      stop("Gaussian sufficient statistics have incompatible dimensions.")
+    }
+    colnames(linear) <- model$alpha_names
+    colnames(quadratic_diag) <- model$alpha_names
+    sufficient_stats$linear <- linear
+    sufficient_stats$quadratic_diag <- quadratic_diag
+    sufficient_stats$n <- as.integer(nrow(linear))
+    sufficient_stats$alpha_names <- model$alpha_names
+    return(structure(sufficient_stats, class = "population_sufficient_stats"))
+  }
+
+  if (identical(family, "raw_alpha")) {
+    return(population_sufficient_stats_from_alpha(model, sufficient_stats$alpha))
+  }
+
+  stop("Unknown population sufficient-statistic family: ", family)
+}
+
+population_sufficient_stats_subset <- function(sufficient_stats, idx) {
+  idx <- as.integer(idx)
+  family <- as.character(sufficient_stats$family)
+  if (identical(family, "gaussian_diag")) {
+    out <- sufficient_stats
+    out$linear <- sufficient_stats$linear[idx, , drop = FALSE]
+    out$quadratic_diag <- sufficient_stats$quadratic_diag[idx, , drop = FALSE]
+    out$n <- as.integer(length(idx))
+    return(out)
+  }
+  if (identical(family, "raw_alpha")) {
+    out <- sufficient_stats
+    out$alpha <- sufficient_stats$alpha[idx, , drop = FALSE]
+    out$n <- as.integer(length(idx))
+    return(out)
+  }
+  stop("Unknown population sufficient-statistic family: ", family)
+}
+
+population_sufficient_stats_bind <- function(population_model, stats_list) {
+  model <- normalize_population_model(population_model)
+  if (!length(stats_list)) {
+    alpha <- matrix(numeric(0), nrow = 0L, ncol = model$alpha_dim)
+    colnames(alpha) <- model$alpha_names
+    return(population_sufficient_stats_from_alpha(model, alpha))
+  }
+  stats_list <- lapply(stats_list, validate_population_sufficient_stats, population_model = model)
+  families <- vapply(stats_list, `[[`, character(1), "family")
+  if (length(unique(families)) != 1L) {
+    stop("Cannot bind mixed sufficient-statistic families.")
+  }
+
+  if (identical(unname(families[[1L]]), "gaussian_diag")) {
+    linear <- do.call(rbind, lapply(stats_list, `[[`, "linear"))
+    quadratic_diag <- do.call(rbind, lapply(stats_list, `[[`, "quadratic_diag"))
+    colnames(linear) <- model$alpha_names
+    colnames(quadratic_diag) <- model$alpha_names
+    return(structure(
+      list(
+        family = "gaussian_diag",
+        linear = linear,
+        quadratic_diag = quadratic_diag,
+        n = as.integer(nrow(linear)),
+        alpha_names = model$alpha_names
+      ),
+      class = "population_sufficient_stats"
+    ))
+  }
+
+  alpha <- do.call(rbind, lapply(stats_list, `[[`, "alpha"))
+  population_sufficient_stats_from_alpha(model, alpha)
+}
+
+population_log_alpha_given_sufficient_stats_many <- function(model,
+                                                             sufficient_stats,
+                                                             theta = NULL,
+                                                             theta_prepared = NULL) {
+  model <- normalize_population_model(model)
+  sufficient_stats <- validate_population_sufficient_stats(sufficient_stats, model)
+  if (is.null(theta_prepared)) {
+    theta_prepared <- population_model_prepare_theta(model, theta)
+  }
+
+  if (identical(sufficient_stats$family, "gaussian_diag") &&
+      identical(theta_prepared$family, "gaussian")) {
+    if (!identical(theta_prepared$quadratic_kind, "diag")) {
+      stop("Only diagonal Gaussian sufficient-statistic evaluation is supported.")
+    }
+    linear <- theta_prepared$eta %*% t(sufficient_stats$linear)
+    quad <- theta_prepared$quadratic_coef %*% t(sufficient_stats$quadratic_diag)
+    return(sweep(linear - 0.5 * quad, 1L, theta_prepared$log_kernel_constant, "+"))
+  }
+
+  if (!identical(sufficient_stats$family, "raw_alpha")) {
+    stop("Sufficient-statistic family is incompatible with the population model.")
+  }
+  population_model_log_alpha_given_prepared_theta_many(
+    model,
+    alpha = sufficient_stats$alpha,
+    theta_prepared = theta_prepared
+  )
 }
 
 build_compressed_population_local_factor <- function(local_object,
                                                      population_model) {
   population_model <- normalize_population_model(population_model)
-  alpha <- as.matrix(local_object$factor_particles)
-  if (ncol(alpha) != population_model$alpha_dim) {
-    stop("Compressed local factor particle dimension does not match the population model.")
+  alpha <- NULL
+  if (!is.null(local_object$factor_particles)) {
+    alpha <- as.matrix(local_object$factor_particles)
+    if (ncol(alpha) != population_model$alpha_dim) {
+      stop("Compressed local factor particle dimension does not match the population model.")
+    }
+    if (!is.null(colnames(alpha)) && setequal(colnames(alpha), population_model$alpha_names)) {
+      alpha <- alpha[, population_model$alpha_names, drop = FALSE]
+    } else {
+      colnames(alpha) <- population_model$alpha_names
+    }
   }
-  if (!is.null(colnames(alpha)) && setequal(colnames(alpha), population_model$alpha_names)) {
-    alpha <- alpha[, population_model$alpha_names, drop = FALSE]
+
+  sufficient_stats <- if (!is.null(local_object$factor_sufficient_stats)) {
+    validate_population_sufficient_stats(local_object$factor_sufficient_stats, population_model)
   } else {
-    colnames(alpha) <- population_model$alpha_names
+    population_sufficient_stats_from_alpha(population_model, alpha)
+  }
+  n_particles <- population_sufficient_stats_n(sufficient_stats)
+  if (!is.null(alpha) && nrow(alpha) != n_particles) {
+    stop("Compressed local factor particles and sufficient statistics have different lengths.")
   }
 
   log_base <- as.numeric(local_object$factor_log_base)
-  if (length(log_base) != nrow(alpha)) {
+  if (length(log_base) != n_particles) {
     stop("Compressed local factor log_base must match the number of particles.")
   }
 
@@ -152,12 +320,14 @@ build_compressed_population_local_factor <- function(local_object,
       local_id = as.integer(local_object$local_id %||% NA_integer_),
       population_model = population_model,
       particles = alpha,
-      log_weights = rep(NA_real_, nrow(alpha)),
-      log_reference_density = rep(NA_real_, nrow(alpha)),
+      sufficient_stats = sufficient_stats,
+      n_particles = n_particles,
+      log_weights = rep(NA_real_, n_particles),
+      log_reference_density = rep(NA_real_, n_particles),
       log_base = log_base,
       log_constant = as.numeric(local_object$factor_log_constant %||% 0),
       reference_prior = NULL,
-      component_id = rep.int(1L, nrow(alpha))
+      component_id = rep.int(1L, n_particles)
     ),
     class = "population_local_factor"
   )
@@ -271,6 +441,8 @@ build_population_local_factor <- function(local_object,
       local_id = as.integer(local_object$local_id),
       population_model = population_model,
       particles = alpha,
+      sufficient_stats = population_sufficient_stats_from_alpha(population_model, alpha),
+      n_particles = as.integer(nrow(alpha)),
       log_weights = log_weights,
       log_reference_density = log_reference_density,
       log_base = log_base,
@@ -307,22 +479,23 @@ build_population_local_factor <- function(local_object,
 }
 
 .local_log_marginal_blocked <- function(model,
-                                        alpha,
+                                        sufficient_stats,
                                         log_base,
                                         theta,
                                         theta_prepared = NULL,
                                         block_size = 1024L) {
   theta <- .as_hyper_matrix(theta, hyper_names = model$hyper_names, hyper_dim = model$hyper_dim)
   theta_prepared <- theta_prepared %||% population_model_prepare_theta(model, theta)
+  sufficient_stats <- validate_population_sufficient_stats(sufficient_stats, model)
   block_size <- as.integer(max(1L, block_size))
   accum <- rep.int(-Inf, nrow(theta))
-  n_alpha <- nrow(alpha)
+  n_alpha <- population_sufficient_stats_n(sufficient_stats)
 
   for (start in seq.int(1L, n_alpha, by = block_size)) {
     idx <- seq.int(start, min(start + block_size - 1L, n_alpha))
-    log_terms <- .population_log_alpha_given_theta_many(
+    log_terms <- population_log_alpha_given_sufficient_stats_many(
       model = model,
-      alpha = alpha[idx, , drop = FALSE],
+      sufficient_stats = population_sufficient_stats_subset(sufficient_stats, idx),
       theta_prepared = theta_prepared
     )
     block_lse <- .rowLogSumExp(sweep(log_terms, 2L, log_base[idx], "+"))
@@ -339,7 +512,7 @@ population_local_factor_log_marginal_many <- function(factor,
   theta_prepared <- population_model_prepare_theta(factor$population_model, theta)
   out <- .local_log_marginal_blocked(
     model = factor$population_model,
-    alpha = factor$particles,
+    sufficient_stats = factor$sufficient_stats,
     log_base = factor$log_base,
     theta = theta_prepared$theta,
     theta_prepared = theta_prepared,
@@ -356,9 +529,9 @@ population_local_factor_log_marginal <- function(factor, theta, include_constant
 population_local_factor_ess <- function(factor, theta) {
   stopifnot(inherits(factor, "population_local_factor"))
   theta_prepared <- population_model_prepare_theta(factor$population_model, theta)
-  logp <- .population_log_alpha_given_theta_many(
+  logp <- population_log_alpha_given_sufficient_stats_many(
     model = factor$population_model,
-    alpha = factor$particles,
+    sufficient_stats = factor$sufficient_stats,
     theta_prepared = theta_prepared
   )[1L, ]
   lw <- factor$log_base + logp
@@ -370,10 +543,13 @@ population_local_factor_ess <- function(factor, theta) {
 
 population_local_factor_reweighted_particles <- function(factor, theta) {
   stopifnot(inherits(factor, "population_local_factor"))
+  if (is.null(factor$particles)) {
+    stop("Raw factor particles are not stored for this sufficient-statistic factor.")
+  }
   theta_prepared <- population_model_prepare_theta(factor$population_model, theta)
-  logp <- .population_log_alpha_given_theta_many(
+  logp <- population_log_alpha_given_sufficient_stats_many(
     model = factor$population_model,
-    alpha = factor$particles,
+    sufficient_stats = factor$sufficient_stats,
     theta_prepared = theta_prepared
   )[1L, ]
   lw <- factor$log_base + logp
@@ -389,9 +565,9 @@ population_local_factor_reweighted_particles <- function(factor, theta) {
 population_local_factor_tail_diagnostic <- function(factor, theta, use_psis = TRUE) {
   stopifnot(inherits(factor, "population_local_factor"))
   theta_prepared <- population_model_prepare_theta(factor$population_model, theta)
-  logp <- .population_log_alpha_given_theta_many(
+  logp <- population_log_alpha_given_sufficient_stats_many(
     model = factor$population_model,
-    alpha = factor$particles,
+    sufficient_stats = factor$sufficient_stats,
     theta_prepared = theta_prepared
   )[1L, ]
   lw <- factor$log_base + logp
@@ -434,13 +610,22 @@ population_local_factor_tail_diagnostic <- function(factor, theta, use_psis = TR
   particle_block_size <- as.integer(max(1L, particle_block_size))
 
   if (length(factors)) {
-    local_lengths <- vapply(factors, function(factor) nrow(factor$particles), integer(1))
-    alpha <- do.call(rbind, lapply(factors, `[[`, "particles"))
+    local_lengths <- vapply(factors, `[[`, integer(1), "n_particles")
+    sufficient_stats <- population_sufficient_stats_bind(
+      population_model,
+      lapply(factors, `[[`, "sufficient_stats")
+    )
+    has_all_particles <- all(vapply(factors, function(factor) !is.null(factor$particles), logical(1)))
+    alpha <- if (isTRUE(has_all_particles)) {
+      do.call(rbind, lapply(factors, `[[`, "particles"))
+    } else {
+      NULL
+    }
     log_base <- unlist(lapply(factors, `[[`, "log_base"), use.names = FALSE)
     local_index <- rep.int(seq_along(factors), local_lengths)
-    block_starts <- seq.int(1L, nrow(alpha), by = particle_block_size)
+    block_starts <- seq.int(1L, population_sufficient_stats_n(sufficient_stats), by = particle_block_size)
     blocks <- lapply(block_starts, function(start) {
-      idx <- seq.int(start, min(start + particle_block_size - 1L, nrow(alpha)))
+      idx <- seq.int(start, min(start + particle_block_size - 1L, population_sufficient_stats_n(sufficient_stats)))
       rr <- rle(local_index[idx])
       ends <- cumsum(rr$lengths)
       starts <- c(1L, head(ends, -1L) + 1L)
@@ -454,6 +639,7 @@ population_local_factor_tail_diagnostic <- function(factor, theta, use_psis = TR
   } else {
     alpha <- matrix(numeric(0), nrow = 0L, ncol = population_model$alpha_dim)
     colnames(alpha) <- population_model$alpha_names
+    sufficient_stats <- population_sufficient_stats_from_alpha(population_model, alpha)
     log_base <- numeric(0)
     local_index <- integer(0)
     blocks <- list()
@@ -467,6 +653,7 @@ population_local_factor_tail_diagnostic <- function(factor, theta, use_psis = TR
       log_constant = sum(vapply(factors, `[[`, numeric(1), "log_constant")),
       stack = list(
         alpha = alpha,
+        sufficient_stats = sufficient_stats,
         log_base = log_base,
         local_index = local_index,
         blocks = blocks,
@@ -561,9 +748,12 @@ update_population_factor_set_locals <- function(factor_set,
   accum <- matrix(-Inf, nrow = nrow(theta), ncol = factor_set$n_locals)
 
   for (block in factor_set$stack$blocks) {
-    log_terms <- .population_log_alpha_given_theta_many(
+    log_terms <- population_log_alpha_given_sufficient_stats_many(
       model = model,
-      alpha = factor_set$stack$alpha[block$idx, , drop = FALSE],
+      sufficient_stats = population_sufficient_stats_subset(
+        factor_set$stack$sufficient_stats,
+        block$idx
+      ),
       theta_prepared = theta_prepared
     )
     log_terms <- sweep(log_terms, 2L, factor_set$stack$log_base[block$idx], "+")

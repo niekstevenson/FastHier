@@ -315,11 +315,13 @@ make_population_model_diag_gaussian <- function(alpha_names,
       function(j) .dnorm_log_scalar(mu[, j], mean_prior_mean[j], mean_prior_var[j]),
       numeric(nrow(theta))
     )
+    mean_log <- matrix(mean_log, nrow = nrow(theta), ncol = d)
     sigma_log <- vapply(
       seq_len(d),
       function(j) .dinvgamma_log_scalar(sigma2[, j], sigma2_prior_shape[j], sigma2_prior_rate[j]),
       numeric(nrow(theta))
     )
+    sigma_log <- matrix(sigma_log, nrow = nrow(theta), ncol = d)
     out <- rowSums(mean_log) + rowSums(sigma_log) + rowSums(ell)
     as.numeric(out)
   }

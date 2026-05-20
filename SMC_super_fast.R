@@ -918,6 +918,7 @@ mcmc_moves_z_mix_batched <- function(Z, loglik, lpz, Tmap, lambda,
                                      da_screen_mix = NULL,    # mixture in Z used to build surrogate
                                      # --- Likelihood cache (optional) ---
                                      ll_cache = NULL,
+                                     base_logpdf_fn = NULL,
                                      allow_pcn = TRUE,
                                      n_cores = 1
                                      ) {
@@ -928,7 +929,12 @@ mcmc_moves_z_mix_batched <- function(Z, loglik, lpz, Tmap, lambda,
   allow_pcn <- isTRUE(allow_pcn)
   if (!allow_pcn) pcn_prob <- 0
   lpz_from_theta <- function(Theta_mat) {
-    as.numeric(reference_prior_logpdf(reference_prior, Theta_mat) - Tmap$log_jac(Theta_mat))
+    base_log <- if (is.null(base_logpdf_fn)) {
+      reference_prior_logpdf(reference_prior, Theta_mat)
+    } else {
+      base_logpdf_fn(Theta_mat)
+    }
+    as.numeric(base_log - Tmap$log_jac(Theta_mat))
   }
   standard_normal_logpdf_rows <- function(Zmat) {
     rowSums(stats::dnorm(as.matrix(Zmat), log = TRUE))
@@ -1359,81 +1365,58 @@ maybe_update_ref_mix <- function(lambda, elite_mix, hist_mix,
   if (!is.finite(val)) as.integer(default) else val
 }
 
-# Main Enhanced SMC Sampler Function
-# Adaptive SMC with transport maps, elite mixtures, and robust rejuvenation
-# Args:
-#   data: data for likelihood computation
-#   loglik_fn: log-likelihood function
-#   mu_ref: prior mean vector
-#   Sigma_ref: prior covariance matrix
-#   M: number of particles
-#   resample_threshold: ESS threshold for resampling
-#   n_mcmc_moves: number of MCMC moves per round
-#   max_rounds: maximum number of SMC rounds
-#   G_mix: number of mixture components for elite mixture
-#   gamma_sharp: sharpening parameter for elite weights
-#   refit_every: frequency of transport map refitting
-#   rw_prob: probability of random-walk moves
-#   rw_scale_init: initial scaling for random-walk
-#   indep_t_df: degrees of freedom for t-distribution proposals
-#   indep_t_prob: probability of t-distribution vs Gaussian proposals
-#   hist_mix_enable: whether to enable historical mixture
-#   hist_mix_lambda_thresh: temperature threshold for historical mixture
-#   hist_mix_prob: target probability for historical mixture usage
-#   seed: random seed
-#   verbose: whether to print progress
-# Returns: list with final samples, weights, transport map, and diagnostics
-enhanced_smc_elite <- function(data, loglik_fn, mu_ref = NULL, Sigma_ref = NULL, reference_prior = NULL,
-                               M = 5000L,
-                               resample_threshold = 0.6,
-                               n_mcmc_moves = 3L,
-                               max_rounds = 200L,
-                               lambda_target = 1.0,
-                               checkpoint_lambdas = NULL,
-                               G_mix = 16L,
-                               gamma_sharp = 0.7,
-                               refit_every = 2L,   # kept for compatibility; now advisory
-                               rw_prob = 0.6,
-                               rw_scale_init = 0.9,
-                               indep_t_df = 4L,
-                               indep_t_prob = 0.85,
-                               hist_mix_enable = TRUE,
-                               hist_mix_lambda_thresh = 0.50,
-                               hist_mix_prob = 0.20,
-                               gss_enable = FALSE,            # GSS is not part of the default local target
-                               lambda_ref_snap = 0.15,        # <— snapshot earlier helps early λ
-                               allow_ref_refresh = TRUE,
-                               lambda_ref_refresh = 0.50,     # <— optional single refresh
-                               # ---- DA controls ----
-                               da_enable = TRUE,
-                               da_lambda_floor = 0.20,        # <— NEW: clamp for early λ
-                               da_target_pass = 0.45,         # target Stage-1 pass rate (30–60% window)
-                               da_calibrate_n = 20L,          # exact calls used for micro-calibration
-                               da_alpha_init = 1.00,          # initial mixture power α
-                               da_rm_gain = 0.20,             # Robbins–Monro gain on log-scale for α
-                               # ---- Stability controls ----
-                               adapt_lambda_max = 0.15,       # only adapt kernels/maps while λ <= this
-                               freeze_transport_after_gss = TRUE,
-                               single_gss_updates = TRUE,
-                               post_adapt_n_mcmc_moves = 3L,  # fixed-phase move count (post adaptation)
-                               # ---- Early-round cheapening ----
-                               pre_resample_lambda_gate = 0, # skip light rejuvenation if λ < this
-                               # ---- Inner SMC resampling mode ----
-                               deterministic_resampling = FALSE,
-                               resample_sort_mode = c("adaptive", "hilbert", "cheap1d", "none"),
-                               hilbert_hard_ess = 0.25,
-                               # ---- Likelihood cache controls ----
-                               ll_cache_enable = TRUE,
-                               ll_cache_digits = 8L,
-                               ll_cache_cap = 100000L,
-                               seed_plan = NULL,
-                               warm_start_fit = NULL,
-                               warm_start_use_transport = TRUE,
-                               warm_start_use_mixture = TRUE,
-                               warm_start_max_particles = 2000L,
-                               n_cores = 1,                   # <— NEW: number of cores for parallel likelihood
-                               seed = 123,
-                               verbose = TRUE) {
+run_tempered_smc <- function(reference_prior,
+                             bridge_stat_fn,
+                             base_logpdf_fn = NULL,
+                             initial_particles = NULL,
+                             initial_weights = NULL,
+                             initial_log_normalizer = 0,
+                             M = NULL,
+                             resample_threshold = 0.6,
+                             n_mcmc_moves = 3L,
+                             max_rounds = 200L,
+                             lambda_target = 1.0,
+                             checkpoint_lambdas = NULL,
+                             cess_target = NULL,
+                             G_mix = 16L,
+                             gamma_sharp = 0.7,
+                             refit_every = 2L,
+                             rw_prob = 0.6,
+                             rw_scale_init = 0.9,
+                             indep_t_df = 4L,
+                             indep_t_prob = 0.85,
+                             hist_mix_enable = TRUE,
+                             hist_mix_lambda_thresh = 0.50,
+                             hist_mix_prob = 0.20,
+                             gss_enable = FALSE,
+                             lambda_ref_snap = 0.15,
+                             allow_ref_refresh = TRUE,
+                             lambda_ref_refresh = 0.50,
+                             da_enable = TRUE,
+                             da_lambda_floor = 0.20,
+                             da_target_pass = 0.45,
+                             da_calibrate_n = 20L,
+                             da_alpha_init = 1.00,
+                             da_rm_gain = 0.20,
+                             adapt_lambda_max = 0.15,
+                             freeze_transport_after_gss = TRUE,
+                             single_gss_updates = TRUE,
+                             post_adapt_n_mcmc_moves = 3L,
+                             pre_resample_lambda_gate = 0,
+                             deterministic_resampling = FALSE,
+                             resample_sort_mode = c("adaptive", "hilbert", "cheap1d", "none"),
+                             hilbert_hard_ess = 0.25,
+                             ll_cache_enable = TRUE,
+                             ll_cache_digits = 8L,
+                             ll_cache_cap = 100000L,
+                             seed_plan = NULL,
+                             warm_start_fit = NULL,
+                             warm_start_use_transport = TRUE,
+                             warm_start_use_mixture = TRUE,
+                             warm_start_max_particles = 2000L,
+                             n_cores = 1,
+                             seed = 123,
+                             verbose = TRUE) {
   vcat <- function(...) { if (verbose) base::cat(...) }
   cat <- vcat
   set.seed(.seed_plan_block(seed_plan, "global", default = seed))
@@ -1447,27 +1430,64 @@ enhanced_smc_elite <- function(data, loglik_fn, mu_ref = NULL, Sigma_ref = NULL,
   checkpoint_log_evidence <- numeric(length(checkpoint_lambdas))
   checkpoint_log_increments <- numeric(length(checkpoint_lambdas))
   checkpoint_ptr <- 1L
-  reference_prior <- normalize_reference_prior(reference_prior = reference_prior, mu = mu_ref, Sigma = Sigma_ref)
+  if (!is.function(bridge_stat_fn)) {
+    stop("bridge_stat_fn must be a function of the particle matrix.")
+  }
+  reference_prior <- normalize_reference_prior(reference_prior = reference_prior)
   ref_geom <- reference_prior_geometry(reference_prior)
   mu_ref <- ref_geom$mean
-  Sigma_ref <- ref_geom$cov
   param_names <- ref_geom$param_names
   prior_L <- ref_geom$chol
   allow_pcn <- TRUE
   if (isTRUE(verbose)) {
     cat("  Using transported-space pCN moves.\n")
   }
-  log_ref_theta <- function(Theta_mat) {
-    as.numeric(reference_prior_logpdf(reference_prior, Theta_mat))
+  base_logpdf <- if (is.null(base_logpdf_fn)) {
+    function(Theta_mat) as.numeric(reference_prior_logpdf(reference_prior, Theta_mat))
+  } else {
+    function(Theta_mat) as.numeric(base_logpdf_fn(Theta_mat))
+  }
+  bridge_stat_kernel <- function(Theta_mat, data = NULL) {
+    as.numeric(bridge_stat_fn(Theta_mat))
   }
   # Build likelihood cache (persists across rounds; valid in θ-space)
   ll_cache <- if (ll_cache_enable) .ll_cache_make(digits = ll_cache_digits, cap = ll_cache_cap) else NULL
-  cat("Stage 1: sample prior & build transport...\n")
+  cat("Stage 1: initialize particles & build transport...\n")
   set.seed(.seed_plan_block(seed_plan, "init", default = seed))
-  Theta <- reference_prior_sample(reference_prior, M)
+  if (is.null(initial_particles)) {
+    M <- as.integer(M %||% 5000L)
+    Theta <- reference_prior_sample(reference_prior, M)
+    w <- rep(1 / M, M)
+  } else {
+    Theta <- as.matrix(initial_particles)
+    if (ncol(Theta) != length(param_names)) {
+      stop("initial_particles dimension does not match reference_prior.")
+    }
+    colnames(Theta) <- param_names
+    w_in <- pmax(as.numeric(initial_weights %||% rep(1 / nrow(Theta), nrow(Theta))), 0)
+    if (length(w_in) != nrow(Theta)) {
+      stop("initial_weights must match nrow(initial_particles).")
+    }
+    sw_in <- sum(w_in)
+    if (!is.finite(sw_in) || sw_in <= 0) {
+      stop("initial_weights must sum to a positive finite value.")
+    }
+    w_in <- w_in / sw_in
+    M <- as.integer(M %||% nrow(Theta))
+    if (M <= 0L) stop("M must be positive.")
+    if (nrow(Theta) != M) {
+      cw <- c(0, cumsum(w_in))
+      cw[length(cw)] <- 1
+      u0 <- if (isTRUE(deterministic_resampling)) 0.5 / M else stats::runif(1) / M
+      idx_init <- findInterval(u0 + (0:(M - 1L)) / M, cw, rightmost.closed = TRUE)
+      Theta <- Theta[idx_init, , drop = FALSE]
+      w <- rep(1 / M, M)
+    } else {
+      w <- w_in
+    }
+  }
   colnames(Theta) <- param_names
-  # No cache benefit on the very first batch
-  loglik <- ll_parallel(Theta, data, loglik_fn, n_cores)
+  loglik <- bridge_stat_kernel(Theta)
   warm_theta <- NULL
   warm_w <- NULL
   warm_mix_seed <- NULL
@@ -1526,17 +1546,25 @@ enhanced_smc_elite <- function(data, loglik_fn, mu_ref = NULL, Sigma_ref = NULL,
   }
   if (is.null(Tmap)) {
     Tmap <- build_transport(
-      Theta, rep(1 / M, M),
+      Theta, w,
       reference_prior = reference_prior,
       lambda = 0,
       verbose = verbose
     )
   }
   Z <- Tmap$fwd(Theta)
-  lpz <- as.numeric(log_ref_theta(Theta) - Tmap$log_jac(Theta))
-  w <- rep(1/M, M); lambda <- 0; round <- 0L
-  log_evidence <- 0.0
+  lpz <- as.numeric(base_logpdf(Theta) - Tmap$log_jac(Theta))
+  lambda <- 0; round <- 0L
+  log_evidence <- as.numeric(initial_log_normalizer %||% 0)
   lambda_hist <- c(0)
+  ess_frac_hist <- numeric(0)
+  resampled_hist <- logical(0)
+  accept_rate_hist <- numeric(0)
+  rw_accept_rate_hist <- numeric(0)
+  pcn_accept_rate_hist <- numeric(0)
+  indep_accept_rate_hist <- numeric(0)
+  da_pass_rate_hist <- numeric(0)
+  log_increment_hist <- numeric(0)
   target_acc_rw <- 0.234; log_rw_scale <- log(rw_scale_init); rm_gain <- 0.05
   # MCSE accumulator for log-evidence (sum of per-round variances)
   mcse_var_accum <- 0.0
@@ -1687,7 +1715,11 @@ enhanced_smc_elite <- function(data, loglik_fn, mu_ref = NULL, Sigma_ref = NULL,
     round <- round + 1L
     cat(sprintf("\nRound %d: λ=%.3f -> ", round, lambda))
     resampled <- FALSE
-    cess_target <- cess_target_at_lambda(lambda)
+    cess_target_round <- if (is.null(cess_target)) {
+      cess_target_at_lambda(lambda)
+    } else {
+      as.numeric(cess_target)
+    }
     # Guard against non-finite or invalid normalized weights.
     w[!is.finite(w) | w < 0] <- 0
     sw <- sum(w)
@@ -1713,9 +1745,9 @@ enhanced_smc_elite <- function(data, loglik_fn, mu_ref = NULL, Sigma_ref = NULL,
     }
 
     next_lambda <- if (gss_enable && !is.null(ref_mix) && !is.null(lp_ref)) {
-      next_lambda_via_rCESS_stat(w, h_step, lambda, target = cess_target, lambda_target = lambda_target)
+      next_lambda_via_rCESS_stat(w, h_step, lambda, target = cess_target_round, lambda_target = lambda_target)
     } else {
-      next_lambda_via_rCESS(w, h_step, lambda, target = cess_target, lambda_target = lambda_target)
+      next_lambda_via_rCESS(w, h_step, lambda, target = cess_target_round, lambda_target = lambda_target)
     }
     next_checkpoint <- if (checkpoint_ptr <= length(checkpoint_lambdas)) checkpoint_lambdas[checkpoint_ptr] else Inf
     lambda_new  <- min(next_lambda, lambda_target, next_checkpoint)
@@ -1728,7 +1760,7 @@ enhanced_smc_elite <- function(data, loglik_fn, mu_ref = NULL, Sigma_ref = NULL,
     lambda      <- lambda_new
     adapt_phase <- (lambda <= adapt_lambda_max)
 
-    cat(sprintf("%.3f (Δ=%.4f, CESS target=%.3f)\n", next_lambda, delta, cess_target))
+    cat(sprintf("%.3f (Δ=%.4f, CESS target=%.3f)\n", next_lambda, delta, cess_target_round))
 
     # Update weights in log-space for numerical stability
     mll   <- max(h_step)
@@ -1767,7 +1799,7 @@ enhanced_smc_elite <- function(data, loglik_fn, mu_ref = NULL, Sigma_ref = NULL,
     if (!is.finite(ess_frac)) ess_frac <- 0
     log_evidence <- log_evidence + logZ_inc
     pred_rcess_full <- rCESS_stat(w, h_step, lambda_target - lambda)
-    cat(sprintf("  rCESS(remain)=%.3f | target=%.3f\n", pred_rcess_full, cess_target))
+    cat(sprintf("  rCESS(remain)=%.3f | target=%.3f\n", pred_rcess_full, cess_target_round))
     cat(sprintf("  ESS(pre)=%.3f | logZ += %.4f -> %.4f\n", ess_frac, logZ_inc, log_evidence))
     if (ess_frac < resample_threshold) {
       # Pre-resample light rejuvenation (SKIP when λ is tiny to avoid wasted ll calls)
@@ -1784,7 +1816,7 @@ enhanced_smc_elite <- function(data, loglik_fn, mu_ref = NULL, Sigma_ref = NULL,
           mu_ref, prior_L, w_new,
           elite_mix = emix_pre, hist_mix = NULL,
           reference_prior = reference_prior,
-          data = data, loglik_fn = loglik_fn,
+          data = NULL, loglik_fn = bridge_stat_kernel,
           n_moves = 1,
           rw_prob = 0.40, rw_scale = 0.35,
           pcn_prob = 0.60, pcn_beta = pcn_beta_curr,
@@ -1793,6 +1825,7 @@ enhanced_smc_elite <- function(data, loglik_fn, mu_ref = NULL, Sigma_ref = NULL,
           param_names = param_names,
           weak_dim_idx = integer(0), rw_expand_factor = 1.0,
           resampled = FALSE,
+          base_logpdf_fn = base_logpdf,
           allow_pcn = allow_pcn,
           n_cores = n_cores
         )
@@ -1840,7 +1873,11 @@ enhanced_smc_elite <- function(data, loglik_fn, mu_ref = NULL, Sigma_ref = NULL,
     }
     # Keep the clipped/current lambda in state; `next_lambda` can lie beyond a
     # checkpoint or guard-floor adjustment.
-    w <- w_new; lambda_hist <- c(lambda_hist, lambda)
+    w <- w_new
+    lambda_hist <- c(lambda_hist, lambda)
+    ess_frac_hist <- c(ess_frac_hist, ess_frac)
+    resampled_hist <- c(resampled_hist, resampled)
+    log_increment_hist <- c(log_increment_hist, logZ_inc)
 
     # Post-resampling jitter now handled by the single adaptive branch below.
     if (resampled) {
@@ -1857,7 +1894,7 @@ enhanced_smc_elite <- function(data, loglik_fn, mu_ref = NULL, Sigma_ref = NULL,
           mu_ref, prior_L, w,
           elite_mix = .default_std_normal_mix(ncol(Z)), hist_mix = NULL,
           reference_prior = reference_prior,
-          data = data, loglik_fn = loglik_fn,
+          data = NULL, loglik_fn = bridge_stat_kernel,
           n_moves = 1,
           rw_prob = 1, rw_scale = 0.35,
           pcn_prob = 0, pcn_beta = plogis(logit_pcn_beta),
@@ -1866,6 +1903,7 @@ enhanced_smc_elite <- function(data, loglik_fn, mu_ref = NULL, Sigma_ref = NULL,
           param_names = param_names,
           weak_dim_idx = integer(0), rw_expand_factor = 1.0,
           resampled = TRUE,
+          base_logpdf_fn = base_logpdf,
           allow_pcn = allow_pcn,
           n_cores = n_cores)
         Z <- mover1$Z; loglik <- mover1$loglik; lpz <- mover1$lpz
@@ -1881,7 +1919,7 @@ enhanced_smc_elite <- function(data, loglik_fn, mu_ref = NULL, Sigma_ref = NULL,
             mu_ref, prior_L, w,
             elite_mix = .default_std_normal_mix(ncol(Z)), hist_mix = NULL,
             reference_prior = reference_prior,
-            data = data, loglik_fn = loglik_fn,
+            data = NULL, loglik_fn = bridge_stat_kernel,
             n_moves = 1,
             rw_prob = 0, rw_scale = 0.5,
             pcn_prob = 1, pcn_beta = plogis(logit_pcn_beta),
@@ -1890,6 +1928,7 @@ enhanced_smc_elite <- function(data, loglik_fn, mu_ref = NULL, Sigma_ref = NULL,
             param_names = param_names,
             weak_dim_idx = integer(0), rw_expand_factor = 1.0,
             resampled = TRUE,
+            base_logpdf_fn = base_logpdf,
             allow_pcn = allow_pcn,
             n_cores = n_cores)
           Z <- movej$Z; loglik <- movej$loglik; lpz <- movej$lpz
@@ -1907,7 +1946,7 @@ enhanced_smc_elite <- function(data, loglik_fn, mu_ref = NULL, Sigma_ref = NULL,
           mu_ref, prior_L, w,
           elite_mix = .default_std_normal_mix(ncol(Z)), hist_mix = NULL,
           reference_prior = reference_prior,
-          data = data, loglik_fn = loglik_fn,
+          data = NULL, loglik_fn = bridge_stat_kernel,
           n_moves = 1,
           rw_prob = 0, rw_scale = 0.5,
           pcn_prob = 1, pcn_beta = plogis(logit_pcn_beta),
@@ -1916,6 +1955,7 @@ enhanced_smc_elite <- function(data, loglik_fn, mu_ref = NULL, Sigma_ref = NULL,
           param_names = param_names,
           weak_dim_idx = integer(0), rw_expand_factor = 1.0,
           resampled = TRUE,
+          base_logpdf_fn = base_logpdf,
           allow_pcn = allow_pcn,
           n_cores = n_cores)
         Z <- movej$Z; loglik <- movej$loglik; lpz <- movej$lpz
@@ -1933,7 +1973,7 @@ enhanced_smc_elite <- function(data, loglik_fn, mu_ref = NULL, Sigma_ref = NULL,
           mu_ref, prior_L, w,
           elite_mix = .default_std_normal_mix(ncol(Z)), hist_mix = NULL,
           reference_prior = reference_prior,
-          data = data, loglik_fn = loglik_fn,
+          data = NULL, loglik_fn = bridge_stat_kernel,
           n_moves = 1,
           rw_prob = 1, rw_scale = 0.35,
           pcn_prob = 0, pcn_beta = plogis(logit_pcn_beta),
@@ -1942,6 +1982,7 @@ enhanced_smc_elite <- function(data, loglik_fn, mu_ref = NULL, Sigma_ref = NULL,
           param_names = param_names,
           weak_dim_idx = integer(0), rw_expand_factor = 1.0,
           resampled = TRUE,
+          base_logpdf_fn = base_logpdf,
           allow_pcn = allow_pcn,
           n_cores = n_cores)
           Z <- mover$Z; loglik <- mover$loglik; lpz <- mover$lpz
@@ -1994,7 +2035,7 @@ enhanced_smc_elite <- function(data, loglik_fn, mu_ref = NULL, Sigma_ref = NULL,
       }
       Tmap <- ref$Tmap
       Z    <- Tmap$fwd(Theta)
-      lpz  <- as.numeric(log_ref_theta(Theta) - Tmap$log_jac(Theta))
+      lpz  <- as.numeric(base_logpdf(Theta) - Tmap$log_jac(Theta))
       # Transport changed => all Z-space objects are invalid under old coordinates.
       last_elite_mix <- NULL
       elite_history  <- list()
@@ -2156,7 +2197,7 @@ enhanced_smc_elite <- function(data, loglik_fn, mu_ref = NULL, Sigma_ref = NULL,
     # Micro-calibration (tiny exact budget) to tighten stage-1 (early adaptive phase only).
     da_calib_info <- if (da_calib_active) {
       .calibrate_da_surrogate(Z, Theta, lpz, lambda, if (gss_enable) ref_mix else NULL,
-                              da_screen_mix, data, loglik_fn, Tmap,
+                              da_screen_mix, NULL, bridge_stat_kernel, Tmap,
                               ll_cache = ll_cache,
                               n = da_calibrate_n,
                               seed = .seed_plan_block(seed_plan, "da_calib", round = round, default = seed + 7L * round),
@@ -2253,7 +2294,7 @@ enhanced_smc_elite <- function(data, loglik_fn, mu_ref = NULL, Sigma_ref = NULL,
                                          mu_ref, prior_L, w,
                                          elite_mix, hist_mix,
                                          reference_prior = reference_prior,
-                                         data = data, loglik_fn = loglik_fn, n_moves = n_moves_eff,
+                                         data = NULL, loglik_fn = bridge_stat_kernel, n_moves = n_moves_eff,
                                          rw_prob = rw_prob_eff, rw_scale = rw_scale,
                                          pcn_prob = pcn_prob_eff, pcn_beta = pcn_beta_curr,
                                          indep_t_df = indep_t_df_eff, indep_t_prob = indep_t_prob_eff,
@@ -2270,6 +2311,7 @@ enhanced_smc_elite <- function(data, loglik_fn, mu_ref = NULL, Sigma_ref = NULL,
                                           da_calib = c(da_calib_info$a, da_calib_info$b),
                                           da_screen_mix = da_screen_mix,
                                           ll_cache = ll_cache,
+                                          base_logpdf_fn = base_logpdf,
                                           allow_pcn = allow_pcn,
                                           n_cores = n_cores)
     Z <- move$Z; loglik <- move$loglik; lpz <- move$lpz
@@ -2287,6 +2329,11 @@ enhanced_smc_elite <- function(data, loglik_fn, mu_ref = NULL, Sigma_ref = NULL,
     }
     # Update rolling acceptance snapshots for the next round's adaptive n_moves
     last_rw_acc <- move$rw_accept_rate; last_pcn_acc <- move$pcn_accept_rate; last_id_acc <- move$indep_accept_rate
+    accept_rate_hist <- c(accept_rate_hist, move$accept_rate)
+    rw_accept_rate_hist <- c(rw_accept_rate_hist, move$rw_accept_rate)
+    pcn_accept_rate_hist <- c(pcn_accept_rate_hist, move$pcn_accept_rate)
+    indep_accept_rate_hist <- c(indep_accept_rate_hist, move$indep_accept_rate)
+    da_pass_rate_hist <- c(da_pass_rate_hist, move$da_pass_rate)
     # ---- DA diagnostics & α update ----
     if (da_enable && !is.na(move$da_pass_rate)) {
       last_da_pass_rate <- move$da_pass_rate
@@ -2320,7 +2367,7 @@ enhanced_smc_elite <- function(data, loglik_fn, mu_ref = NULL, Sigma_ref = NULL,
     }
 
     # Compute KL divergence proxy for diagnostics
-    kl_proxy <- mean(lpz) - mean(log_ref_theta(Theta))
+    kl_proxy <- mean(lpz) - mean(base_logpdf(Theta))
     cat(sprintf("  acc[pCN=%.2f, rw=%.2f, id=%.2f] | KLproxy=%.3f\n",
                 move$pcn_accept_rate, move$rw_accept_rate,
                 move$indep_accept_rate, kl_proxy))
@@ -2358,6 +2405,14 @@ enhanced_smc_elite <- function(data, loglik_fn, mu_ref = NULL, Sigma_ref = NULL,
     checkpoint_log_increments = checkpoint_log_increments,
     seed_plan = seed_plan,
     meta = list(rounds = round, ess = ESS(w), lambda_hist = lambda_hist,
+                ess_frac_hist = ess_frac_hist,
+                resampled_hist = resampled_hist,
+                accept_rate_hist = accept_rate_hist,
+                rw_accept_rate_hist = rw_accept_rate_hist,
+                pcn_accept_rate_hist = pcn_accept_rate_hist,
+                indep_accept_rate_hist = indep_accept_rate_hist,
+                da_pass_rate_hist = da_pass_rate_hist,
+                log_increment_hist = log_increment_hist,
                 rw_scale_final = exp(log_rw_scale),
                 pcn_beta_final = plogis(logit_pcn_beta),
                 da_alpha_final = da_alpha,
