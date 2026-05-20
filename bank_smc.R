@@ -1274,58 +1274,13 @@ bank_smc_build_analytic_shape <- function(banks,
   )
 }
 
-bank_smc_combine_population_shapes <- function(shapes,
-                                               weights = NULL,
-                                               population_model = NULL) {
-  shapes <- shapes[!vapply(shapes, is.null, logical(1))]
-  if (!length(shapes)) stop("At least one population shape is required.")
-
-  model <- normalize_population_model(population_model %||% shapes[[1L]]$population_model)
-  weights <- as.numeric(weights %||% rep(1, length(shapes)))
-  if (length(weights) != length(shapes)) {
-    stop("Shape weights must match the number of shapes.")
-  }
-  weights <- .bank_normalize_weights(weights)
-
-  theta_parts <- vector("list", length(shapes))
-  weight_parts <- vector("list", length(shapes))
-  components <- vector("list", length(shapes))
-  for (k in seq_along(shapes)) {
-    theta_k <- .as_hyper_matrix(shapes[[k]]$theta, hyper_names = model$hyper_names, hyper_dim = model$hyper_dim)
-    w_k <- .bank_normalize_weights(shapes[[k]]$w)
-    theta_parts[[k]] <- theta_k
-    weight_parts[[k]] <- weights[k] * w_k
-    components[[k]] <- data.frame(
-      source = as.character(shapes[[k]]$meta$source %||% paste0("shape_", k)),
-      n = as.integer(nrow(theta_k)),
-      weight = as.numeric(weights[k]),
-      check.names = FALSE
-    )
-  }
-
-  theta <- do.call(rbind, theta_parts)
-  w <- .bank_normalize_weights(unlist(weight_parts, use.names = FALSE))
-  structure(
-    list(
-      theta = theta,
-      w = w,
-      population_model = model,
-      meta = list(
-        source = "combined_population_shape",
-        components = do.call(rbind, components)
-      )
-    ),
-    class = "bank_smc_analytic_shape"
-  )
-}
-
 .bank_population_broad_reference_prior_from_theta <- function(population_model,
                                                               theta,
                                                               scale = 16,
                                                               defensive = TRUE,
                                                               defensive_scale = 64,
                                                               defensive_weight = 0.20,
-                                                              label = "bank_weak_atlas_reference") {
+                                                              label = "bank_alpha_first_reference") {
   model <- normalize_population_model(population_model)
   theta <- .bank_align_theta(theta, model)
   components <- population_model_reference_components_from_theta(model, theta)
@@ -1341,25 +1296,25 @@ bank_smc_combine_population_shapes <- function(shapes,
   )
 }
 
-bank_smc_weak_local_atlas <- function(data_list,
-                                      loglik_fn,
-                                      population_model,
-                                      theta_reference,
-                                      M = 300L,
-                                      scale = 16,
-                                      defensive = TRUE,
-                                      defensive_scale = 64,
-                                      defensive_weight = 0.20,
-                                      resample_threshold = 0.6,
-                                      n_mcmc_moves = 2L,
-                                      max_rounds = 80L,
-                                      cess_target = 0.9,
-                                      G_mix = 8L,
-                                      rw_scale = 0.9,
-                                      n_jobs = 1L,
-                                      local_n_cores = 1L,
-                                      seed = 123L,
-                                      verbose = FALSE) {
+bank_smc_alpha_first_local_draws <- function(data_list,
+                                             loglik_fn,
+                                             population_model,
+                                             theta_reference,
+                                             M = 300L,
+                                             scale = 16,
+                                             defensive = TRUE,
+                                             defensive_scale = 64,
+                                             defensive_weight = 0.20,
+                                             resample_threshold = 0.6,
+                                             n_mcmc_moves = 2L,
+                                             max_rounds = 80L,
+                                             cess_target = 0.9,
+                                             G_mix = 8L,
+                                             rw_scale = 0.9,
+                                             n_jobs = 1L,
+                                             local_n_cores = 1L,
+                                             seed = 123L,
+                                             verbose = FALSE) {
   model <- normalize_population_model(population_model)
   theta_reference <- .bank_align_theta(theta_reference, model)
   reference_prior <- .bank_population_broad_reference_prior_from_theta(
@@ -1369,9 +1324,8 @@ bank_smc_weak_local_atlas <- function(data_list,
     defensive = defensive,
     defensive_scale = defensive_scale,
     defensive_weight = defensive_weight,
-    label = sprintf("weak_atlas_scale_%s", format(scale, trim = TRUE))
+    label = sprintf("alpha_first_scale_%s", format(scale, trim = TRUE))
   )
-
   ids <- seq_along(data_list)
   fits <- parallel::mclapply(
     ids,
@@ -1401,17 +1355,13 @@ bank_smc_weak_local_atlas <- function(data_list,
           local_id = as.integer(i),
           alpha = .bank_align_alpha(fit$Theta, model),
           weights = .bank_normalize_weights(fit$w),
-          log_evidence = as.numeric(fit$log_evidence),
           diagnostics = list(
-            source = "weak_local_atlas",
-            scale = as.numeric(scale),
-            defensive = isTRUE(defensive),
             final_ess_frac = as.numeric(ESS(fit$w) / length(fit$w)),
             rounds = as.integer(fit$meta$rounds %||% NA_integer_),
             mean_accept_rate = .bank_mean_or_na(fit$meta$accept_rate_hist)
           )
         ),
-        class = "bank_smc_weak_local_fit"
+        class = "bank_smc_alpha_first_local_fit"
       )
     },
     mc.cores = as.integer(max(1L, n_jobs))
@@ -1421,33 +1371,37 @@ bank_smc_weak_local_atlas <- function(data_list,
   structure(
     list(
       fits = fits,
-      reference_prior = reference_prior,
       population_model = model,
       meta = list(
-        source = "weak_local_atlas",
+        source = "alpha_first_local_draws",
         scale = as.numeric(scale),
         M = as.integer(M),
         defensive = isTRUE(defensive),
         defensive_scale = as.numeric(defensive_scale),
-        defensive_weight = as.numeric(defensive_weight)
+        defensive_weight = as.numeric(defensive_weight),
+        median_ess_frac = stats::median(vapply(
+          fits,
+          function(fit) fit$diagnostics$final_ess_frac,
+          numeric(1)
+        ), na.rm = TRUE)
       )
     ),
-    class = "bank_smc_weak_local_atlas"
+    class = "bank_smc_alpha_first_local_draws"
   )
 }
 
-bank_smc_sample_alpha_configs_from_weak_atlas <- function(atlas,
-                                                         population_model = NULL,
-                                                         n_configs = 128L,
-                                                         seed = NULL) {
-  if (!inherits(atlas, "bank_smc_weak_local_atlas")) {
-    stop("atlas must inherit from 'bank_smc_weak_local_atlas'.")
+bank_smc_sample_alpha_configs_from_alpha_first <- function(draws,
+                                                          population_model = NULL,
+                                                          n_configs = 128L,
+                                                          seed = NULL) {
+  if (!inherits(draws, "bank_smc_alpha_first_local_draws")) {
+    stop("draws must inherit from 'bank_smc_alpha_first_local_draws'.")
   }
-  model <- normalize_population_model(population_model %||% atlas$population_model)
+  model <- normalize_population_model(population_model %||% draws$population_model)
   n_configs <- as.integer(max(1L, n_configs))
   if (!is.null(seed)) set.seed(as.integer(seed))
 
-  fits <- atlas$fits
+  fits <- draws$fits
   out <- array(
     NA_real_,
     dim = c(n_configs, length(fits), model$alpha_dim),
@@ -1462,15 +1416,15 @@ bank_smc_sample_alpha_configs_from_weak_atlas <- function(atlas,
   out
 }
 
-bank_smc_rank_coherent_alpha_configs_from_weak_atlas <- function(atlas,
-                                                                population_model = NULL,
-                                                                probs = c(0.025, 0.05, 0.1, 0.2, 0.8, 0.9, 0.95, 0.975)) {
-  if (!inherits(atlas, "bank_smc_weak_local_atlas")) {
-    stop("atlas must inherit from 'bank_smc_weak_local_atlas'.")
+bank_smc_rank_coherent_alpha_configs_from_alpha_first <- function(draws,
+                                                                 population_model = NULL,
+                                                                 probs = c(0.025, 0.05, 0.1, 0.2, 0.8, 0.9, 0.95, 0.975)) {
+  if (!inherits(draws, "bank_smc_alpha_first_local_draws")) {
+    stop("draws must inherit from 'bank_smc_alpha_first_local_draws'.")
   }
-  model <- normalize_population_model(population_model %||% atlas$population_model)
+  model <- normalize_population_model(population_model %||% draws$population_model)
   probs <- sort(unique(pmin(pmax(as.numeric(probs), 1e-4), 1 - 1e-4)))
-  fits <- atlas$fits
+  fits <- draws$fits
 
   quantiles <- array(
     NA_real_,
@@ -1524,33 +1478,33 @@ bank_smc_rank_coherent_alpha_configs_from_weak_atlas <- function(atlas,
   out
 }
 
-bank_smc_build_weak_atlas_shape <- function(data_list,
-                                            loglik_fn,
-                                            population_model,
-                                            theta_reference,
-                                            n_alpha_configs = 128L,
-                                            draws_per_config = 1L,
-                                            ell_grid_size = 96L,
-                                            M = 300L,
-                                            scales = c(16, 4),
-                                            coherent_probs = c(0.025, 0.05, 0.1, 0.2, 0.8, 0.9, 0.95, 0.975),
-                                            defensive = TRUE,
-                                            defensive_scale = 64,
-                                            defensive_weight = 0.20,
-                                            resample_threshold = 0.6,
-                                            n_mcmc_moves = 2L,
-                                            max_rounds = 80L,
-                                            cess_target = 0.9,
-                                            G_mix = 8L,
-                                            rw_scale = 0.9,
-                                            n_jobs = 1L,
-                                            local_n_cores = 1L,
-                                            seed = 123L,
-                                            verbose = FALSE) {
+bank_smc_alpha_first_anchor_candidates <- function(data_list,
+                                                  loglik_fn,
+                                                  population_model,
+                                                  theta_reference,
+                                                  n_alpha_configs = 128L,
+                                                  draws_per_config = 1L,
+                                                  ell_grid_size = 96L,
+                                                  M = 300L,
+                                                  scales = c(16, 4),
+                                                  coherent_probs = c(0.025, 0.05, 0.1, 0.2, 0.8, 0.9, 0.95, 0.975),
+                                                  defensive = TRUE,
+                                                  defensive_scale = 64,
+                                                  defensive_weight = 0.20,
+                                                  resample_threshold = 0.6,
+                                                  n_mcmc_moves = 2L,
+                                                  max_rounds = 80L,
+                                                  cess_target = 0.9,
+                                                  G_mix = 8L,
+                                                  rw_scale = 0.9,
+                                                  n_jobs = 1L,
+                                                  local_n_cores = 1L,
+                                                  seed = 123L,
+                                                  verbose = FALSE) {
   model <- normalize_population_model(population_model)
   scales <- as.numeric(scales)
   scales <- scales[is.finite(scales) & scales > 0]
-  if (!length(scales)) stop("Weak atlas scales must contain at least one positive value.")
+  if (!length(scales)) stop("Alpha-first scales must contain at least one positive value.")
 
   n_alpha_configs <- as.integer(max(1L, n_alpha_configs))
   draws_per_config <- as.integer(max(1L, draws_per_config))
@@ -1559,9 +1513,9 @@ bank_smc_build_weak_atlas_shape <- function(data_list,
     config_counts[seq_len(n_alpha_configs %% length(scales))] + 1L
 
   theta_parts <- vector("list", length(scales))
-  atlas_meta <- vector("list", length(scales))
+  meta_rows <- vector("list", length(scales))
   for (k in seq_along(scales)) {
-    atlas <- bank_smc_weak_local_atlas(
+    local_draws <- bank_smc_alpha_first_local_draws(
       data_list = data_list,
       loglik_fn = loglik_fn,
       population_model = model,
@@ -1582,8 +1536,8 @@ bank_smc_build_weak_atlas_shape <- function(data_list,
       seed = as.integer(seed + 100000L * k),
       verbose = verbose
     )
-    coherent_configs <- bank_smc_rank_coherent_alpha_configs_from_weak_atlas(
-      atlas = atlas,
+    coherent_configs <- bank_smc_rank_coherent_alpha_configs_from_alpha_first(
+      draws = local_draws,
       population_model = model,
       probs = coherent_probs
     )
@@ -1593,8 +1547,8 @@ bank_smc_build_weak_atlas_shape <- function(data_list,
     }
     n_random <- as.integer(config_counts[k] - dim(coherent_configs)[1L])
     alpha_configs <- if (n_random > 0L) {
-      random_configs <- bank_smc_sample_alpha_configs_from_weak_atlas(
-        atlas = atlas,
+      random_configs <- bank_smc_sample_alpha_configs_from_alpha_first(
+        draws = local_draws,
         population_model = model,
         n_configs = n_random,
         seed = as.integer(seed + 200000L * k)
@@ -1610,15 +1564,11 @@ bank_smc_build_weak_atlas_shape <- function(data_list,
       seed = as.integer(seed + 300000L * k),
       ell_grid_size = ell_grid_size
     )
-    atlas_meta[[k]] <- data.frame(
+    meta_rows[[k]] <- data.frame(
       scale = as.numeric(scales[k]),
       n_alpha_configs = as.integer(config_counts[k]),
       coherent_configs = as.integer(dim(coherent_configs)[1L]),
-      median_local_ess_frac = stats::median(vapply(
-        atlas$fits,
-        function(fit) as.numeric(fit$diagnostics$final_ess_frac),
-        numeric(1)
-      ), na.rm = TRUE),
+      median_local_ess_frac = as.numeric(local_draws$meta$median_ess_frac),
       check.names = FALSE
     )
   }
@@ -1630,12 +1580,46 @@ bank_smc_build_weak_atlas_shape <- function(data_list,
       w = rep(1 / nrow(theta), nrow(theta)),
       population_model = model,
       meta = list(
-        source = "weak_atlas_conditional_group_shape",
+        source = "alpha_first_anchor_candidates",
         scales = scales,
         n_alpha_configs = as.integer(n_alpha_configs),
         draws_per_config = as.integer(draws_per_config),
         ell_grid_size = as.integer(ell_grid_size),
-        atlas = do.call(rbind, atlas_meta)
+        local = do.call(rbind, meta_rows)
+      )
+    ),
+    class = "bank_smc_anchor_candidates"
+  )
+}
+
+bank_smc_anchor_design_fit <- function(anchor_candidates,
+                                       reference_fit,
+                                       population_model = NULL,
+                                       anchor_weight = 0.70) {
+  if (is.null(anchor_candidates)) return(reference_fit)
+  model <- normalize_population_model(population_model %||% anchor_candidates$population_model)
+  anchor_theta <- .as_hyper_matrix(anchor_candidates$theta, hyper_names = model$hyper_names, hyper_dim = model$hyper_dim)
+  anchor_w <- .bank_normalize_weights(anchor_candidates$w %||% rep(1, nrow(anchor_theta)))
+  ref_theta <- .as_hyper_matrix(reference_fit$theta, hyper_names = model$hyper_names, hyper_dim = model$hyper_dim)
+  ref_w <- .bank_normalize_weights(reference_fit$w)
+
+  anchor_weight <- min(max(as.numeric(anchor_weight), 0), 1)
+  theta <- rbind(anchor_theta, ref_theta)
+  colnames(theta) <- model$hyper_names
+  w <- .bank_normalize_weights(c(anchor_weight * anchor_w, (1 - anchor_weight) * ref_w))
+
+  structure(
+    list(
+      theta = theta,
+      w = w,
+      population_model = model,
+      meta = list(
+        source = "alpha_first_anchor_design",
+        anchor_weight = anchor_weight,
+        anchor_rows = as.integer(nrow(anchor_theta)),
+        reference_rows = as.integer(nrow(ref_theta)),
+        anchor_source = anchor_candidates$meta$source %||% NA_character_,
+        reference_source = reference_fit$meta$source %||% NA_character_
       )
     ),
     class = "bank_smc_analytic_shape"
@@ -1651,6 +1635,7 @@ bank_smc_select_theta_design <- function(population_fit,
                                          include_center = TRUE,
                                          banks = NULL,
                                          initial_theta = NULL,
+                                         extra_theta = NULL,
                                          prior_stress = FALSE,
                                          prior_tail_probs = c(0.025, 0.975),
                                          target_ess_frac = 0.3,
@@ -1696,6 +1681,10 @@ bank_smc_select_theta_design <- function(population_fit,
     stress_center <- initial_theta %||% matrix(center, nrow = 1L)
     stress <- .bank_theta_prior_stress_candidates(model, stress_center, tail_probs = prior_tail_probs)
     rows <- c(rows, lapply(seq_len(nrow(stress)), function(i) stress[i, , drop = FALSE]))
+  }
+  if (!is.null(extra_theta)) {
+    extra_theta <- .as_hyper_matrix(extra_theta, hyper_names = model$hyper_names, hyper_dim = model$hyper_dim)
+    rows <- c(rows, lapply(seq_len(nrow(extra_theta)), function(i) extra_theta[i, , drop = FALSE]))
   }
 
   out <- do.call(rbind, rows)
@@ -2033,6 +2022,7 @@ fit_bank_smc_population_model <- function(data_list,
                                           population_model,
                                           initial_theta,
                                           local_control = list(),
+                                          anchor_control = list(),
                                           shape_control = list(),
                                           outer_control = list(),
                                           design_control = list(),
@@ -2050,36 +2040,37 @@ fit_bank_smc_population_model <- function(data_list,
     target_cess = 0.9,
     n_mcmc_moves = 2L
   )
+  anchor_defaults <- list(
+    enabled = TRUE,
+    M = NULL,
+    n_alpha_configs = 128L,
+    scales = c(16, 4),
+    coherent_probs = c(0.025, 0.05, 0.1, 0.2, 0.8, 0.9, 0.95, 0.975),
+    anchor_weight = 0.70,
+    defensive = TRUE,
+    defensive_scale = 64,
+    defensive_weight = 0.20,
+    draws_per_config = 1L,
+    ell_grid_size = 96L,
+    n_mcmc_moves = 2L,
+    max_rounds = 80L,
+    cess_target = 0.9,
+    resample_threshold = 0.6,
+    G_mix = 8L,
+    rw_scale = 0.9
+  )
   design_defaults <- list(
     support_points = 6L,
     profile_dims = 4L,
     tail_probs = c(0.025, 0.1, 0.9, 0.975),
     initial_tail_probs = c(0.01, 0.025, 0.1, 0.9, 0.975, 0.99)
   )
-  shape_defaults <- list(
-    n_alpha_configs = 128L,
-    draws_per_config = 1L,
-    ell_grid_size = 96L,
-    weak_atlas = TRUE,
-    weak_particles = NULL,
-    weak_scales = c(16, 4),
-    weak_coherent_probs = c(0.025, 0.05, 0.1, 0.2, 0.8, 0.9, 0.95, 0.975),
-    weak_defensive = TRUE,
-    weak_defensive_scale = 64,
-    weak_defensive_weight = 0.20,
-    weak_shape_weight = 0.70,
-    bank_shape_weight = 0.30,
-    weak_n_mcmc_moves = 2L,
-    weak_max_rounds = 80L,
-    weak_cess_target = 0.9,
-    weak_resample_threshold = 0.6,
-    weak_G_mix = 8L,
-    weak_rw_scale = 0.9
-  )
+  shape_defaults <- list(n_alpha_configs = 128L, draws_per_config = 1L, ell_grid_size = 96L)
   audit_defaults <- list(max_points = 5L, target_ess_frac = 0.05, max_pareto_k = 0.7, max_repairs = 20L, refine_rounds = 3L)
   local_control <- modifyList(local_defaults, local_control)
+  anchor_control <- modifyList(anchor_defaults, anchor_control)
+  anchor_control$M <- as.integer(anchor_control$M %||% min(400L, local_control$M))
   shape_control <- modifyList(shape_defaults, shape_control)
-  shape_control$weak_particles <- as.integer(shape_control$weak_particles %||% min(400L, local_control$M))
   design_control <- modifyList(design_defaults, design_control)
   node_budget <- if (is.finite(local_control$max_nodes)) as.integer(local_control$max_nodes) else 5L
   design_control$max_points <- as.integer(
@@ -2103,29 +2094,29 @@ fit_bank_smc_population_model <- function(data_list,
     verbose = FALSE
   )
 
-  weak_shape_fit <- NULL
-  if (isTRUE(shape_control$weak_atlas)) {
-    if (isTRUE(verbose)) cat("Bank SMC: weak alpha-first population shape\n")
-    weak_shape_fit <- bank_smc_build_weak_atlas_shape(
+  anchor_candidates <- NULL
+  if (isTRUE(anchor_control$enabled)) {
+    if (isTRUE(verbose)) cat("Bank SMC: alpha-first anchor candidates\n")
+    anchor_candidates <- bank_smc_alpha_first_anchor_candidates(
       data_list = data_list,
       loglik_fn = loglik_fn,
       population_model = model,
       theta_reference = initial_theta,
-      n_alpha_configs = shape_control$n_alpha_configs,
-      draws_per_config = shape_control$draws_per_config,
-      ell_grid_size = shape_control$ell_grid_size,
-      M = shape_control$weak_particles,
-      scales = shape_control$weak_scales,
-      coherent_probs = shape_control$weak_coherent_probs,
-      defensive = shape_control$weak_defensive,
-      defensive_scale = shape_control$weak_defensive_scale,
-      defensive_weight = shape_control$weak_defensive_weight,
-      resample_threshold = shape_control$weak_resample_threshold,
-      n_mcmc_moves = shape_control$weak_n_mcmc_moves,
-      max_rounds = shape_control$weak_max_rounds,
-      cess_target = shape_control$weak_cess_target,
-      G_mix = shape_control$weak_G_mix,
-      rw_scale = shape_control$weak_rw_scale,
+      n_alpha_configs = anchor_control$n_alpha_configs,
+      draws_per_config = anchor_control$draws_per_config,
+      ell_grid_size = anchor_control$ell_grid_size,
+      M = anchor_control$M,
+      scales = anchor_control$scales,
+      coherent_probs = anchor_control$coherent_probs,
+      defensive = anchor_control$defensive,
+      defensive_scale = anchor_control$defensive_scale,
+      defensive_weight = anchor_control$defensive_weight,
+      resample_threshold = anchor_control$resample_threshold,
+      n_mcmc_moves = anchor_control$n_mcmc_moves,
+      max_rounds = anchor_control$max_rounds,
+      cess_target = anchor_control$cess_target,
+      G_mix = anchor_control$G_mix,
+      rw_scale = anchor_control$rw_scale,
       n_jobs = n_cores,
       local_n_cores = 1L,
       seed = seed + 50000L,
@@ -2134,7 +2125,7 @@ fit_bank_smc_population_model <- function(data_list,
   }
 
   if (isTRUE(verbose)) cat("Bank SMC: bank-imputed population shape\n")
-  bank_shape_fit <- bank_smc_build_analytic_shape(
+  shape_fit <- bank_smc_build_analytic_shape(
     banks = banks,
     population_model = model,
     theta_reference = initial_theta,
@@ -2143,16 +2134,13 @@ fit_bank_smc_population_model <- function(data_list,
     ell_grid_size = shape_control$ell_grid_size,
     seed = seed + 100000L
   )
-  shape_fit <- if (is.null(weak_shape_fit)) {
-    bank_shape_fit
-  } else {
-    bank_smc_combine_population_shapes(
-      shapes = list(weak_atlas = weak_shape_fit, bank_imputed = bank_shape_fit),
-      weights = c(shape_control$weak_shape_weight, shape_control$bank_shape_weight),
-      population_model = model
-    )
-  }
 
+  design_fit <- bank_smc_anchor_design_fit(
+    anchor_candidates = anchor_candidates,
+    reference_fit = shape_fit,
+    population_model = model,
+    anchor_weight = anchor_control$anchor_weight
+  )
   initial_design_control <- design_control
   initial_design_control$tail_probs <- initial_design_control$initial_tail_probs
   initial_design_control$initial_tail_probs <- NULL
@@ -2160,7 +2148,7 @@ fit_bank_smc_population_model <- function(data_list,
     bank_smc_select_theta_design,
     c(
       list(
-        population_fit = shape_fit,
+        population_fit = design_fit,
         population_model = model,
         banks = banks,
         initial_theta = initial_theta,
@@ -2281,6 +2269,7 @@ fit_bank_smc_population_model <- function(data_list,
     banks = banks,
     factor_set = factor_set,
     shape_fit = shape_fit,
+    anchor_candidates = anchor_candidates,
     fit = fit,
     theta_design = theta_design,
     design_refinement = design_refinement$refinements,
@@ -2290,6 +2279,7 @@ fit_bank_smc_population_model <- function(data_list,
     settings = list(
       local_control = local_control,
       shape_control = shape_control,
+      anchor_control = anchor_control,
       design_control = design_control,
       audit_control = audit_control,
       seed = seed
