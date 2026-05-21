@@ -779,6 +779,18 @@ population_factor_set_loglik <- function(factor_set, theta, include_constant = F
   model <- factor_set$population_model
   theta <- .as_hyper_matrix(theta, hyper_names = model$hyper_names, hyper_dim = model$hyper_dim)
 
+  if (inherits(factor_set, "local_likelihood_sketch_factor_set")) {
+    out <- local_likelihood_sketch_set_loglik(
+      sketch_set = factor_set$sketch_set,
+      population_model = model,
+      theta = theta,
+      rho = factor_set$rho,
+      n_jobs = n_cores
+    )
+    if (isTRUE(include_constant)) out <- out + factor_set$log_constant
+    return(out)
+  }
+
   if (!length(factor_set$factors)) {
     out <- rep.int(0, nrow(theta))
     if (isTRUE(include_constant)) out <- out + factor_set$log_constant
@@ -818,6 +830,19 @@ population_factor_set_loglik_by_local <- function(factor_set,
   stopifnot(inherits(factor_set, "population_factor_set"))
   model <- factor_set$population_model
   theta <- .as_hyper_matrix(theta, hyper_names = model$hyper_names, hyper_dim = model$hyper_dim)
+
+  if (inherits(factor_set, "local_likelihood_sketch_factor_set")) {
+    out <- local_likelihood_sketch_set_log_marginal_matrix(
+      sketch_set = factor_set$sketch_set,
+      population_model = model,
+      theta = theta,
+      rho = factor_set$rho,
+      n_jobs = n_cores
+    )
+    if (isTRUE(include_constant)) out <- out + factor_set$log_constant / max(ncol(out), 1L)
+    return(out)
+  }
+
   if (!length(factor_set$factors)) {
     return(matrix(numeric(0), nrow = nrow(theta), ncol = 0L))
   }
@@ -1160,6 +1185,7 @@ outer_population_smc <- function(factor_set,
                                  resample_sort_mode = c("adaptive", "hilbert", "cheap1d", "none"),
                                  hilbert_hard_ess = 0.25,
                                  hilbert_max_dim = 8L,
+                                 cess_target = NULL,
                                  n_cores = 1L,
                                  seed = 123L,
                                  verbose = TRUE) {
@@ -1173,6 +1199,12 @@ outer_population_smc <- function(factor_set,
     stop("beta_target must be in (0, 1].")
   }
   resample_sort_mode <- match.arg(resample_sort_mode)
+  if (!is.null(cess_target)) {
+    cess_target <- as.numeric(cess_target)
+    if (length(cess_target) != 1L || !is.finite(cess_target) || cess_target <= 0 || cess_target >= 1) {
+      stop("cess_target must be NULL or a scalar in (0, 1).")
+    }
+  }
   min_mcmc_moves <- as.integer(max(1L, min_mcmc_moves))
   n_mcmc_moves <- as.integer(max(min_mcmc_moves, n_mcmc_moves))
 
@@ -1198,7 +1230,7 @@ outer_population_smc <- function(factor_set,
 
   while (beta < beta_target - 1e-12 && round < as.integer(max_rounds)) {
     round <- round + 1L
-    target_cess <- cess_target_at_lambda(beta)
+    target_cess <- cess_target %||% cess_target_at_lambda(beta)
     beta_new <- next_lambda_via_rCESS(
       w = w,
       loglik = loglik_dynamic,
