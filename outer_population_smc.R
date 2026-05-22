@@ -22,6 +22,11 @@ if (!exists("normalize_population_model", mode = "function") ||
     !exists("population_model_log_alpha_given_prepared_theta_many", mode = "function")) {
   source("population_models.R")
 }
+if (!exists("theta_proposal_sample", mode = "function") ||
+    !exists("theta_proposal_log_density", mode = "function") ||
+    !exists("normalize_theta_proposal", mode = "function")) {
+  source("theta_proposals.R")
+}
 
 suppressPackageStartupMessages({
   library(parallel)
@@ -958,6 +963,9 @@ population_factor_set_logposterior <- function(factor_set, theta, include_consta
                               loglik_dynamic,
                               beta,
                               factor_set,
+                              logbase = NULL,
+                              bridge_stat = NULL,
+                              initial_proposal = NULL,
                               w = NULL,
                               min_n_moves = 1L,
                               max_n_moves = 3L,
@@ -988,6 +996,13 @@ population_factor_set_logposterior <- function(factor_set, theta, include_consta
     ))
   }
 
+  proposal_bridge <- !is.null(initial_proposal)
+  if (proposal_bridge) {
+    initial_proposal <- normalize_theta_proposal(initial_proposal, population_model = factor_set$population_model)
+  }
+  logbase <- as.numeric(logbase %||% logprior)
+  bridge_stat <- as.numeric(bridge_stat %||% loglik_dynamic)
+
   if (is.null(w)) {
     w_cov <- rep(1 / N, N)
   } else {
@@ -1016,7 +1031,7 @@ population_factor_set_logposterior <- function(factor_set, theta, include_consta
 
   acc_total <- 0L
   prop_total <- 0L
-  logpost <- logprior + beta * loglik_dynamic
+  logpost <- logbase + beta * bridge_stat
   move_accept <- numeric(0)
   cumulative_accept <- 0
 
@@ -1027,16 +1042,28 @@ population_factor_set_logposterior <- function(factor_set, theta, include_consta
 
     logprior_prop <- population_model_log_hyperprior(model, theta_prop)
     ok <- is.finite(logprior_prop)
-    loglik_prop <- rep(-Inf, N)
+    logfactor_prop <- rep(-Inf, N)
     if (any(ok)) {
-      loglik_prop[ok] <- population_factor_set_loglik(
+      logfactor_prop[ok] <- population_factor_set_loglik(
         factor_set,
         theta = theta_prop[ok, , drop = FALSE],
         include_constant = FALSE,
         n_cores = n_cores
       )
     }
-    logpost_prop <- logprior_prop + beta * loglik_prop
+    if (proposal_bridge) {
+      logq_prop <- rep(-Inf, N)
+      if (any(ok)) {
+        logq_prop[ok] <- theta_proposal_log_density(initial_proposal, theta_prop[ok, , drop = FALSE])
+      }
+      logbase_prop <- logq_prop
+      bridge_stat_prop <- logprior_prop + logfactor_prop - logq_prop
+    } else {
+      logq_prop <- rep(NA_real_, N)
+      logbase_prop <- logprior_prop
+      bridge_stat_prop <- logfactor_prop
+    }
+    logpost_prop <- logbase_prop + beta * bridge_stat_prop
     log_alpha <- logpost_prop - logpost
     accept <- which(log(runif(N)) < pmin(0, log_alpha))
     prop_total <- prop_total + N
@@ -1052,7 +1079,9 @@ population_factor_set_logposterior <- function(factor_set, theta, include_consta
     if (length(accept)) {
       theta[accept, ] <- theta_prop[accept, , drop = FALSE]
       logprior[accept] <- logprior_prop[accept]
-      loglik_dynamic[accept] <- loglik_prop[accept]
+      loglik_dynamic[accept] <- logfactor_prop[accept]
+      logbase[accept] <- logbase_prop[accept]
+      bridge_stat[accept] <- bridge_stat_prop[accept]
       logpost[accept] <- logpost_prop[accept]
       acc_total <- acc_total + length(accept)
     }
@@ -1066,6 +1095,9 @@ population_factor_set_logposterior <- function(factor_set, theta, include_consta
     theta = theta,
     logprior = logprior,
     loglik_dynamic = loglik_dynamic,
+    logbase = logbase,
+    bridge_stat = bridge_stat,
+    logq0 = if (proposal_bridge) logbase else rep(NA_real_, N),
     accept_rate = if (prop_total > 0L) acc_total / prop_total else 0,
     move_accept = move_accept,
     n_moves_used = length(move_accept),
@@ -1152,6 +1184,9 @@ update_outer_population_fit <- function(fit,
   }
   fit$logprior <- rejuvenated$logprior
   fit$loglik_dynamic <- rejuvenated$loglik_dynamic
+  fit$bridge_stat <- rejuvenated$bridge_stat
+  fit$logbase <- rejuvenated$logbase
+  fit$logq0 <- rejuvenated$logq0
   fit$population_model <- model
   fit$log_evidence_dynamic <- as.numeric(fit$log_evidence_dynamic %||% 0) + lse
   fit$log_evidence_constant <- new_factor_set$log_constant
@@ -1170,6 +1205,7 @@ update_outer_population_fit <- function(fit,
 
 outer_population_smc <- function(factor_set,
                                  N = 2000L,
+                                 initial_proposal = NULL,
                                  resample_threshold = 0.5,
                                  n_mcmc_moves = 3L,
                                  min_mcmc_moves = 1L,
@@ -1208,10 +1244,23 @@ outer_population_smc <- function(factor_set,
   min_mcmc_moves <- as.integer(max(1L, min_mcmc_moves))
   n_mcmc_moves <- as.integer(max(min_mcmc_moves, n_mcmc_moves))
 
-  theta <- population_model_sample_hyper(model, n = as.integer(N))
+  proposal_bridge <- !is.null(initial_proposal)
+  if (proposal_bridge) {
+    initial_proposal <- normalize_theta_proposal(initial_proposal, population_model = model)
+    theta <- theta_proposal_sample(initial_proposal, n = as.integer(N), seed = seed)
+  } else {
+    theta <- population_model_sample_hyper(model, n = as.integer(N))
+  }
   colnames(theta) <- model$hyper_names
   logprior <- population_model_log_hyperprior(model, theta)
   loglik_dynamic <- population_factor_set_loglik(factor_set, theta, include_constant = FALSE, n_cores = n_cores)
+  logq0 <- if (proposal_bridge) {
+    theta_proposal_log_density(initial_proposal, theta)
+  } else {
+    rep(NA_real_, nrow(theta))
+  }
+  logbase <- if (proposal_bridge) logq0 else logprior
+  bridge_stat <- if (proposal_bridge) logprior + loglik_dynamic - logq0 else loglik_dynamic
 
   w <- rep(1 / N, N)
   beta <- 0.0
@@ -1233,7 +1282,7 @@ outer_population_smc <- function(factor_set,
     target_cess <- cess_target %||% cess_target_at_lambda(beta)
     beta_new <- next_lambda_via_rCESS(
       w = w,
-      loglik = loglik_dynamic,
+      loglik = bridge_stat,
       lambda = beta,
       target = target_cess,
       lambda_target = beta_target
@@ -1243,7 +1292,7 @@ outer_population_smc <- function(factor_set,
     }
 
     delta <- beta_new - beta
-    x <- as.numeric(loglik_dynamic)
+    x <- as.numeric(bridge_stat)
     ok <- is.finite(x)
     if (!any(ok)) stop("All outer log-likelihood values are non-finite.")
     x[!ok] <- min(x[ok])
@@ -1286,6 +1335,9 @@ outer_population_smc <- function(factor_set,
       theta <- theta[idx, , drop = FALSE]
       logprior <- logprior[idx]
       loglik_dynamic <- loglik_dynamic[idx]
+      logbase <- logbase[idx]
+      bridge_stat <- bridge_stat[idx]
+      logq0 <- logq0[idx]
       w <- rep(1 / N, N)
       resampled <- TRUE
     }
@@ -1296,6 +1348,9 @@ outer_population_smc <- function(factor_set,
       loglik_dynamic = loglik_dynamic,
       beta = beta,
       factor_set = factor_set,
+      logbase = logbase,
+      bridge_stat = bridge_stat,
+      initial_proposal = initial_proposal,
       w = w,
       min_n_moves = min_mcmc_moves,
       max_n_moves = n_mcmc_moves,
@@ -1312,6 +1367,9 @@ outer_population_smc <- function(factor_set,
     theta <- rejuvenated$theta
     logprior <- rejuvenated$logprior
     loglik_dynamic <- rejuvenated$loglik_dynamic
+    logbase <- rejuvenated$logbase
+    bridge_stat <- rejuvenated$bridge_stat
+    logq0 <- rejuvenated$logq0
     accept_rate <- rejuvenated$accept_rate
     log_rw_scale <- log(pmax(rejuvenated$rw_scale, 1e-6))
 
@@ -1342,6 +1400,9 @@ outer_population_smc <- function(factor_set,
     w = w,
     logprior = logprior,
     loglik_dynamic = loglik_dynamic,
+    bridge_stat = bridge_stat,
+    logbase = logbase,
+    logq0 = logq0,
     beta = beta,
     log_evidence_dynamic = log_evidence_dynamic,
     log_evidence_constant = factor_set$log_constant,
@@ -1357,6 +1418,8 @@ outer_population_smc <- function(factor_set,
       resampled_hist = resampled_hist,
       moves_hist = moves_hist,
       sort_hist = sort_hist
-    )
+    ),
+    initial_proposal = initial_proposal,
+    proposal_bridge = proposal_bridge
   )
 }

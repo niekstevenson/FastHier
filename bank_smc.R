@@ -54,6 +54,14 @@ if (!exists("normalize_population_model", mode = "function") ||
   if (!length(x) || all(is.na(x))) NA_real_ else mean(x, na.rm = TRUE)
 }
 
+.bank_assert_smc_complete <- function(fit, label, tol = 1e-10) {
+  final_lambda <- as.numeric(fit$final_lambda %||% NA_real_)
+  if (!is.finite(final_lambda) || final_lambda < 1 - tol) {
+    stop(label, " SMC stopped before lambda_target; log_marginal_anchor is not a completed local normalizer.")
+  }
+  invisible(TRUE)
+}
+
 .bank_align_alpha <- function(alpha, population_model) {
   model <- normalize_population_model(population_model)
   alpha <- as.matrix(alpha)
@@ -391,6 +399,128 @@ bank_smc_local_bank_replace_node <- function(bank,
   validate_bank_smc_local_bank(bank, population_model = population_model)
 }
 
+bank_smc_calibrate_local_bank_normalizers <- function(bank,
+                                                      population_model,
+                                                      max_iter = 200L,
+                                                      tol = 1e-8,
+                                                      anchor = c("mean_smc", "first_smc")) {
+  model <- normalize_population_model(population_model)
+  bank <- validate_bank_smc_local_bank(bank, population_model = model)
+  anchor <- match.arg(anchor)
+  S <- length(bank$nodes)
+  if (S <= 1L) {
+    bank$support_diagnostics$normalizer_calibration <- list(
+      method = "reverse_logistic_mbar",
+      converged = TRUE,
+      iterations = 0L,
+      max_abs_delta = 0,
+      max_abs_shift_from_smc = 0
+    )
+    return(bank)
+  }
+
+  theta_anchors <- bank_smc_local_bank_theta_anchors(bank, model)
+  log_eta <- ifelse(bank$eta > 0, log(bank$eta), -Inf)
+  logZ_smc <- vapply(bank$nodes, `[[`, numeric(1), "log_marginal_anchor")
+  if (any(!is.finite(logZ_smc))) {
+    stop("Cannot calibrate a local bank with non-finite node normalizers.")
+  }
+
+  logp_parts <- vector("list", S)
+  log_sample_weight_parts <- vector("list", S)
+  for (s in seq_len(S)) {
+    node <- bank$nodes[[s]]
+    logp_parts[[s]] <- t(population_model_log_alpha_given_theta_many(
+      model,
+      alpha = node$alpha,
+      theta = theta_anchors
+    ))
+    log_sample_weight_parts[[s]] <- log_eta[s] + ifelse(node$weights > 0, log(node$weights), -Inf)
+  }
+  logp <- do.call(rbind, logp_parts)
+  log_sample_weight <- unlist(log_sample_weight_parts, use.names = FALSE)
+  if (nrow(logp) != length(log_sample_weight) || ncol(logp) != S) {
+    stop("Internal normalizer calibration dimensions are inconsistent.")
+  }
+
+  ref <- logZ_smc[1L]
+  logZ_rel <- logZ_smc - ref
+  max_delta <- Inf
+  iter <- 0L
+  for (iter in seq_len(as.integer(max_iter))) {
+    log_den <- .rowLogSumExp(sweep(sweep(logp, 2L, log_eta, "+"), 2L, logZ_rel, "-"))
+    logZ_new <- vapply(
+      seq_len(S),
+      function(j) logsumexp(log_sample_weight + logp[, j] - log_den),
+      numeric(1)
+    )
+    logZ_new <- logZ_new - logZ_new[1L]
+    max_delta <- max(abs(logZ_new - logZ_rel))
+    logZ_rel <- logZ_new
+    if (is.finite(max_delta) && max_delta <= as.numeric(tol)) break
+  }
+
+  shift <- switch(
+    anchor,
+    mean_smc = sum(bank$eta * (logZ_smc - logZ_rel)),
+    first_smc = logZ_smc[1L] - logZ_rel[1L]
+  )
+  logZ_calibrated <- logZ_rel + shift
+  for (s in seq_len(S)) {
+    bank$nodes[[s]]$diagnostics$raw_log_marginal_anchor <- bank$nodes[[s]]$diagnostics$raw_log_marginal_anchor %||%
+      bank$nodes[[s]]$log_marginal_anchor
+    bank$nodes[[s]]$diagnostics$normalizer_calibration_shift <- as.numeric(logZ_calibrated[s] - logZ_smc[s])
+    bank$nodes[[s]]$log_marginal_anchor <- as.numeric(logZ_calibrated[s])
+  }
+  bank$stack <- NULL
+  bank$support_diagnostics$normalizer_calibration <- list(
+    method = "reverse_logistic_mbar",
+    anchor = anchor,
+    converged = is.finite(max_delta) && max_delta <= as.numeric(tol),
+    iterations = as.integer(iter),
+    max_abs_delta = as.numeric(max_delta),
+    max_abs_shift_from_smc = as.numeric(max(abs(logZ_calibrated - logZ_smc))),
+    mean_abs_shift_from_smc = as.numeric(mean(abs(logZ_calibrated - logZ_smc)))
+  )
+  validate_bank_smc_local_bank(bank, population_model = model)
+}
+
+bank_smc_calibrate_banks_normalizers <- function(banks,
+                                                 population_model,
+                                                 max_iter = 200L,
+                                                 tol = 1e-8,
+                                                 anchor = "mean_smc",
+                                                 n_jobs = 1L) {
+  model <- normalize_population_model(population_model)
+  out <- parallel::mclapply(
+    banks,
+    bank_smc_calibrate_local_bank_normalizers,
+    population_model = model,
+    max_iter = max_iter,
+    tol = tol,
+    anchor = anchor,
+    mc.cores = as.integer(max(1L, n_jobs))
+  )
+  names(out) <- names(banks)
+  out
+}
+
+bank_smc_calibration_summary <- function(banks) {
+  rows <- lapply(banks, function(bank) {
+    diag <- bank$support_diagnostics$normalizer_calibration %||% list()
+    data.frame(
+      local_id = as.integer(bank$local_id),
+      converged = isTRUE(diag$converged),
+      iterations = as.integer(diag$iterations %||% NA_integer_),
+      max_abs_delta = as.numeric(diag$max_abs_delta %||% NA_real_),
+      max_abs_shift_from_smc = as.numeric(diag$max_abs_shift_from_smc %||% NA_real_),
+      mean_abs_shift_from_smc = as.numeric(diag$mean_abs_shift_from_smc %||% NA_real_),
+      check.names = FALSE
+    )
+  })
+  do.call(rbind, rows)
+}
+
 bank_smc_local_bank_build_stack <- function(bank, population_model) {
   model <- normalize_population_model(population_model)
   bank <- validate_bank_smc_local_bank(bank, population_model = model)
@@ -716,6 +846,7 @@ bank_smc_local_bank_mixture_diagnostic <- function(bank,
                                                    theta,
                                                    use_psis = TRUE,
                                                    use_cached_stack = TRUE) {
+  bank <- validate_bank_smc_local_bank(bank, population_model = population_model)
   terms <- bank_smc_local_bank_log_terms(
     bank = bank,
     population_model = population_model,
@@ -726,9 +857,11 @@ bank_smc_local_bank_mixture_diagnostic <- function(bank,
     stop("Bank mixture diagnostic expects exactly one theta row.")
   }
   summary <- .bank_log_weight_summary(terms$log_terms[1L, ], use_psis = use_psis)
+  node_particle_scale <- max(1L, max(vapply(bank$nodes, `[[`, integer(1), "n_particles")))
   data.frame(
     ess = summary$ess,
-    ess_frac = summary$ess_frac,
+    ess_frac = as.numeric(summary$ess / node_particle_scale),
+    total_ess_frac = summary$ess_frac,
     max_weight = summary$max_weight,
     q99_weight = summary$q99_weight,
     log_weight_var = summary$log_weight_var,
@@ -769,7 +902,7 @@ bank_smc_local_bank_coverage_diagnostic <- function(bank,
     theta = theta
   )
 
-  best <- if (!is.null(natural)) natural$best_node else which.max(single$ess_frac)
+  best <- which.max(single$ess_frac)
   pareto_ok <- is.na(mixture$pareto_k[1L]) || mixture$pareto_k[1L] <= max_pareto_k
   natural_threshold <- -log(pmax(as.numeric(min_mixture_ess_frac), .Machine$double.eps))
   covered <- mixture$ess_frac[1L] >= min_mixture_ess_frac && pareto_ok
@@ -790,6 +923,164 @@ bank_smc_local_bank_coverage_diagnostic <- function(bank,
       max_pareto_k = max_pareto_k
     )
   )
+}
+
+.bank_gaussian_theta_from_natural_eta <- function(population_model, eta) {
+  model <- normalize_population_model(population_model)
+  if (!identical(model$fast_family %||% NULL, "gaussian")) return(NULL)
+  eta <- as.matrix(eta)
+  d <- model$alpha_dim
+  if (ncol(eta) != 2L * d) {
+    stop("Gaussian natural parameter matrix has incompatible dimension.")
+  }
+  linear <- eta[, seq_len(d), drop = FALSE]
+  quadratic <- eta[, d + seq_len(d), drop = FALSE]
+  sigma2 <- -0.5 / pmin(quadratic, -1e-12)
+  mu <- linear * sigma2
+  theta <- cbind(mu, log(sigma2))
+  colnames(theta) <- model$hyper_names
+  .as_hyper_matrix(theta, hyper_names = model$hyper_names, hyper_dim = model$hyper_dim)
+}
+
+.bank_interpolate_theta_natural <- function(population_model, theta_a, theta_b, t = 0.5) {
+  model <- normalize_population_model(population_model)
+  theta_a <- .bank_align_theta(theta_a, model)
+  theta_b <- .bank_align_theta(theta_b, model)
+  eta_a <- .bank_gaussian_natural_eta(model, theta_a)
+  eta_b <- .bank_gaussian_natural_eta(model, theta_b)
+  if (!is.null(eta_a) && !is.null(eta_b)) {
+    eta <- (1 - as.numeric(t)) * eta_a + as.numeric(t) * eta_b
+    theta <- .bank_gaussian_theta_from_natural_eta(model, eta)
+  } else {
+    theta <- (1 - as.numeric(t)) * theta_a + as.numeric(t) * theta_b
+    colnames(theta) <- model$hyper_names
+  }
+  .bank_align_theta(theta, model)
+}
+
+.bank_theta_anchor_index <- function(bank, population_model, theta, tol = 1e-8) {
+  model <- normalize_population_model(population_model)
+  bank <- validate_bank_smc_local_bank(bank, population_model = model)
+  theta <- .bank_align_theta(theta, model)
+  anchors <- bank_smc_local_bank_theta_anchors(bank, model)
+  distance <- rowSums(abs(sweep(anchors, 2L, as.numeric(theta), "-")))
+  hit <- which(distance <= as.numeric(tol))
+  if (length(hit)) as.integer(hit[1L]) else NA_integer_
+}
+
+.bank_overlap_ok <- function(summary,
+                             min_ess_frac,
+                             max_pareto_k) {
+  ess_ok <- is.finite(summary$ess_frac) && summary$ess_frac >= as.numeric(min_ess_frac)
+  k <- as.numeric(summary$pareto_k %||% NA_real_)
+  k_ok <- is.na(k) || !is.finite(k) || k <= as.numeric(max_pareto_k)
+  isTRUE(ess_ok && k_ok)
+}
+
+.bank_worst_pareto_k <- function(a, b) {
+  k <- as.numeric(c(a, b))
+  k <- k[is.finite(k)]
+  if (length(k)) max(k) else NA_real_
+}
+
+bank_smc_local_bank_overlap_graph <- function(bank,
+                                              population_model,
+                                              min_edge_ess_frac = 0.05,
+                                              max_pareto_k = 0.7,
+                                              use_psis = TRUE) {
+  model <- normalize_population_model(population_model)
+  bank <- validate_bank_smc_local_bank(bank, population_model = model)
+  S <- bank$n_nodes
+  adjacency <- matrix(FALSE, nrow = S, ncol = S)
+  diag(adjacency) <- TRUE
+  if (S <= 1L) {
+    return(list(
+      adjacency = adjacency,
+      edges = data.frame(),
+      components = rep.int(1L, S),
+      n_components = 1L,
+      certified = TRUE
+    ))
+  }
+
+  edge_rows <- vector("list", S * (S - 1L) / 2L)
+  row_id <- 0L
+  for (a in seq_len(S - 1L)) {
+    for (b in seq.int(a + 1L, S)) {
+      forward <- .bank_log_weight_summary(
+        .bank_single_node_log_weights(bank$nodes[[a]], model, bank$nodes[[b]]$theta_anchor),
+        use_psis = use_psis
+      )
+      reverse <- .bank_log_weight_summary(
+        .bank_single_node_log_weights(bank$nodes[[b]], model, bank$nodes[[a]]$theta_anchor),
+        use_psis = use_psis
+      )
+      pass <- .bank_overlap_ok(forward, min_edge_ess_frac, max_pareto_k) &&
+        .bank_overlap_ok(reverse, min_edge_ess_frac, max_pareto_k)
+      adjacency[a, b] <- adjacency[b, a] <- isTRUE(pass)
+      row_id <- row_id + 1L
+      edge_rows[[row_id]] <- data.frame(
+        node_a = as.integer(a),
+        node_b = as.integer(b),
+        pass = isTRUE(pass),
+        forward_ess_frac = as.numeric(forward$ess_frac),
+        reverse_ess_frac = as.numeric(reverse$ess_frac),
+        worst_ess_frac = as.numeric(min(forward$ess_frac, reverse$ess_frac)),
+        forward_pareto_k = as.numeric(forward$pareto_k %||% NA_real_),
+        reverse_pareto_k = as.numeric(reverse$pareto_k %||% NA_real_),
+        worst_pareto_k = .bank_worst_pareto_k(forward$pareto_k %||% NA_real_, reverse$pareto_k %||% NA_real_),
+        check.names = FALSE
+      )
+    }
+  }
+  edges <- do.call(rbind, edge_rows)
+
+  components <- rep.int(NA_integer_, S)
+  component_id <- 0L
+  for (start in seq_len(S)) {
+    if (!is.na(components[start])) next
+    component_id <- component_id + 1L
+    queue <- start
+    components[start] <- component_id
+    while (length(queue)) {
+      current <- queue[1L]
+      queue <- queue[-1L]
+      next_nodes <- which(adjacency[current, ] & is.na(components))
+      if (length(next_nodes)) {
+        components[next_nodes] <- component_id
+        queue <- c(queue, next_nodes)
+      }
+    }
+  }
+
+  list(
+    adjacency = adjacency,
+    edges = edges,
+    components = components,
+    n_components = as.integer(component_id),
+    certified = component_id == 1L
+  )
+}
+
+.bank_overlap_cut_pairs <- function(graph, root_component = 1L) {
+  edges <- graph$edges
+  if (is.null(edges) || !nrow(edges)) return(list())
+  components <- graph$components
+  a_root <- components[edges$node_a] == root_component
+  b_root <- components[edges$node_b] == root_component
+  candidates <- edges[xor(a_root, b_root), , drop = FALSE]
+  if (!nrow(candidates)) return(list())
+  candidates <- candidates[order(-candidates$worst_ess_frac), , drop = FALSE]
+  lapply(seq_len(nrow(candidates)), function(i) {
+    row <- candidates[i, , drop = FALSE]
+    a <- as.integer(row$node_a)
+    b <- as.integer(row$node_b)
+    if (components[a] == root_component) {
+      list(source = a, target = b, edge = row)
+    } else {
+      list(source = b, target = a, edge = row)
+    }
+  })
 }
 
 bank_smc_anchor_node <- function(local_id,
@@ -845,9 +1136,7 @@ bank_smc_anchor_node <- function(local_id,
     verbose = verbose
   )
 
-  if (fit$final_lambda < 1 - 1e-8) {
-    stop("Anchor SMC did not reach the local posterior within max_steps.")
-  }
+  .bank_assert_smc_complete(fit, "Bank anchor")
 
   node <- build_bank_smc_node_from_local_fit(
     local_fit = fit,
@@ -873,6 +1162,110 @@ bank_smc_anchor_node <- function(local_id,
   node
 }
 
+bank_smc_bridge_node <- function(local_id,
+                                 population_model,
+                                 source_node,
+                                 theta_target,
+                                 data_i,
+                                 loglik_fn,
+                                 M = NULL,
+                                 target_cess = 0.9,
+                                 resample_threshold = 0.5,
+                                 n_mcmc_moves = 2L,
+                                 rw_scale = 0.75,
+                                 G_mix = 8L,
+                                 da_enable = TRUE,
+                                 refit_every = 2L,
+                                 max_steps = 64L,
+                                 deterministic_resampling = FALSE,
+                                 n_cores = 1L,
+                                 seed = NULL,
+                                 verbose = FALSE) {
+  model <- normalize_population_model(population_model)
+  source_node <- validate_bank_smc_node(source_node, population_model = model)
+  theta_target <- .bank_align_theta(theta_target, model)
+  theta_source <- source_node$theta_anchor
+  old_log_marginal <- as.numeric(source_node$log_marginal_anchor)
+  if (!is.finite(old_log_marginal)) {
+    stop("Cannot bridge from a source node without finite log_marginal_anchor.")
+  }
+
+  reference_prior <- .bank_population_reference_prior_from_theta(
+    model,
+    theta_target,
+    label = "bank_bridge_endpoint"
+  )
+  base_logpdf_fn <- function(alpha) {
+    ll_parallel(
+      alpha,
+      data_i,
+      loglik_fn,
+      n_cores = as.integer(n_cores)
+    ) +
+      population_model_log_alpha_given_theta(model, alpha = alpha, theta = theta_source) -
+      old_log_marginal
+  }
+  bridge_stat_fn <- function(alpha) {
+    population_model_log_alpha_given_theta(model, alpha = alpha, theta = theta_target) -
+      population_model_log_alpha_given_theta(model, alpha = alpha, theta = theta_source)
+  }
+
+  fit <- run_tempered_smc(
+    reference_prior = reference_prior,
+    bridge_stat_fn = bridge_stat_fn,
+    base_logpdf_fn = base_logpdf_fn,
+    initial_particles = source_node$alpha,
+    initial_weights = source_node$weights,
+    initial_log_normalizer = old_log_marginal,
+    M = as.integer(M %||% source_node$n_particles),
+    resample_threshold = resample_threshold,
+    n_mcmc_moves = as.integer(n_mcmc_moves),
+    max_rounds = as.integer(max_steps),
+    lambda_target = 1,
+    cess_target = as.numeric(target_cess),
+    G_mix = as.integer(G_mix),
+    refit_every = as.integer(refit_every),
+    rw_scale_init = rw_scale,
+    post_adapt_n_mcmc_moves = as.integer(n_mcmc_moves),
+    da_enable = isTRUE(da_enable),
+    deterministic_resampling = deterministic_resampling,
+    n_cores = n_cores,
+    seed = seed,
+    verbose = verbose
+  )
+  .bank_assert_smc_complete(fit, "Bank bridge")
+  fit$loglik <- ll_parallel(
+    fit$Theta,
+    data_i,
+    loglik_fn,
+    n_cores = as.integer(n_cores)
+  )
+
+  build_bank_smc_node_from_local_fit(
+    local_fit = fit,
+    theta_anchor = theta_target,
+    population_model = model,
+    local_id = local_id,
+    diagnostics = list(
+      source = "bank_bridge_endpoint",
+      final_ess = as.numeric(ESS(fit$w)),
+      final_ess_frac = as.numeric(ESS(fit$w) / length(fit$w)),
+      mean_accept_rate = .bank_mean_or_na(fit$meta$accept_rate_hist)
+    ),
+    bridge_provenance = list(
+      type = "endpoint_bridge",
+      source_theta = theta_source,
+      target_theta = theta_target,
+      source_log_marginal = old_log_marginal,
+      target_cess = as.numeric(target_cess),
+      resample_threshold = as.numeric(resample_threshold),
+      n_mcmc_moves = as.integer(n_mcmc_moves),
+      rw_scale = as.numeric(rw_scale),
+      kernel = "run_tempered_smc"
+    )
+  )
+}
+
 bank_smc_local_bank_add_anchor <- function(bank,
                                            population_model,
                                            theta_target,
@@ -880,6 +1273,8 @@ bank_smc_local_bank_add_anchor <- function(bank,
                                            loglik_fn,
                                            M = NULL,
                                            eta = NULL,
+                                           bridge_min_single_ess_frac = 0.05,
+                                           bridge_max_pareto_k = 0.7,
                                            ...,
                                            use_psis = TRUE) {
   model <- normalize_population_model(population_model)
@@ -892,16 +1287,40 @@ bank_smc_local_bank_add_anchor <- function(bank,
     theta = theta_target,
     use_psis = use_psis
   )
-  M <- as.integer(M %||% bank$nodes[[coverage$best_node]]$n_particles)
-  node <- bank_smc_anchor_node(
-    local_id = bank$local_id,
+  source_diag <- bank_smc_local_bank_single_node_diagnostics(
+    bank = bank,
     population_model = model,
-    theta_anchor = theta_target,
-    data_i = data_i,
-    loglik_fn = loglik_fn,
-    M = M,
-    ...
+    theta = theta_target,
+    use_psis = TRUE
   )
+  source_index <- which.max(source_diag$ess_frac)
+  source_pareto_k <- as.numeric(source_diag$pareto_k[source_index])
+  source_overlap_ok <- source_diag$ess_frac[source_index] >= as.numeric(bridge_min_single_ess_frac) &&
+    (!is.finite(source_pareto_k) || source_pareto_k <= as.numeric(bridge_max_pareto_k))
+
+  M <- as.integer(M %||% bank$nodes[[source_index]]$n_particles)
+  node <- if (isTRUE(source_overlap_ok)) {
+    bank_smc_bridge_node(
+      local_id = bank$local_id,
+      population_model = model,
+      source_node = bank$nodes[[source_index]],
+      theta_target = theta_target,
+      data_i = data_i,
+      loglik_fn = loglik_fn,
+      M = M,
+      ...
+    )
+  } else {
+    bank_smc_anchor_node(
+      local_id = bank$local_id,
+      population_model = model,
+      theta_anchor = theta_target,
+      data_i = data_i,
+      loglik_fn = loglik_fn,
+      M = M,
+      ...
+    )
+  }
   updated <- bank_smc_local_bank_add_node(
     bank = bank,
     node = node,
@@ -912,9 +1331,221 @@ bank_smc_local_bank_add_anchor <- function(bank,
   list(
     bank = updated,
     node = node,
-    start_node_index = as.integer(coverage$best_node),
-    start_coverage = coverage
+    start_node_index = as.integer(source_index),
+    start_coverage = coverage,
+    source_overlap = source_diag[source_index, , drop = FALSE],
+    used_bridge = isTRUE(source_overlap_ok)
   )
+}
+
+bank_smc_local_bank_certify_bridge_graph <- function(bank,
+                                                     population_model,
+                                                     data_i,
+                                                     loglik_fn,
+                                                     M = NULL,
+                                                     min_edge_ess_frac = 0.05,
+                                                     max_pareto_k = 0.7,
+                                                     use_psis = TRUE,
+                                                     max_rounds = 50L,
+                                                     target_cess = 0.9,
+                                                     n_mcmc_moves = 2L,
+                                                     n_cores = 1L,
+                                                     seed = 123L,
+                                                     verbose = FALSE,
+                                                     ...) {
+  model <- normalize_population_model(population_model)
+  bank <- validate_bank_smc_local_bank(bank, population_model = model)
+  max_rounds <- as.integer(max(0L, max_rounds))
+  rows <- vector("list", 0L)
+
+  graph <- bank_smc_local_bank_overlap_graph(
+    bank = bank,
+    population_model = model,
+    min_edge_ess_frac = min_edge_ess_frac,
+    max_pareto_k = max_pareto_k,
+    use_psis = use_psis
+  )
+  if (isTRUE(graph$certified) || max_rounds <= 0L) {
+    bank$support_diagnostics$overlap_graph <- list(
+      method = "bidirectional_importance_overlap_graph",
+      certified = isTRUE(graph$certified),
+      n_components = as.integer(graph$n_components),
+      rounds = 0L,
+      inserted = 0L,
+      min_edge_ess_frac = as.numeric(min_edge_ess_frac),
+      max_pareto_k = as.numeric(max_pareto_k),
+      use_psis = isTRUE(use_psis),
+      edges = graph$edges
+    )
+    return(list(bank = bank, graph = graph, insertions = data.frame()))
+  }
+
+  for (round in seq_len(max_rounds)) {
+    if (isTRUE(graph$certified)) break
+    if (bank$n_nodes >= bank$max_nodes) break
+    pair_candidates <- .bank_overlap_cut_pairs(graph, root_component = graph$components[1L])
+    if (!length(pair_candidates)) break
+    pair <- NULL
+    theta_mid <- NULL
+    for (candidate in pair_candidates) {
+      source_node <- bank$nodes[[candidate$source]]
+      target_node <- bank$nodes[[candidate$target]]
+      candidate_mid <- .bank_interpolate_theta_natural(
+        population_model = model,
+        theta_a = source_node$theta_anchor,
+        theta_b = target_node$theta_anchor,
+        t = 0.5
+      )
+      if (is.na(.bank_theta_anchor_index(bank, model, candidate_mid, tol = 1e-8))) {
+        pair <- candidate
+        theta_mid <- candidate_mid
+        break
+      }
+    }
+    if (is.null(pair)) break
+
+    source_node <- bank$nodes[[pair$source]]
+    particles <- as.integer(M %||% source_node$n_particles)
+    if (is.finite(bank$max_particles) && bank$n_particles + particles > bank$max_particles) break
+    node <- bank_smc_bridge_node(
+      local_id = bank$local_id,
+      population_model = model,
+      source_node = source_node,
+      theta_target = theta_mid,
+      data_i = data_i,
+      loglik_fn = loglik_fn,
+      M = particles,
+      target_cess = target_cess,
+      n_mcmc_moves = n_mcmc_moves,
+      n_cores = n_cores,
+      seed = as.integer(seed + round),
+      verbose = verbose,
+      ...
+    )
+    bank <- bank_smc_local_bank_add_node(
+      bank = bank,
+      node = node,
+      eta = NULL,
+      population_model = model
+    )
+    inserted_node <- bank$n_nodes
+
+    rows[[length(rows) + 1L]] <- data.frame(
+      local_id = as.integer(bank$local_id),
+      round = as.integer(round),
+      source_node = as.integer(pair$source),
+      target_node = as.integer(pair$target),
+      inserted_node = as.integer(inserted_node),
+      pre_components = as.integer(graph$n_components),
+      pre_worst_ess_frac = as.numeric(pair$edge$worst_ess_frac),
+      pre_forward_ess_frac = as.numeric(pair$edge$forward_ess_frac),
+      pre_reverse_ess_frac = as.numeric(pair$edge$reverse_ess_frac),
+      nodes_after = as.integer(bank$n_nodes),
+      particles_after = as.integer(bank$n_particles),
+      check.names = FALSE
+    )
+
+    graph <- bank_smc_local_bank_overlap_graph(
+      bank = bank,
+      population_model = model,
+      min_edge_ess_frac = min_edge_ess_frac,
+      max_pareto_k = max_pareto_k,
+      use_psis = use_psis
+    )
+  }
+
+  insertions <- if (length(rows)) do.call(rbind, rows) else data.frame()
+  bank$support_diagnostics$overlap_graph <- list(
+    method = "bidirectional_importance_overlap_graph",
+    certified = isTRUE(graph$certified),
+    n_components = as.integer(graph$n_components),
+    rounds = as.integer(length(rows)),
+    inserted = as.integer(nrow(insertions)),
+    min_edge_ess_frac = as.numeric(min_edge_ess_frac),
+    max_pareto_k = as.numeric(max_pareto_k),
+    use_psis = isTRUE(use_psis),
+    edges = graph$edges
+  )
+
+  list(bank = validate_bank_smc_local_bank(bank, population_model = model), graph = graph, insertions = insertions)
+}
+
+bank_smc_certify_banks_bridge_graph <- function(banks,
+                                                data_list,
+                                                loglik_fn,
+                                                population_model,
+                                                M = NULL,
+                                                min_edge_ess_frac = 0.05,
+                                                max_pareto_k = 0.7,
+                                                use_psis = TRUE,
+                                                max_rounds = 50L,
+                                                target_cess = 0.9,
+                                                n_mcmc_moves = 2L,
+                                                n_jobs = 1L,
+                                                local_n_cores = 1L,
+                                                seed = 123L,
+                                                verbose = FALSE,
+                                                ...) {
+  model <- normalize_population_model(population_model)
+  ids <- seq_along(banks)
+  certified <- parallel::mclapply(
+    ids,
+    function(pos) {
+      bank_smc_local_bank_certify_bridge_graph(
+        bank = banks[[pos]],
+        population_model = model,
+        data_i = data_list[[pos]],
+        loglik_fn = loglik_fn,
+        M = M,
+        min_edge_ess_frac = min_edge_ess_frac,
+        max_pareto_k = max_pareto_k,
+        use_psis = use_psis,
+        max_rounds = max_rounds,
+        target_cess = target_cess,
+        n_mcmc_moves = n_mcmc_moves,
+        n_cores = local_n_cores,
+        seed = as.integer(seed + 10000L * pos),
+        verbose = verbose,
+        ...
+      )
+    },
+    mc.cores = as.integer(max(1L, n_jobs))
+  )
+  failed <- vapply(certified, inherits, logical(1), what = "try-error")
+  if (any(failed)) {
+    msg <- conditionMessage(attr(certified[[which(failed)[1L]]], "condition"))
+    stop("Local bank bridge-graph certification failed for worker ", which(failed)[1L], ": ", msg)
+  }
+  rows <- vector("list", length(certified))
+  for (i in seq_along(certified)) {
+    banks[[i]] <- certified[[i]]$bank
+    rows[[i]] <- certified[[i]]$insertions
+  }
+  rows <- Filter(nrow, rows)
+  list(
+    banks = banks,
+    insertions = if (length(rows)) do.call(rbind, rows) else data.frame()
+  )
+}
+
+bank_smc_overlap_graph_summary <- function(banks) {
+  rows <- lapply(banks, function(bank) {
+    diag <- bank$support_diagnostics$overlap_graph %||% list()
+    certified <- if (!is.null(diag$certified)) isTRUE(diag$certified) else bank$n_nodes <= 1L
+    n_components <- if (!is.null(diag$n_components)) as.integer(diag$n_components) else {
+      if (bank$n_nodes <= 1L) 1L else NA_integer_
+    }
+    data.frame(
+      local_id = as.integer(bank$local_id),
+      certified = certified,
+      n_components = n_components,
+      inserted = as.integer(diag$inserted %||% NA_integer_),
+      min_edge_ess_frac = as.numeric(diag$min_edge_ess_frac %||% NA_real_),
+      max_pareto_k = as.numeric(diag$max_pareto_k %||% NA_real_),
+      check.names = FALSE
+    )
+  })
+  do.call(rbind, rows)
 }
 
 .bank_population_reference_prior_from_theta <- function(population_model,
@@ -1626,6 +2257,254 @@ bank_smc_anchor_design_fit <- function(anchor_candidates,
   )
 }
 
+bank_smc_rho_sketch_anchor_candidates <- function(data_list,
+                                                  loglik_fn,
+                                                  population_model,
+                                                  theta_reference,
+                                                  rho_ladder = c(0.001, 0.01, 0.05, 0.15, 0.35, 0.75),
+                                                  outer_particles = 500L,
+                                                  sketch_starts = 8L,
+                                                  start_scale = 4,
+                                                  reference_scale = 25,
+                                                  support_weight_floor = 0.50,
+                                                  n_mcmc_moves = 2L,
+                                                  max_rounds = 80L,
+                                                  cess_target = 0.60,
+                                                  resample_threshold = 0.5,
+                                                  rw_scale = 0.8,
+                                                  n_jobs = 1L,
+                                                  seed = 123L,
+                                                  verbose = FALSE) {
+  if (!exists("fit_local_likelihood_sketches", mode = "function") ||
+      !exists("build_local_likelihood_sketch_factor_set", mode = "function")) {
+    if (file.exists("local_likelihood_sketches.R")) {
+      source("local_likelihood_sketches.R")
+    } else {
+      stop("rho sketch anchors require local_likelihood_sketches.R.")
+    }
+  }
+  model <- normalize_population_model(population_model)
+  theta_reference <- .bank_align_theta(theta_reference, model)
+  rho_ladder <- sort(unique(as.numeric(rho_ladder)))
+  rho_ladder <- rho_ladder[is.finite(rho_ladder) & rho_ladder > 0]
+  if (!length(rho_ladder)) stop("rho_ladder must contain positive finite values.")
+  support_weight_floor <- min(max(as.numeric(support_weight_floor), 0), 1)
+
+  sketch_set <- fit_local_likelihood_sketches(
+    data_list = data_list,
+    loglik_fn = loglik_fn,
+    alpha_names = model$alpha_names,
+    population_model = model,
+    theta_reference = theta_reference,
+    n_starts = as.integer(sketch_starts),
+    start_scale = as.numeric(start_scale),
+    reference_scale = as.numeric(reference_scale),
+    n_jobs = n_jobs,
+    seed = seed
+  )
+  factor_sets <- lapply(rho_ladder, function(rho) {
+    build_local_likelihood_sketch_factor_set(
+      sketch_set = sketch_set,
+      population_model = model,
+      rho = rho
+    )
+  })
+
+  fits <- vector("list", length(rho_ladder))
+  timing <- data.frame(
+    rho = rho_ladder,
+    elapsed_sec = NA_real_,
+    rounds = NA_integer_,
+    update_ess = NA_real_,
+    accept_rate = NA_real_,
+    check.names = FALSE
+  )
+  if (isTRUE(verbose)) cat("Bank SMC: rho sketch support ladder\n")
+  t0 <- system.time({
+    fits[[1L]] <- outer_population_smc(
+      factor_sets[[1L]],
+      N = as.integer(outer_particles),
+      resample_threshold = resample_threshold,
+      n_mcmc_moves = as.integer(n_mcmc_moves),
+      min_mcmc_moves = 1L,
+      max_rounds = as.integer(max_rounds),
+      rw_scale_init = rw_scale,
+      cess_target = cess_target,
+      n_cores = n_jobs,
+      seed = seed + 1000L,
+      verbose = FALSE
+    )
+  })
+  timing$elapsed_sec[1L] <- t0[["elapsed"]]
+  timing$rounds[1L] <- fits[[1L]]$meta$rounds %||% NA_integer_
+  timing$accept_rate[1L] <- tail(fits[[1L]]$meta$accept_hist %||% NA_real_, 1L)
+
+  if (length(rho_ladder) > 1L) {
+    for (j in seq_along(rho_ladder)[-1L]) {
+      tj <- system.time({
+        fits[[j]] <- update_outer_population_fit(
+          fit = fits[[j - 1L]],
+          old_factor_set = factor_sets[[j - 1L]],
+          new_factor_set = factor_sets[[j]],
+          n_mcmc_moves = as.integer(n_mcmc_moves),
+          min_mcmc_moves = 1L,
+          resample_threshold = resample_threshold,
+          n_cores = n_jobs,
+          seed = seed + 1000L + j,
+          verbose = FALSE
+        )
+      })
+      update_info <- tail(fits[[j]]$meta$factor_update, 1L)[[1L]]
+      timing$elapsed_sec[j] <- tj[["elapsed"]]
+      timing$rounds[j] <- 0L
+      timing$update_ess[j] <- update_info$ess
+      timing$accept_rate[j] <- update_info$accept_rate
+    }
+  }
+
+  theta <- do.call(rbind, lapply(fits, `[[`, "theta"))
+  weights <- unlist(lapply(fits, function(fit) {
+    wi <- .bank_normalize_weights(fit$w)
+    uniform <- rep(1 / length(wi), length(wi))
+    ((1 - support_weight_floor) * wi + support_weight_floor * uniform) / length(fits)
+  }), use.names = FALSE)
+  weights <- .bank_normalize_weights(weights)
+
+  structure(
+    list(
+      theta = theta,
+      w = weights,
+      population_model = model,
+      meta = list(
+        source = "rho_sketch_anchor_candidates",
+        rho_ladder = rho_ladder,
+        outer_particles = as.integer(outer_particles),
+        sketch_starts = as.integer(sketch_starts),
+        support_weight_floor = support_weight_floor,
+        timing = timing,
+        sketch_settings = sketch_set$settings
+      )
+    ),
+    class = "bank_smc_anchor_candidates"
+  )
+}
+
+.bank_smc_theta_feature_matrix <- function(theta, population_model) {
+  model <- normalize_population_model(population_model)
+  theta <- .as_hyper_matrix(theta, hyper_names = model$hyper_names, hyper_dim = model$hyper_dim)
+  eta <- .bank_gaussian_natural_eta(model, theta)
+  if (is.null(eta)) theta else eta
+}
+
+.bank_smc_feature_distances <- function(candidate, reference, population_model) {
+  model <- normalize_population_model(population_model)
+  X <- .bank_smc_theta_feature_matrix(candidate, model)
+  R <- .bank_smc_theta_feature_matrix(reference, model)
+  all <- rbind(X, R)
+  center <- colMeans(all)
+  scale <- apply(all, 2L, stats::sd)
+  scale[!is.finite(scale) | scale <= 0] <- 1
+  X <- sweep(sweep(X, 2L, center, "-"), 2L, scale, "/")
+  R <- sweep(sweep(R, 2L, center, "-"), 2L, scale, "/")
+  vapply(seq_len(nrow(X)), function(i) {
+    min(sqrt(rowSums(sweep(R, 2L, X[i, ], "-")^2)))
+  }, numeric(1))
+}
+
+.bank_smc_candidate_pool_indices <- function(theta, w, population_model, max_pool = 96L) {
+  model <- normalize_population_model(population_model)
+  theta <- .as_hyper_matrix(theta, hyper_names = model$hyper_names, hyper_dim = model$hyper_dim)
+  w <- .bank_normalize_weights(w)
+  max_pool <- as.integer(max(1L, max_pool))
+  if (nrow(theta) <= max_pool) return(seq_len(nrow(theta)))
+
+  features <- .bank_smc_theta_feature_matrix(theta, model)
+  S <- tryCatch(weighted_cov(features, w), error = function(e) stats::cov(features))
+  S <- regularize_cov(S, min_eig = 1e-8, cond_cap = 1e8)
+  eig <- eigen(S, symmetric = TRUE)
+  center <- .bank_weighted_mean(features, w)
+  pc <- as.numeric(scale(features, center = center, scale = FALSE) %*% eig$vectors[, 1L])
+
+  idx <- integer(0)
+  probs_pc <- seq(0.01, 0.99, length.out = min(max_pool, 64L))
+  vals <- .bank_weighted_quantile(pc, w, probs_pc)
+  idx <- c(idx, vapply(vals, function(v) which.min(abs(pc - v)), integer(1)))
+
+  tail_probs <- c(0.005, 0.025, 0.05, 0.95, 0.975, 0.995)
+  for (j in seq_len(ncol(theta))) {
+    vals <- .bank_weighted_quantile(theta[, j], w, tail_probs)
+    idx <- c(idx, vapply(vals, function(v) which.min(abs(theta[, j] - v)), integer(1)))
+  }
+
+  idx <- unique(idx)
+  if (length(idx) > max_pool) idx <- idx[seq_len(max_pool)]
+  idx
+}
+
+bank_smc_select_challenger_theta <- function(anchor_candidates,
+                                             population_model,
+                                             banks,
+                                             reference_theta,
+                                             max_points = 1L,
+                                             candidate_pool = 96L,
+                                             min_distance = 0.25,
+                                             relevance_temperature = 10,
+                                             target_ess_frac = 0.3,
+                                             score_local_count = 20L) {
+  if (is.null(anchor_candidates) || max_points <= 0L) {
+    return(NULL)
+  }
+  if (!inherits(anchor_candidates, "bank_smc_anchor_candidates")) {
+    stop("anchor_candidates must inherit from 'bank_smc_anchor_candidates'.")
+  }
+  model <- normalize_population_model(population_model)
+  theta <- .as_hyper_matrix(anchor_candidates$theta, hyper_names = model$hyper_names, hyper_dim = model$hyper_dim)
+  w <- .bank_normalize_weights(anchor_candidates$w %||% rep(1, nrow(theta)))
+  reference_theta <- .as_hyper_matrix(reference_theta, hyper_names = model$hyper_names, hyper_dim = model$hyper_dim)
+  pool <- .bank_smc_candidate_pool_indices(theta, w, model, max_pool = candidate_pool)
+  candidates <- .bank_unique_theta_rows(theta[pool, , drop = FALSE], model)
+  if (!nrow(candidates)) return(NULL)
+
+  novelty <- .bank_smc_feature_distances(candidates, reference_theta, model)
+  coverage <- .bank_score_theta_design_with_banks(
+    candidates,
+    banks = banks,
+    population_model = model,
+    target_ess_frac = target_ess_frac,
+    score_local_count = score_local_count
+  )
+  bank_factor_set <- bank_smc_banks_to_factor_set(banks, model)
+  logpost <- population_factor_set_logposterior(
+    bank_factor_set,
+    candidates,
+    include_constant = FALSE
+  )
+  finite_lp <- is.finite(logpost)
+  relative_logpost <- rep(-Inf, length(logpost))
+  if (any(finite_lp)) {
+    relative_logpost[finite_lp] <- logpost[finite_lp] - max(logpost[finite_lp])
+  }
+  relevance <- exp(pmin(relative_logpost, 0) / as.numeric(relevance_temperature))
+  score <- pmax(coverage, 0) * pmax(novelty, 0) * relevance
+  ord <- order(score, coverage, novelty, decreasing = TRUE)
+  selected <- vector("list", 0L)
+  selected_theta <- reference_theta
+  for (idx in ord) {
+    if (!is.finite(score[idx]) || score[idx] <= 0) next
+    cand <- candidates[idx, , drop = FALSE]
+    dist <- .bank_smc_feature_distances(cand, selected_theta, model)
+    if (is.finite(dist) && dist >= min_distance) {
+      selected[[length(selected) + 1L]] <- cand
+      selected_theta <- rbind(selected_theta, cand)
+    }
+    if (length(selected) >= as.integer(max_points)) break
+  }
+  if (!length(selected)) return(NULL)
+  out <- do.call(rbind, selected)
+  colnames(out) <- model$hyper_names
+  .bank_unique_theta_rows(out, model)
+}
+
 bank_smc_select_theta_design <- function(population_fit,
                                          population_model,
                                          max_points = 6L,
@@ -1638,6 +2517,8 @@ bank_smc_select_theta_design <- function(population_fit,
                                          extra_theta = NULL,
                                          prior_stress = FALSE,
                                          prior_tail_probs = c(0.025, 0.975),
+                                         paired_effect_profiles = TRUE,
+                                         protect_profile_tails = TRUE,
                                          target_ess_frac = 0.3,
                                          score_local_count = 20L) {
   model <- normalize_population_model(population_model)
@@ -1677,10 +2558,39 @@ bank_smc_select_theta_design <- function(population_fit,
     dims <- head(order(spread, decreasing = TRUE), profile_dims)
     for (j in dims) {
       vals <- .bank_weighted_quantile(theta[, j], w, tail_probs)
+      if (isTRUE(protect_profile_tails) && length(vals)) {
+        for (val in range(vals, na.rm = TRUE)) {
+          row <- center
+          row[j] <- val
+          protected[[length(protected) + 1L]] <- row
+        }
+      }
       for (val in vals) {
         row <- center
         row[j] <- val
         rows[[length(rows) + 1L]] <- row
+      }
+    }
+  }
+
+  if (isTRUE(paired_effect_profiles) &&
+      identical(model$fast_family %||% NULL, "gaussian") &&
+      model$hyper_dim == 2L * model$alpha_dim &&
+      profile_dims > 0L) {
+    d <- model$alpha_dim
+    effect_score <- spread[seq_len(d)] + spread[d + seq_len(d)]
+    effect_dims <- head(order(effect_score, decreasing = TRUE), min(profile_dims, d))
+    pair_probs <- sort(unique(as.numeric(tail_probs)))
+    for (j in effect_dims) {
+      mean_vals <- .bank_weighted_quantile(theta[, j], w, pair_probs)
+      var_vals <- .bank_weighted_quantile(theta[, d + j], w, pair_probs)
+      for (mean_val in mean_vals) {
+        for (var_val in var_vals) {
+          row <- center
+          row[j] <- mean_val
+          row[d + j] <- var_val
+          rows[[length(rows) + 1L]] <- row
+        }
       }
     }
   }
@@ -1723,6 +2633,41 @@ bank_smc_select_theta_design <- function(population_fit,
     out <- out[take, , drop = FALSE]
   }
   out[seq_len(min(nrow(out), max_points)), , drop = FALSE]
+}
+
+bank_smc_select_joint_tail_theta <- function(population_fit,
+                                             population_model,
+                                             max_points = 4L,
+                                             profile_dims = 1L,
+                                             tail_probs = c(0.01, 0.05, 0.95, 0.99)) {
+  model <- normalize_population_model(population_model)
+  theta <- .as_hyper_matrix(population_fit$theta, hyper_names = model$hyper_names, hyper_dim = model$hyper_dim)
+  w <- .bank_normalize_weights(population_fit$w)
+  if (nrow(theta) < 1L || max_points <= 0L) {
+    return(matrix(numeric(0), nrow = 0L, ncol = model$hyper_dim, dimnames = list(NULL, model$hyper_names)))
+  }
+
+  profile_dims <- as.integer(max(1L, profile_dims))
+  tail_probs <- sort(unique(pmin(pmax(as.numeric(tail_probs), 1e-4), 1 - 1e-4)))
+  S <- if (nrow(theta) > 1L) {
+    tryCatch(weighted_cov(theta, w), error = function(e) stats::cov(theta))
+  } else {
+    matrix(0, nrow = model$hyper_dim, ncol = model$hyper_dim)
+  }
+  spread <- sqrt(pmax(diag(regularize_cov(S, min_eig = 1e-8, cond_cap = 1e8)), 0))
+  spread[!is.finite(spread)] <- 0
+  dims <- head(order(spread, decreasing = TRUE), min(profile_dims, model$hyper_dim))
+
+  idx <- integer(0)
+  for (j in dims) {
+    vals <- .bank_weighted_quantile(theta[, j], w, tail_probs)
+    idx <- c(idx, vapply(vals, function(v) which.min(abs(theta[, j] - v)), integer(1)))
+  }
+  idx <- unique(idx)
+  if (length(idx) > as.integer(max_points)) idx <- idx[seq_len(as.integer(max_points))]
+  out <- theta[idx, , drop = FALSE]
+  colnames(out) <- model$hyper_names
+  .bank_unique_theta_rows(out, model)
 }
 
 bank_smc_initial_banks <- function(data_list,
@@ -1849,14 +2794,29 @@ bank_smc_refine_banks_to_design <- function(banks,
                                             bridge_particles = NULL,
                                             target_cess = 0.9,
                                             n_mcmc_moves = 2L,
+                                            max_steps = 128L,
+                                            bridge_min_single_ess_frac = 0.05,
+                                            bridge_max_pareto_k = 0.7,
+                                            force = FALSE,
+                                            anchor_tol = 1e-8,
+                                            graph_control = list(),
                                             n_jobs = 1L,
                                             local_n_cores = 1L,
                                             seed = 123L,
                                             verbose = FALSE) {
   model <- normalize_population_model(population_model)
   theta_design <- .as_hyper_matrix(theta_design, hyper_names = model$hyper_names, hyper_dim = model$hyper_dim)
+  graph_defaults <- list(
+    enabled = TRUE,
+    min_edge_ess_frac = 0.05,
+    max_pareto_k = max_pareto_k,
+    use_psis = FALSE,
+    max_rounds = 50L
+  )
+  graph_control <- modifyList(graph_defaults, graph_control)
   ids <- seq_along(banks)
   rows <- vector("list", 0L)
+  graph_rows <- vector("list", 0L)
   refined <- parallel::mclapply(
     ids,
     function(pos) {
@@ -1872,8 +2832,11 @@ bank_smc_refine_banks_to_design <- function(banks,
           max_pareto_k = max_pareto_k,
           use_psis = FALSE
         )
+        anchors <- bank_smc_local_bank_theta_anchors(bank, model)
+        has_anchor <- any(rowSums(abs(sweep(anchors, 2L, as.numeric(theta_j), "-"))) <= as.numeric(anchor_tol))
         added <- FALSE
-        if (!isTRUE(diag$covered) && bank$n_nodes < bank$max_nodes) {
+        forced <- isTRUE(force) && !has_anchor
+        if ((!isTRUE(diag$covered) || forced) && bank$n_nodes < bank$max_nodes) {
           if (is.finite(bank$max_particles) &&
               bank$n_particles + as.integer(bridge_particles %||% bank$nodes[[diag$best_node]]$n_particles) > bank$max_particles) {
             added <- FALSE
@@ -1887,6 +2850,9 @@ bank_smc_refine_banks_to_design <- function(banks,
               M = bridge_particles,
               target_cess = target_cess,
               n_mcmc_moves = n_mcmc_moves,
+              max_steps = max_steps,
+              bridge_min_single_ess_frac = bridge_min_single_ess_frac,
+              bridge_max_pareto_k = bridge_max_pareto_k,
               n_cores = local_n_cores,
               seed = as.integer(seed + 10000L * pos + j),
               verbose = verbose,
@@ -1900,6 +2866,7 @@ bank_smc_refine_banks_to_design <- function(banks,
           local_id = as.integer(bank$local_id),
           theta_id = as.integer(j),
           covered_before = isTRUE(diag$covered),
+          forced = isTRUE(forced),
           added = isTRUE(added),
           ess_frac = as.numeric(diag$mixture$ess_frac),
           natural_ess_frac = as.numeric(diag$natural$best_ess_frac %||% NA_real_),
@@ -1910,17 +2877,47 @@ bank_smc_refine_banks_to_design <- function(banks,
           check.names = FALSE
         )
       }
-      list(bank = bank, rows = do.call(rbind, local_rows))
+      graph_insertions <- data.frame()
+      if (isTRUE(graph_control$enabled) && bank$n_nodes > 1L) {
+        certified <- bank_smc_local_bank_certify_bridge_graph(
+          bank = bank,
+          population_model = model,
+          data_i = data_list[[pos]],
+          loglik_fn = loglik_fn,
+          M = bridge_particles,
+          min_edge_ess_frac = graph_control$min_edge_ess_frac,
+          max_pareto_k = graph_control$max_pareto_k,
+          use_psis = graph_control$use_psis,
+          max_rounds = graph_control$max_rounds,
+          target_cess = target_cess,
+          n_mcmc_moves = n_mcmc_moves,
+          max_steps = max_steps,
+          n_cores = local_n_cores,
+          seed = as.integer(seed + 500000L + 10000L * pos),
+          verbose = verbose
+        )
+        bank <- certified$bank
+        graph_insertions <- certified$insertions
+      }
+      list(bank = bank, rows = do.call(rbind, local_rows), graph_rows = graph_insertions)
     },
     mc.cores = as.integer(max(1L, n_jobs))
   )
+  failed <- vapply(refined, inherits, logical(1), what = "try-error")
+  if (any(failed)) {
+    msg <- conditionMessage(attr(refined[[which(failed)[1L]]], "condition"))
+    stop("Local bank design refinement failed for worker ", which(failed)[1L], ": ", msg)
+  }
   for (i in seq_along(refined)) {
     banks[[i]] <- refined[[i]]$bank
     rows[[i]] <- refined[[i]]$rows
+    graph_rows[[i]] <- refined[[i]]$graph_rows
   }
+  graph_rows <- Filter(nrow, graph_rows)
   list(
     banks = banks,
-    refinements = do.call(rbind, rows)
+    refinements = do.call(rbind, rows),
+    graph_insertions = if (length(graph_rows)) do.call(rbind, graph_rows) else data.frame()
   )
 }
 
@@ -1979,6 +2976,13 @@ bank_smc_repair_from_audit <- function(banks,
                                        loglik_fn,
                                        population_model,
                                        max_repairs = 20L,
+                                       target_ess_frac = 0.3,
+                                       max_pareto_k = 0.7,
+                                       n_jobs = 1L,
+                                       local_n_cores = 1L,
+                                       seed = 123L,
+                                       verbose = FALSE,
+                                       graph_control = list(),
                                        ...) {
   failed <- audit[!audit$covered, , drop = FALSE]
   empty_repairs <- data.frame(
@@ -2001,37 +3005,112 @@ bank_smc_repair_from_audit <- function(banks,
   failed <- failed[seq_len(min(nrow(failed), as.integer(max_repairs))), , drop = FALSE]
 
   model <- normalize_population_model(population_model)
+  graph_defaults <- list(
+    enabled = TRUE,
+    min_edge_ess_frac = 0.05,
+    max_pareto_k = max_pareto_k,
+    use_psis = FALSE,
+    max_rounds = 50L
+  )
+  graph_control <- modifyList(graph_defaults, graph_control)
   dots <- list(...)
-  repair_rows <- vector("list", 0L)
-  for (r in seq_len(nrow(failed))) {
-    i <- failed$local_id[r]
-    j <- failed$theta_id[r]
-    bank <- validate_bank_smc_local_bank(banks[[i]], population_model = model)
-    if (bank$n_nodes >= bank$max_nodes) next
-    M <- as.integer(dots$M %||% bank$nodes[[failed$best_node[r]]]$n_particles)
-    if (is.finite(bank$max_particles) && bank$n_particles + M > bank$max_particles) next
-    bridged <- bank_smc_local_bank_add_anchor(
-      bank = bank,
-      population_model = model,
-      theta_target = theta_audit[j, , drop = FALSE],
-      data_i = data_list[[i]],
-      loglik_fn = loglik_fn,
-      ...,
-      use_psis = FALSE
-    )
-    banks[[i]] <- bridged$bank
-    repair_rows[[r]] <- data.frame(
-      local_id = as.integer(i),
-      theta_id = as.integer(j),
-      old_ess_frac = failed$ess_frac[r],
-      nodes_after = as.integer(bridged$bank$n_nodes),
-      particles_after = as.integer(bridged$bank$n_particles),
-      check.names = FALSE
-    )
+  failed_by_local <- split(failed, failed$local_id)
+  repaired <- parallel::mclapply(
+    failed_by_local,
+    function(local_failed) {
+      i <- as.integer(local_failed$local_id[1L])
+      bank <- validate_bank_smc_local_bank(banks[[i]], population_model = model)
+      local_rows <- vector("list", 0L)
+      for (r in seq_len(nrow(local_failed))) {
+        j <- local_failed$theta_id[r]
+        diag <- bank_smc_local_bank_coverage_diagnostic(
+          bank = bank,
+          population_model = model,
+          theta = theta_audit[j, , drop = FALSE],
+          min_mixture_ess_frac = target_ess_frac,
+          max_pareto_k = max_pareto_k,
+          use_psis = FALSE
+        )
+        if (isTRUE(diag$covered)) next
+        if (bank$n_nodes >= bank$max_nodes) next
+        M <- as.integer(dots$M %||% bank$nodes[[diag$best_node]]$n_particles)
+        if (is.finite(bank$max_particles) && bank$n_particles + M > bank$max_particles) next
+        bridged <- do.call(
+          bank_smc_local_bank_add_anchor,
+          c(
+            list(
+              bank = bank,
+              population_model = model,
+              theta_target = theta_audit[j, , drop = FALSE],
+              data_i = data_list[[i]],
+              loglik_fn = loglik_fn,
+              n_cores = local_n_cores,
+              seed = as.integer(seed + 10000L * i + r),
+              verbose = verbose,
+              use_psis = FALSE
+            ),
+            dots
+          )
+        )
+        bank <- bridged$bank
+        local_rows[[length(local_rows) + 1L]] <- data.frame(
+          local_id = as.integer(i),
+          theta_id = as.integer(j),
+          old_ess_frac = as.numeric(diag$mixture$ess_frac),
+          nodes_after = as.integer(bridged$bank$n_nodes),
+          particles_after = as.integer(bridged$bank$n_particles),
+          check.names = FALSE
+        )
+      }
+      graph_insertions <- data.frame()
+      if (isTRUE(graph_control$enabled) && bank$n_nodes > 1L) {
+        certified <- bank_smc_local_bank_certify_bridge_graph(
+          bank = bank,
+          population_model = model,
+          data_i = data_list[[i]],
+          loglik_fn = loglik_fn,
+          M = dots$M %||% NULL,
+          min_edge_ess_frac = graph_control$min_edge_ess_frac,
+          max_pareto_k = graph_control$max_pareto_k,
+          use_psis = graph_control$use_psis,
+          max_rounds = graph_control$max_rounds,
+          target_cess = dots$target_cess %||% 0.9,
+          n_mcmc_moves = dots$n_mcmc_moves %||% 2L,
+          max_steps = dots$max_steps %||% 128L,
+          n_cores = local_n_cores,
+          seed = as.integer(seed + 600000L + 10000L * i),
+          verbose = verbose
+        )
+        bank <- certified$bank
+        graph_insertions <- certified$insertions
+      }
+      list(
+        bank = bank,
+        rows = if (length(local_rows)) do.call(rbind, local_rows) else empty_repairs,
+        graph_rows = graph_insertions
+      )
+    },
+    mc.cores = as.integer(max(1L, n_jobs))
+  )
+  failed_workers <- vapply(repaired, inherits, logical(1), what = "try-error")
+  if (any(failed_workers)) {
+    msg <- conditionMessage(attr(repaired[[which(failed_workers)[1L]]], "condition"))
+    stop("Local bank audit repair failed for worker ", which(failed_workers)[1L], ": ", msg)
   }
+  repair_rows <- vector("list", length(repaired))
+  graph_rows <- vector("list", length(repaired))
+  for (k in seq_along(repaired)) {
+    i <- as.integer(names(failed_by_local)[k])
+    banks[[i]] <- repaired[[k]]$bank
+    repair_rows[[k]] <- repaired[[k]]$rows
+    graph_rows[[k]] <- repaired[[k]]$graph_rows
+  }
+  repair_rows <- Filter(nrow, repair_rows)
+  graph_rows <- Filter(nrow, graph_rows)
   list(
     banks = banks,
-    repairs = if (length(repair_rows)) do.call(rbind, repair_rows) else empty_repairs
+    repairs = if (length(repair_rows)) do.call(rbind, repair_rows) else empty_repairs,
+    graph_insertions = if (length(graph_rows)) do.call(rbind, graph_rows) else data.frame()
   )
 }
 
@@ -2041,9 +3120,12 @@ fit_bank_smc_population_model <- function(data_list,
                                           initial_theta,
                                           local_control = list(),
                                           anchor_control = list(),
+                                          rho_anchor_control = list(),
                                           shape_control = list(),
                                           outer_control = list(),
                                           design_control = list(),
+                                          calibration_control = list(),
+                                          graph_control = list(),
                                           audit_control = list(),
                                           n_cores = 1L,
                                           seed = 123L,
@@ -2056,7 +3138,10 @@ fit_bank_smc_population_model <- function(data_list,
     target_ess_frac = 0.3,
     bridge_particles = NULL,
     target_cess = 0.9,
-    n_mcmc_moves = 2L
+    n_mcmc_moves = 2L,
+    max_steps = 128L,
+    bridge_min_single_ess_frac = Inf,
+    bridge_max_pareto_k = 0.7
   )
   anchor_defaults <- list(
     enabled = TRUE,
@@ -2077,31 +3162,79 @@ fit_bank_smc_population_model <- function(data_list,
     G_mix = 8L,
     rw_scale = 0.9
   )
+  rho_anchor_defaults <- list(
+    enabled = FALSE,
+    max_challengers = 1L,
+    min_base_points = 4L,
+    candidate_pool = 96L,
+    min_distance = 0.25,
+    relevance_temperature = 10,
+    rho_ladder = c(0.001, 0.01, 0.05, 0.15, 0.35, 0.75),
+    outer_particles = 500L,
+    sketch_starts = 8L,
+    start_scale = 4,
+    reference_scale = 25,
+    support_weight_floor = 0.50,
+    n_mcmc_moves = 2L,
+    max_rounds = 80L,
+    cess_target = 0.60,
+    resample_threshold = 0.5,
+    rw_scale = 0.8
+  )
   design_defaults <- list(
     support_points = 6L,
     profile_dims = 4L,
     tail_probs = c(0.025, 0.1, 0.9, 0.975),
-    initial_tail_probs = c(0.01, 0.025, 0.1, 0.9, 0.975, 0.99)
+    initial_tail_probs = c(0.01, 0.025, 0.1, 0.9, 0.975, 0.99),
+    paired_effect_profiles = TRUE
   )
   shape_defaults <- list(n_alpha_configs = 128L, draws_per_config = 1L, ell_grid_size = 96L)
+  calibration_defaults <- list(
+    enabled = TRUE,
+    max_iter = 3000L,
+    tol = 1e-8,
+    anchor = "mean_smc"
+  )
+  graph_defaults <- list(
+    enabled = TRUE,
+    min_edge_ess_frac = 0.05,
+    max_pareto_k = 0.7,
+    use_psis = FALSE,
+    max_rounds = 50L,
+    require_connected = TRUE
+  )
   audit_defaults <- list(
-    max_points = 5L,
+    max_points = NULL,
     target_ess_frac = 0.05,
     max_pareto_k = 0.7,
-    max_repairs = 20L,
-    refine_rounds = 3L
+    max_repairs = NULL,
+    refine_rounds = 3L,
+    force_refine_points = 0L,
+    force_profile_dims = 1L,
+    force_tail_probs = c(0.01, 0.05, 0.95, 0.99)
   )
   local_control <- modifyList(local_defaults, local_control)
   anchor_control <- modifyList(anchor_defaults, anchor_control)
   anchor_control$M <- as.integer(anchor_control$M %||% min(400L, local_control$M))
+  rho_anchor_control <- modifyList(rho_anchor_defaults, rho_anchor_control)
   shape_control <- modifyList(shape_defaults, shape_control)
+  calibration_control <- modifyList(calibration_defaults, calibration_control)
+  graph_control <- modifyList(graph_defaults, graph_control)
   design_control <- modifyList(design_defaults, design_control)
   node_budget <- if (is.finite(local_control$max_nodes)) as.integer(local_control$max_nodes) else 5L
   design_control$max_points <- as.integer(
     design_control$max_points %||%
-      max(2L, min(5L, node_budget - 1L))
+      max(2L, node_budget - 1L)
   )
   audit_control <- modifyList(audit_defaults, audit_control)
+  audit_control$max_points <- as.integer(
+    audit_control$max_points %||%
+      max(5L, node_budget - 1L)
+  )
+  audit_control$max_repairs <- as.integer(
+    audit_control$max_repairs %||%
+      max(20L, length(data_list) * audit_control$max_points)
+  )
 
   if (isTRUE(verbose)) cat("Bank SMC: initial local banks\n")
   banks <- bank_smc_initial_banks(
@@ -2112,6 +3245,9 @@ fit_bank_smc_population_model <- function(data_list,
     M = local_control$M,
     max_nodes = local_control$max_nodes,
     max_particles = local_control$max_particles,
+    cess_target = local_control$target_cess,
+    n_mcmc_moves = local_control$n_mcmc_moves,
+    max_rounds = local_control$max_steps,
     n_jobs = n_cores,
     local_n_cores = 1L,
     seed = seed,
@@ -2148,6 +3284,31 @@ fit_bank_smc_population_model <- function(data_list,
     )
   }
 
+  rho_anchor_candidates <- NULL
+  if (isTRUE(rho_anchor_control$enabled)) {
+    if (isTRUE(verbose)) cat("Bank SMC: rho-sketch anchor candidates\n")
+    rho_anchor_candidates <- bank_smc_rho_sketch_anchor_candidates(
+      data_list = data_list,
+      loglik_fn = loglik_fn,
+      population_model = model,
+      theta_reference = initial_theta,
+      rho_ladder = rho_anchor_control$rho_ladder,
+      outer_particles = rho_anchor_control$outer_particles,
+      sketch_starts = rho_anchor_control$sketch_starts,
+      start_scale = rho_anchor_control$start_scale,
+      reference_scale = rho_anchor_control$reference_scale,
+      support_weight_floor = rho_anchor_control$support_weight_floor,
+      n_mcmc_moves = rho_anchor_control$n_mcmc_moves,
+      max_rounds = rho_anchor_control$max_rounds,
+      cess_target = rho_anchor_control$cess_target,
+      resample_threshold = rho_anchor_control$resample_threshold,
+      rw_scale = rho_anchor_control$rw_scale,
+      n_jobs = n_cores,
+      seed = seed + 75000L,
+      verbose = FALSE
+    )
+  }
+
   if (isTRUE(verbose)) cat("Bank SMC: bank-imputed population shape\n")
   shape_fit <- bank_smc_build_analytic_shape(
     banks = banks,
@@ -2168,6 +3329,15 @@ fit_bank_smc_population_model <- function(data_list,
   initial_design_control <- design_control
   initial_design_control$tail_probs <- initial_design_control$initial_tail_probs
   initial_design_control$initial_tail_probs <- NULL
+  rho_challenger_slots <- if (isTRUE(rho_anchor_control$enabled)) {
+    min(
+      as.integer(rho_anchor_control$max_challengers),
+      max(0L, initial_design_control$max_points - as.integer(rho_anchor_control$min_base_points))
+    )
+  } else {
+    0L
+  }
+  initial_design_control$max_points <- max(1L, initial_design_control$max_points - rho_challenger_slots)
   theta_design <- do.call(
     bank_smc_select_theta_design,
     c(
@@ -2181,6 +3351,24 @@ fit_bank_smc_population_model <- function(data_list,
       initial_design_control
     )
   )
+  rho_theta_design <- NULL
+  if (rho_challenger_slots > 0L) {
+    rho_theta_design <- bank_smc_select_challenger_theta(
+      anchor_candidates = rho_anchor_candidates,
+      population_model = model,
+      banks = banks,
+      reference_theta = theta_design,
+      max_points = rho_challenger_slots,
+      candidate_pool = rho_anchor_control$candidate_pool,
+      min_distance = rho_anchor_control$min_distance,
+      relevance_temperature = rho_anchor_control$relevance_temperature,
+      target_ess_frac = local_control$target_ess_frac
+    )
+    if (!is.null(rho_theta_design) && nrow(rho_theta_design)) {
+      theta_design <- .bank_unique_theta_rows(rbind(theta_design, rho_theta_design), model)
+      theta_design <- theta_design[seq_len(min(nrow(theta_design), design_control$max_points)), , drop = FALSE]
+    }
+  }
 
   if (isTRUE(verbose)) cat(sprintf("Bank SMC: initial design expansion (%d theta points)\n", nrow(theta_design)))
   design_refinement <- bank_smc_refine_banks_to_design(
@@ -2193,35 +3381,131 @@ fit_bank_smc_population_model <- function(data_list,
     bridge_particles = local_control$bridge_particles,
     target_cess = local_control$target_cess,
     n_mcmc_moves = local_control$n_mcmc_moves,
+    max_steps = local_control$max_steps,
+    bridge_min_single_ess_frac = local_control$bridge_min_single_ess_frac,
+    bridge_max_pareto_k = local_control$bridge_max_pareto_k,
+    force = TRUE,
+    graph_control = graph_control,
     n_jobs = n_cores,
     local_n_cores = 1L,
     seed = seed + 200000L,
     verbose = FALSE
   )
   banks <- design_refinement$banks
+  graph_insertions <- list(initial_design = design_refinement$graph_insertions)
 
-  if (isTRUE(verbose)) cat("Bank SMC: outer population fit\n")
-  factor_set <- bank_smc_banks_to_factor_set(banks, model)
-  fit <- do.call(
-    outer_population_smc,
-    modifyList(
-      list(
-        factor_set = factor_set,
-        N = 1200L,
-        n_mcmc_moves = 3L,
-        max_rounds = 80L,
-        n_cores = n_cores,
-        seed = seed + 300000L,
-        verbose = FALSE
-      ),
-      outer_control
-    )
-  )
+  if (isTRUE(graph_control$enabled) && isTRUE(graph_control$require_connected)) {
+    graph_summary <- bank_smc_overlap_graph_summary(banks)
+    if (any(!graph_summary$certified)) {
+      stop(
+        "Local bank overlap graph certification failed before outer SMC for ",
+        sum(!graph_summary$certified),
+        " locals."
+      )
+    }
+  }
 
   audits <- list()
   repairs <- list()
   factor_updates <- list()
   for (round in seq_len(as.integer(audit_control$refine_rounds) + 1L)) {
+    if (isTRUE(graph_control$enabled) && isTRUE(graph_control$require_connected)) {
+      graph_summary <- bank_smc_overlap_graph_summary(banks)
+      if (any(!graph_summary$certified)) {
+        stop(
+          "Local bank overlap graph certification failed before outer SMC for ",
+          sum(!graph_summary$certified),
+          " locals."
+        )
+      }
+    }
+    if (isTRUE(calibration_control$enabled)) {
+      if (isTRUE(verbose)) cat("Bank SMC: calibrating local normalizers\n")
+      banks <- bank_smc_calibrate_banks_normalizers(
+        banks = banks,
+        population_model = model,
+        max_iter = calibration_control$max_iter,
+        tol = calibration_control$tol,
+        anchor = calibration_control$anchor,
+        n_jobs = n_cores
+      )
+    }
+    if (isTRUE(verbose)) {
+      label <- if (round == 1L) "outer population fit" else "outer population refit"
+      cat(sprintf("Bank SMC: %s\n", label))
+    }
+    factor_set <- bank_smc_banks_to_factor_set(banks, model)
+    fit <- do.call(
+      outer_population_smc,
+      modifyList(
+        list(
+          factor_set = factor_set,
+          N = 1200L,
+          n_mcmc_moves = 3L,
+          max_rounds = 80L,
+          n_cores = n_cores,
+          seed = seed + 300000L + 10000L * (round - 1L),
+          verbose = FALSE
+        ),
+        outer_control
+      )
+    )
+
+    if (as.integer(audit_control$force_refine_points) > 0L &&
+        round <= as.integer(audit_control$refine_rounds)) {
+      force_theta <- bank_smc_select_joint_tail_theta(
+        population_fit = fit,
+        population_model = model,
+        max_points = audit_control$force_refine_points,
+        profile_dims = audit_control$force_profile_dims,
+        tail_probs = audit_control$force_tail_probs
+      )
+      if (nrow(force_theta)) {
+        forced_refinement <- bank_smc_refine_banks_to_design(
+          banks = banks,
+          theta_design = force_theta,
+          data_list = data_list,
+          loglik_fn = loglik_fn,
+          population_model = model,
+          target_ess_frac = audit_control$target_ess_frac,
+          bridge_particles = local_control$bridge_particles,
+          target_cess = local_control$target_cess,
+          n_mcmc_moves = local_control$n_mcmc_moves,
+          max_steps = local_control$max_steps,
+          bridge_min_single_ess_frac = local_control$bridge_min_single_ess_frac,
+          bridge_max_pareto_k = local_control$bridge_max_pareto_k,
+          graph_control = graph_control,
+          force = TRUE,
+          n_jobs = n_cores,
+          local_n_cores = 1L,
+          seed = seed + 350000L + round,
+          verbose = FALSE
+        )
+        forced_added <- forced_refinement$refinements[
+          as.logical(forced_refinement$refinements$added), ,
+          drop = FALSE
+        ]
+        graph_added <- forced_refinement$graph_insertions
+        changed_locals <- sort(unique(c(
+          forced_added$local_id,
+          graph_added$local_id
+        )))
+        if (length(changed_locals)) {
+          banks <- forced_refinement$banks
+          repairs[[paste0("force_", round)]] <- forced_refinement$refinements
+          graph_insertions[[paste0("force_", round)]] <- forced_refinement$graph_insertions
+          factor_updates[[paste0("force_", round)]] <- list(
+            local_ids = changed_locals,
+            action = "force_outer_tail_anchor"
+          )
+          if (isTRUE(verbose)) {
+            cat(sprintf("Bank SMC: forced %d posterior-boundary anchors\n", nrow(forced_added)))
+          }
+          next
+        }
+      }
+    }
+
     audit_design_control <- modifyList(design_control, list(max_points = audit_control$max_points))
     audit_design_control$initial_tail_probs <- NULL
     theta_audit <- do.call(
@@ -2257,36 +3541,26 @@ fit_bank_smc_population_model <- function(data_list,
       loglik_fn = loglik_fn,
       population_model = model,
       max_repairs = audit_control$max_repairs,
+      target_ess_frac = audit_control$target_ess_frac,
+      max_pareto_k = audit_control$max_pareto_k,
       M = local_control$bridge_particles,
       target_cess = local_control$target_cess,
       n_mcmc_moves = local_control$n_mcmc_moves,
-      n_cores = 1L,
+      max_steps = local_control$max_steps,
+      bridge_min_single_ess_frac = local_control$bridge_min_single_ess_frac,
+      bridge_max_pareto_k = local_control$bridge_max_pareto_k,
+      n_jobs = n_cores,
+      local_n_cores = 1L,
       seed = seed + 400000L + round,
-      verbose = FALSE
+      verbose = FALSE,
+      graph_control = graph_control
     )
     banks <- repair$banks
-    repairs[[round]] <- repair$repairs
-    changed <- sort(unique(repair$repairs$local_id))
+    repairs[[paste0("repair_", round)]] <- repair$repairs
+    graph_insertions[[paste0("repair_", round)]] <- repair$graph_insertions
+    changed <- sort(unique(c(repair$repairs$local_id, repair$graph_insertions$local_id)))
     if (!length(changed)) break
-
-    old_factor_set <- factor_set
-    local_objects <- bank_smc_banks_to_local_objects(banks, model)
-    factor_set <- update_population_factor_set_locals(
-      factor_set = factor_set,
-      local_objects = local_objects,
-      local_ids = changed
-    )
-    fit <- update_outer_population_fit(
-      fit = fit,
-      old_factor_set = old_factor_set,
-      new_factor_set = factor_set,
-      n_mcmc_moves = as.integer(outer_control$n_mcmc_moves %||% 3L),
-      min_mcmc_moves = as.integer(outer_control$min_mcmc_moves %||% 1L),
-      n_cores = n_cores,
-      seed = seed + 500000L + round,
-      verbose = FALSE
-    )
-    factor_updates[[round]] <- list(local_ids = changed)
+    factor_updates[[paste0("repair_", round)]] <- list(local_ids = changed, action = "rerun_outer")
   }
 
   list(
@@ -2294,17 +3568,23 @@ fit_bank_smc_population_model <- function(data_list,
     factor_set = factor_set,
     shape_fit = shape_fit,
     anchor_candidates = anchor_candidates,
+    rho_anchor_candidates = rho_anchor_candidates,
+    rho_theta_design = rho_theta_design,
     fit = fit,
     theta_design = theta_design,
     design_refinement = design_refinement$refinements,
     audits = audits,
     repairs = repairs,
+    graph_insertions = graph_insertions,
     factor_updates = factor_updates,
     settings = list(
       local_control = local_control,
       shape_control = shape_control,
       anchor_control = anchor_control,
+      rho_anchor_control = rho_anchor_control,
       design_control = design_control,
+      calibration_control = calibration_control,
+      graph_control = graph_control,
       audit_control = audit_control,
       seed = seed
     )
