@@ -126,6 +126,22 @@ graph_max_pareto_k <- arg_num(cli_args, "graph_max_pareto_k", 0.70)
 graph_use_psis <- arg_lgl(cli_args, "graph_use_psis", FALSE)
 graph_max_rounds <- arg_int(cli_args, "graph_max_rounds", 50L)
 graph_require_connected <- arg_lgl(cli_args, "graph_require_connected", TRUE)
+surface_refine_points <- arg_int(cli_args, "surface_refine_points", 0L)
+surface_refine_rounds <- arg_int(cli_args, "surface_refine_rounds", 1L)
+surface_profile_dims <- arg_int(cli_args, "surface_profile_dims", design_profile_dims)
+surface_tail_probs <- arg_num_vec(cli_args, "surface_tail_probs", c(0.05, 0.95))
+surface_mean_tail_probs <- arg_num_vec(cli_args, "surface_mean_tail_probs", surface_tail_probs)
+surface_variance_tail_probs <- arg_num_vec(cli_args, "surface_variance_tail_probs", surface_tail_probs)
+surface_inflation_scale <- arg_num(cli_args, "surface_inflation_scale", 2.5)
+surface_include_inflated_profile <- arg_lgl(cli_args, "surface_include_inflated_profile", TRUE)
+surface_include_posterior_tail <- arg_lgl(cli_args, "surface_include_posterior_tail", TRUE)
+surface_paired_effect_profiles <- arg_lgl(cli_args, "surface_paired_effect_profiles", TRUE)
+surface_paired_effect_grid <- arg_lgl(cli_args, "surface_paired_effect_grid", TRUE)
+surface_candidate_multiplier <- arg_int(cli_args, "surface_candidate_multiplier", 4L)
+surface_score_local_count <- arg_int(cli_args, "surface_score_local_count", 20L)
+surface_score_log_weight <- arg_num(cli_args, "surface_score_log_weight", 1)
+surface_score_score_weight <- arg_num(cli_args, "surface_score_score_weight", 0.25)
+surface_score_distance_weight <- arg_num(cli_args, "surface_score_distance_weight", 0.05)
 rho_anchor_ladder <- arg_num_vec(cli_args, "rho_anchor_ladder", c(0.001, 0.01, 0.05, 0.15, 0.35, 0.75))
 rho_anchor_enabled <- arg_lgl(cli_args, "rho_anchor_enabled", TRUE)
 outer_particles <- arg_int(cli_args, "outer_particles", 2000L)
@@ -270,6 +286,25 @@ bank_result <- fit_bank_smc_population_model(
     max_rounds = graph_max_rounds,
     require_connected = graph_require_connected
   ),
+  surface_control = list(
+    enabled = surface_refine_points > 0L,
+    max_points = surface_refine_points,
+    refine_rounds = surface_refine_rounds,
+    profile_dims = surface_profile_dims,
+    tail_probs = surface_tail_probs,
+    paired_mean_tail_probs = surface_mean_tail_probs,
+    paired_variance_tail_probs = surface_variance_tail_probs,
+    inflation_scale = surface_inflation_scale,
+    include_inflated_profile = surface_include_inflated_profile,
+    include_posterior_tail = surface_include_posterior_tail,
+    paired_effect_profiles = surface_paired_effect_profiles,
+    paired_effect_grid = surface_paired_effect_grid,
+    candidate_multiplier = surface_candidate_multiplier,
+    score_local_count = surface_score_local_count,
+    score_log_weight = surface_score_log_weight,
+    score_score_weight = surface_score_score_weight,
+    score_distance_weight = surface_score_distance_weight
+  ),
   rho_anchor_control = list(
     enabled = rho_anchor_enabled,
     rho_ladder = rho_anchor_ladder,
@@ -349,6 +384,21 @@ audit_summary <- lapply(audit_entries, function(x) {
   )
 })
 audit_summary <- if (length(audit_summary)) do.call(rbind, audit_summary) else NULL
+surface_entries <- Filter(
+  function(x) is.data.frame(x) && "predicted_anchor_error" %in% names(x),
+  bank_result$surface_refinements
+)
+surface_summary <- lapply(surface_entries, function(x) {
+  added <- x[as.logical(x$added), , drop = FALSE]
+  finite_error <- added$predicted_anchor_error[is.finite(added$predicted_anchor_error)]
+  data.frame(
+    added = nrow(added),
+    max_abs_prediction_error = if (length(finite_error)) max(abs(finite_error)) else NA_real_,
+    median_abs_prediction_error = if (length(finite_error)) stats::median(abs(finite_error)) else NA_real_,
+    check.names = FALSE
+  )
+})
+surface_summary <- if (length(surface_summary)) do.call(rbind, surface_summary) else NULL
 
 saveRDS(
   list(
@@ -366,6 +416,7 @@ saveRDS(
     calibration_summary = calibration_summary,
     overlap_graph_summary = overlap_graph_summary,
     audit_summary = audit_summary,
+    surface_summary = surface_summary,
     settings = list(
       label = run_label,
       cores = cores,
@@ -402,6 +453,22 @@ saveRDS(
       graph_use_psis = graph_use_psis,
       graph_max_rounds = graph_max_rounds,
       graph_require_connected = graph_require_connected,
+      surface_refine_points = surface_refine_points,
+      surface_refine_rounds = surface_refine_rounds,
+      surface_profile_dims = surface_profile_dims,
+      surface_tail_probs = surface_tail_probs,
+      surface_mean_tail_probs = surface_mean_tail_probs,
+      surface_variance_tail_probs = surface_variance_tail_probs,
+      surface_inflation_scale = surface_inflation_scale,
+      surface_include_inflated_profile = surface_include_inflated_profile,
+      surface_include_posterior_tail = surface_include_posterior_tail,
+      surface_paired_effect_profiles = surface_paired_effect_profiles,
+      surface_paired_effect_grid = surface_paired_effect_grid,
+      surface_candidate_multiplier = surface_candidate_multiplier,
+      surface_score_local_count = surface_score_local_count,
+      surface_score_log_weight = surface_score_log_weight,
+      surface_score_score_weight = surface_score_score_weight,
+      surface_score_distance_weight = surface_score_distance_weight,
       rho_anchor_enabled = rho_anchor_enabled,
       rho_anchor_ladder = rho_anchor_ladder,
       outer_particles = outer_particles,
@@ -443,6 +510,14 @@ if (isTRUE(graph_certify)) {
     nrow(overlap_graph_summary),
     max(overlap_graph_summary$n_components, na.rm = TRUE),
     sum(overlap_graph_summary$inserted, na.rm = TRUE)
+  ))
+}
+if (!is.null(surface_summary)) {
+  cat(sprintf(
+    "Surface anchors: added=%d | max prediction error=%.3f | median prediction error=%.3f\n",
+    sum(surface_summary$added, na.rm = TRUE),
+    max(surface_summary$max_abs_prediction_error, na.rm = TRUE),
+    stats::median(surface_summary$median_abs_prediction_error, na.rm = TRUE)
   ))
 }
 cat("\nPosterior comparison to EMC2:\n")

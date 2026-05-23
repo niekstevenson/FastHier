@@ -675,6 +675,166 @@ bank_smc_local_bank_log_terms <- function(bank,
   )
 }
 
+.bank_gaussian_prior_sufficient_mean <- function(population_model, theta) {
+  model <- normalize_population_model(population_model)
+  if (!identical(model$fast_family %||% NULL, "gaussian")) return(NULL)
+  prepared <- population_model_prepare_theta(model, theta)
+  if (!identical(prepared$family, "gaussian") ||
+      !identical(prepared$quadratic_kind, "diag")) {
+    return(NULL)
+  }
+  sigma2 <- 1 / pmax(prepared$quadratic_coef, 1e-12)
+  out <- cbind(prepared$mean, prepared$mean * prepared$mean + sigma2)
+  colnames(out) <- c(
+    paste0("linear_", model$alpha_names),
+    paste0("quadratic_", model$alpha_names)
+  )
+  out
+}
+
+bank_smc_local_bank_score_summary <- function(bank,
+                                              population_model,
+                                              theta,
+                                              omit_node = NULL,
+                                              use_cached_stack = TRUE) {
+  model <- normalize_population_model(population_model)
+  bank <- validate_bank_smc_local_bank(bank, population_model = model)
+  theta <- .bank_align_theta(theta, model)
+  if (!is.null(omit_node)) {
+    omit_node <- as.integer(omit_node)
+    if (length(omit_node) != 1L || omit_node < 1L || omit_node > bank$n_nodes) {
+      stop("omit_node is out of range.")
+    }
+    keep <- setdiff(seq_along(bank$nodes), omit_node)
+    if (!length(keep)) stop("Cannot score a local bank with every node omitted.")
+    bank <- new_bank_smc_local_bank(
+      local_id = bank$local_id,
+      nodes = bank$nodes[keep],
+      eta = bank$eta[keep],
+      max_nodes = bank$max_nodes,
+      max_particles = bank$max_particles
+    )
+    use_cached_stack <- FALSE
+  }
+  terms <- bank_smc_local_bank_log_terms(
+    bank = bank,
+    population_model = model,
+    theta = theta,
+    use_cached_stack = use_cached_stack
+  )
+  lw <- as.numeric(terms$log_terms[1L, ])
+  log_marginal <- as.numeric(terms$log_marginal[1L])
+  w <- exp(lw - log_marginal)
+  out <- list(log_marginal = log_marginal)
+  prior_mean <- .bank_gaussian_prior_sufficient_mean(model, theta)
+  if (!is.null(prior_mean)) {
+    Talpha <- .bank_gaussian_sufficient_stat_matrix(terms$stack$alpha, model)
+    Et <- as.numeric(colSums(Talpha * w))
+    score_eta <- Et - as.numeric(prior_mean[1L, ])
+    names(score_eta) <- colnames(Talpha)
+    out$score_eta <- score_eta
+  }
+  out
+}
+
+.bank_surface_local_stability <- function(bank,
+                                          population_model,
+                                          theta,
+                                          use_cached_stack = TRUE) {
+  model <- normalize_population_model(population_model)
+  bank <- validate_bank_smc_local_bank(bank, population_model = model)
+  theta <- .bank_align_theta(theta, model)
+  full <- bank_smc_local_bank_score_summary(
+    bank = bank,
+    population_model = model,
+    theta = theta,
+    use_cached_stack = use_cached_stack
+  )
+  anchors <- bank_smc_local_bank_theta_anchors(bank, model)
+  natural <- bank_smc_local_bank_natural_diagnostic(bank, model, theta)
+  nearest <- as.integer((natural %||% list())$best_node %||%
+    which.min(rowSums(abs(sweep(anchors, 2L, as.numeric(theta), "-")))))
+  loo <- if (bank$n_nodes > 1L) {
+    bank_smc_local_bank_score_summary(
+      bank = bank,
+      population_model = model,
+      theta = theta,
+      omit_node = nearest,
+      use_cached_stack = FALSE
+    )
+  } else {
+    NULL
+  }
+  log_sensitivity <- if (!is.null(loo)) {
+    abs(as.numeric(full$log_marginal) - as.numeric(loo$log_marginal))
+  } else {
+    Inf
+  }
+  score_sensitivity <- if (!is.null(loo) &&
+      !is.null(full$score_eta) &&
+      !is.null(loo$score_eta)) {
+    sqrt(mean((full$score_eta - loo$score_eta)^2))
+  } else {
+    NA_real_
+  }
+  data.frame(
+    local_id = as.integer(bank$local_id),
+    nearest_node = nearest,
+    log_sensitivity = as.numeric(log_sensitivity),
+    score_sensitivity = as.numeric(score_sensitivity),
+    natural_ess_frac = as.numeric((natural %||% list())$best_ess_frac %||% NA_real_),
+    natural_distance = as.numeric((natural %||% list())$best_distance %||% NA_real_),
+    log_marginal = as.numeric(full$log_marginal),
+    check.names = FALSE
+  )
+}
+
+bank_smc_score_surface_theta_design_with_banks <- function(theta,
+                                                           banks,
+                                                           population_model,
+                                                           local_count = 20L,
+                                                           log_weight = 1,
+                                                           score_weight = 0.25,
+                                                           distance_weight = 0.05,
+                                                           n_jobs = 1L) {
+  model <- normalize_population_model(population_model)
+  theta <- .as_hyper_matrix(theta, hyper_names = model$hyper_names, hyper_dim = model$hyper_dim)
+  if (is.null(banks) || !length(banks) || !nrow(theta)) {
+    return(list(score = rep(0, nrow(theta)), diagnostics = data.frame()))
+  }
+  n_score <- min(length(banks), as.integer(max(1L, local_count)))
+  local_ids <- unique(as.integer(round(seq(1L, length(banks), length.out = n_score))))
+  parts <- parallel::mclapply(
+    seq_len(nrow(theta)),
+    function(j) {
+      local_rows <- lapply(local_ids, function(i) {
+        row <- .bank_surface_local_stability(
+          bank = banks[[i]],
+          population_model = model,
+          theta = theta[j, , drop = FALSE],
+          use_cached_stack = TRUE
+        )
+        row$theta_id <- as.integer(j)
+        row
+      })
+      do.call(rbind, local_rows)
+    },
+    mc.cores = as.integer(max(1L, n_jobs))
+  )
+  diagnostics <- do.call(rbind, parts)
+  diagnostics$component_score <-
+    as.numeric(log_weight) * pmax(diagnostics$log_sensitivity, 0) +
+    as.numeric(score_weight) * pmax(diagnostics$score_sensitivity, 0) +
+    as.numeric(distance_weight) * pmax(diagnostics$natural_distance, 0)
+  score <- vapply(seq_len(nrow(theta)), function(j) {
+    x <- diagnostics$component_score[diagnostics$theta_id == j]
+    x <- x[is.finite(x)]
+    if (!length(x)) return(0)
+    sum(x) + max(x)
+  }, numeric(1))
+  list(score = score, diagnostics = diagnostics)
+}
+
 .bank_log_weight_summary <- function(log_weights, use_psis = TRUE) {
   log_weights <- as.numeric(log_weights)
   finite <- is.finite(log_weights)
@@ -2670,6 +2830,169 @@ bank_smc_select_joint_tail_theta <- function(population_fit,
   .bank_unique_theta_rows(out, model)
 }
 
+bank_smc_select_inflated_profile_theta <- function(population_fit,
+                                                   population_model,
+                                                   max_points = 8L,
+                                                   profile_dims = 4L,
+                                                   tail_probs = c(0.05, 0.95),
+                                                   paired_mean_tail_probs = NULL,
+                                                   paired_variance_tail_probs = NULL,
+                                                   inflation_scale = 2.5,
+                                                   paired_effect_profiles = TRUE,
+                                                   paired_effect_grid = TRUE) {
+  model <- normalize_population_model(population_model)
+  theta <- .as_hyper_matrix(population_fit$theta, hyper_names = model$hyper_names, hyper_dim = model$hyper_dim)
+  w <- .bank_normalize_weights(population_fit$w)
+  empty <- matrix(numeric(0), nrow = 0L, ncol = model$hyper_dim, dimnames = list(NULL, model$hyper_names))
+  max_points <- as.integer(max_points)
+  if (nrow(theta) < 2L || max_points <= 0L) return(empty)
+
+  center <- .bank_weighted_mean(theta, w)
+  names(center) <- model$hyper_names
+  S <- tryCatch(weighted_cov(theta, w), error = function(e) stats::cov(theta))
+  spread <- sqrt(pmax(diag(regularize_cov(S, min_eig = 1e-8, cond_cap = 1e8)), 0))
+  spread[!is.finite(spread)] <- 0
+  tail_probs <- sort(unique(pmin(pmax(as.numeric(tail_probs), 1e-4), 1 - 1e-4)))
+  z <- stats::qnorm(tail_probs)
+  mean_tail_probs <- sort(unique(pmin(pmax(as.numeric(paired_mean_tail_probs %||% tail_probs), 1e-4), 1 - 1e-4)))
+  variance_tail_probs <- sort(unique(pmin(pmax(as.numeric(paired_variance_tail_probs %||% tail_probs), 1e-4), 1 - 1e-4)))
+  z_mean_grid <- stats::qnorm(mean_tail_probs)
+  z_variance_grid <- stats::qnorm(variance_tail_probs)
+  profile_dims <- as.integer(max(1L, profile_dims))
+  rows <- list()
+
+  add_axis_rows <- function(j) {
+    if (!is.finite(spread[j]) || spread[j] <= 0) return(NULL)
+    for (zz in z) {
+      row <- center
+      row[j] <- center[j] + as.numeric(inflation_scale) * zz * spread[j]
+      rows[[length(rows) + 1L]] <<- row
+    }
+    NULL
+  }
+
+  if (isTRUE(paired_effect_profiles) &&
+      identical(model$fast_family %||% NULL, "gaussian") &&
+      model$hyper_dim == 2L * model$alpha_dim) {
+    d <- model$alpha_dim
+    effect_score <- spread[seq_len(d)] + spread[d + seq_len(d)]
+    effects <- head(order(effect_score, decreasing = TRUE), min(profile_dims, d))
+    for (j in effects) {
+      if (isTRUE(paired_effect_grid) &&
+          is.finite(spread[j]) && spread[j] > 0 &&
+          is.finite(spread[d + j]) && spread[d + j] > 0) {
+        for (z_mean in z_mean_grid) {
+          for (z_var in z_variance_grid) {
+            row <- center
+            row[j] <- center[j] + as.numeric(inflation_scale) * z_mean * spread[j]
+            row[d + j] <- center[d + j] + as.numeric(inflation_scale) * z_var * spread[d + j]
+            rows[[length(rows) + 1L]] <- row
+          }
+        }
+      } else {
+        add_axis_rows(j)
+        add_axis_rows(d + j)
+      }
+    }
+  } else {
+    dims <- head(order(spread, decreasing = TRUE), min(profile_dims, model$hyper_dim))
+    for (j in dims) add_axis_rows(j)
+  }
+
+  if (!length(rows)) return(empty)
+  out <- do.call(rbind, rows)
+  colnames(out) <- model$hyper_names
+  out <- .bank_unique_theta_rows(out, model)
+  log_prior <- population_model_log_hyperprior(model, out)
+  out <- out[is.finite(log_prior), , drop = FALSE]
+  if (!nrow(out)) return(empty)
+  out[seq_len(min(nrow(out), max_points)), , drop = FALSE]
+}
+
+bank_smc_select_surface_theta <- function(population_fit,
+                                          population_model,
+                                          max_points = 8L,
+                                          profile_dims = 4L,
+                                          tail_probs = c(0.05, 0.95),
+                                          paired_mean_tail_probs = NULL,
+                                          paired_variance_tail_probs = NULL,
+                                          inflation_scale = 2.5,
+                                          include_inflated_profile = TRUE,
+                                          include_posterior_tail = TRUE,
+                                          paired_effect_profiles = TRUE,
+                                          paired_effect_grid = TRUE,
+                                          candidate_multiplier = 4L,
+                                          banks = NULL,
+                                          score_local_count = 20L,
+                                          score_log_weight = 1,
+                                          score_score_weight = 0.25,
+                                          score_distance_weight = 0.05,
+                                          n_jobs = 1L,
+                                          return_diagnostics = FALSE) {
+  model <- normalize_population_model(population_model)
+  max_points <- as.integer(max_points)
+  empty <- matrix(numeric(0), nrow = 0L, ncol = model$hyper_dim, dimnames = list(NULL, model$hyper_names))
+  if (max_points <= 0L) return(empty)
+  pool_points <- max_points * as.integer(max(1L, candidate_multiplier))
+
+  rows <- list()
+  if (isTRUE(include_inflated_profile)) {
+    inflated <- bank_smc_select_inflated_profile_theta(
+      population_fit = population_fit,
+      population_model = model,
+      max_points = pool_points,
+      profile_dims = profile_dims,
+      tail_probs = tail_probs,
+      paired_mean_tail_probs = paired_mean_tail_probs,
+      paired_variance_tail_probs = paired_variance_tail_probs,
+      inflation_scale = inflation_scale,
+      paired_effect_profiles = paired_effect_profiles,
+      paired_effect_grid = paired_effect_grid
+    )
+    if (nrow(inflated)) rows[[length(rows) + 1L]] <- inflated
+  }
+  if (isTRUE(include_posterior_tail)) {
+    posterior_tail <- bank_smc_select_joint_tail_theta(
+      population_fit = population_fit,
+      population_model = model,
+      max_points = pool_points,
+      profile_dims = profile_dims,
+      tail_probs = tail_probs
+    )
+    if (nrow(posterior_tail)) rows[[length(rows) + 1L]] <- posterior_tail
+  }
+  if (!length(rows)) return(empty)
+  out <- .bank_unique_theta_rows(do.call(rbind, rows), model)
+  score_info <- NULL
+  if (!is.null(banks) && length(banks) && nrow(out) > max_points) {
+    score_info <- bank_smc_score_surface_theta_design_with_banks(
+      theta = out,
+      banks = banks,
+      population_model = model,
+      local_count = score_local_count,
+      log_weight = score_log_weight,
+      score_weight = score_score_weight,
+      distance_weight = score_distance_weight,
+      n_jobs = n_jobs
+    )
+    ranked <- order(score_info$score, decreasing = TRUE)
+    out <- out[ranked, , drop = FALSE]
+    if (!is.null(score_info$diagnostics) && nrow(score_info$diagnostics)) {
+      score_info$ranking <- data.frame(
+        theta_id = seq_along(score_info$score),
+        surface_score = score_info$score,
+        rank = rank(-score_info$score, ties.method = "first"),
+        check.names = FALSE
+      )
+    }
+  }
+  selected <- out[seq_len(min(nrow(out), max_points)), , drop = FALSE]
+  if (isTRUE(return_diagnostics)) {
+    return(list(theta = selected, score = score_info))
+  }
+  selected
+}
+
 bank_smc_initial_banks <- function(data_list,
                                    loglik_fn,
                                    population_model,
@@ -2835,6 +3158,9 @@ bank_smc_refine_banks_to_design <- function(banks,
         anchors <- bank_smc_local_bank_theta_anchors(bank, model)
         has_anchor <- any(rowSums(abs(sweep(anchors, 2L, as.numeric(theta_j), "-"))) <= as.numeric(anchor_tol))
         added <- FALSE
+        log_marginal_before <- as.numeric(diag$mixture$log_marginal)
+        log_marginal_anchor <- NA_real_
+        predicted_anchor_error <- NA_real_
         forced <- isTRUE(force) && !has_anchor
         if ((!isTRUE(diag$covered) || forced) && bank$n_nodes < bank$max_nodes) {
           if (is.finite(bank$max_particles) &&
@@ -2860,6 +3186,8 @@ bank_smc_refine_banks_to_design <- function(banks,
             )
             bank <- bridged$bank
             added <- TRUE
+            log_marginal_anchor <- as.numeric(bridged$node$log_marginal_anchor)
+            predicted_anchor_error <- log_marginal_anchor - log_marginal_before
           }
         }
         local_rows[[length(local_rows) + 1L]] <- data.frame(
@@ -2872,6 +3200,9 @@ bank_smc_refine_banks_to_design <- function(banks,
           natural_ess_frac = as.numeric(diag$natural$best_ess_frac %||% NA_real_),
           natural_variance = as.numeric(diag$natural$best_variance %||% NA_real_),
           best_node = as.integer(diag$best_node),
+          log_marginal_before = log_marginal_before,
+          log_marginal_anchor = log_marginal_anchor,
+          predicted_anchor_error = predicted_anchor_error,
           nodes_after = as.integer(bank$n_nodes),
           particles_after = as.integer(bank$n_particles),
           check.names = FALSE
@@ -3126,6 +3457,7 @@ fit_bank_smc_population_model <- function(data_list,
                                           design_control = list(),
                                           calibration_control = list(),
                                           graph_control = list(),
+                                          surface_control = list(),
                                           audit_control = list(),
                                           n_cores = 1L,
                                           seed = 123L,
@@ -3203,6 +3535,25 @@ fit_bank_smc_population_model <- function(data_list,
     max_rounds = 50L,
     require_connected = TRUE
   )
+  surface_defaults <- list(
+    enabled = FALSE,
+    max_points = 0L,
+    refine_rounds = 1L,
+    profile_dims = 4L,
+    tail_probs = c(0.05, 0.95),
+    paired_mean_tail_probs = NULL,
+    paired_variance_tail_probs = NULL,
+    inflation_scale = 2.5,
+    include_inflated_profile = TRUE,
+    include_posterior_tail = TRUE,
+    paired_effect_profiles = TRUE,
+    paired_effect_grid = TRUE,
+    candidate_multiplier = 4L,
+    score_local_count = 20L,
+    score_log_weight = 1,
+    score_score_weight = 0.25,
+    score_distance_weight = 0.05
+  )
   audit_defaults <- list(
     max_points = NULL,
     target_ess_frac = 0.05,
@@ -3220,7 +3571,12 @@ fit_bank_smc_population_model <- function(data_list,
   shape_control <- modifyList(shape_defaults, shape_control)
   calibration_control <- modifyList(calibration_defaults, calibration_control)
   graph_control <- modifyList(graph_defaults, graph_control)
+  surface_control <- modifyList(surface_defaults, surface_control)
   design_control <- modifyList(design_defaults, design_control)
+  surface_control$max_points <- as.integer(surface_control$max_points %||% 0L)
+  surface_control$refine_rounds <- as.integer(surface_control$refine_rounds %||% 0L)
+  surface_control$profile_dims <- as.integer(surface_control$profile_dims %||% 1L)
+  surface_control$enabled <- isTRUE(surface_control$enabled) && surface_control$max_points > 0L
   node_budget <- if (is.finite(local_control$max_nodes)) as.integer(local_control$max_nodes) else 5L
   design_control$max_points <- as.integer(
     design_control$max_points %||%
@@ -3407,7 +3763,11 @@ fit_bank_smc_population_model <- function(data_list,
 
   audits <- list()
   repairs <- list()
+  surface_refinements <- list()
+  surface_designs <- list()
+  surface_scores <- list()
   factor_updates <- list()
+  surface_rounds_done <- 0L
   for (round in seq_len(as.integer(audit_control$refine_rounds) + 1L)) {
     if (isTRUE(graph_control$enabled) && isTRUE(graph_control$require_connected)) {
       graph_summary <- bank_smc_overlap_graph_summary(banks)
@@ -3450,6 +3810,89 @@ fit_bank_smc_population_model <- function(data_list,
         outer_control
       )
     )
+
+    if (isTRUE(surface_control$enabled) &&
+        surface_rounds_done < as.integer(surface_control$refine_rounds) &&
+        round <= as.integer(audit_control$refine_rounds)) {
+      surface_selection <- bank_smc_select_surface_theta(
+        population_fit = fit,
+        population_model = model,
+        max_points = surface_control$max_points,
+        profile_dims = surface_control$profile_dims,
+        tail_probs = surface_control$tail_probs,
+        paired_mean_tail_probs = surface_control$paired_mean_tail_probs,
+        paired_variance_tail_probs = surface_control$paired_variance_tail_probs,
+        inflation_scale = surface_control$inflation_scale,
+        include_inflated_profile = surface_control$include_inflated_profile,
+        include_posterior_tail = surface_control$include_posterior_tail,
+        paired_effect_profiles = surface_control$paired_effect_profiles,
+        paired_effect_grid = surface_control$paired_effect_grid,
+        candidate_multiplier = surface_control$candidate_multiplier,
+        banks = banks,
+        score_local_count = surface_control$score_local_count,
+        score_log_weight = surface_control$score_log_weight,
+        score_score_weight = surface_control$score_score_weight,
+        score_distance_weight = surface_control$score_distance_weight,
+        n_jobs = n_cores,
+        return_diagnostics = TRUE
+      )
+      surface_theta <- surface_selection$theta
+      surface_designs[[paste0("surface_", round)]] <- surface_theta
+      surface_scores[[paste0("surface_", round)]] <- surface_selection$score
+      if (nrow(surface_theta)) {
+        surface_refinement <- bank_smc_refine_banks_to_design(
+          banks = banks,
+          theta_design = surface_theta,
+          data_list = data_list,
+          loglik_fn = loglik_fn,
+          population_model = model,
+          target_ess_frac = audit_control$target_ess_frac,
+          bridge_particles = local_control$bridge_particles,
+          target_cess = local_control$target_cess,
+          n_mcmc_moves = local_control$n_mcmc_moves,
+          max_steps = local_control$max_steps,
+          bridge_min_single_ess_frac = local_control$bridge_min_single_ess_frac,
+          bridge_max_pareto_k = local_control$bridge_max_pareto_k,
+          graph_control = graph_control,
+          force = TRUE,
+          n_jobs = n_cores,
+          local_n_cores = 1L,
+          seed = seed + 325000L + round,
+          verbose = FALSE
+        )
+        surface_rounds_done <- surface_rounds_done + 1L
+        surface_added <- surface_refinement$refinements[
+          as.logical(surface_refinement$refinements$added), ,
+          drop = FALSE
+        ]
+        graph_added <- surface_refinement$graph_insertions
+        changed_locals <- sort(unique(c(
+          surface_added$local_id,
+          graph_added$local_id
+        )))
+        surface_refinements[[paste0("surface_", round)]] <- surface_refinement$refinements
+        if (length(changed_locals)) {
+          banks <- surface_refinement$banks
+          graph_insertions[[paste0("surface_", round)]] <- surface_refinement$graph_insertions
+          factor_updates[[paste0("surface_", round)]] <- list(
+            local_ids = changed_locals,
+            action = "surface_profile_anchor"
+          )
+          if (isTRUE(verbose)) {
+            finite_error <- surface_added$predicted_anchor_error[
+              is.finite(surface_added$predicted_anchor_error)
+            ]
+            max_error <- if (length(finite_error)) max(abs(finite_error)) else NA_real_
+            cat(sprintf(
+              "Bank SMC: forced %d surface anchors | max prediction error %.3f\n",
+              nrow(surface_added),
+              max_error
+            ))
+          }
+          next
+        }
+      }
+    }
 
     if (as.integer(audit_control$force_refine_points) > 0L &&
         round <= as.integer(audit_control$refine_rounds)) {
@@ -3575,6 +4018,9 @@ fit_bank_smc_population_model <- function(data_list,
     design_refinement = design_refinement$refinements,
     audits = audits,
     repairs = repairs,
+    surface_designs = surface_designs,
+    surface_scores = surface_scores,
+    surface_refinements = surface_refinements,
     graph_insertions = graph_insertions,
     factor_updates = factor_updates,
     settings = list(
@@ -3585,6 +4031,7 @@ fit_bank_smc_population_model <- function(data_list,
       design_control = design_control,
       calibration_control = calibration_control,
       graph_control = graph_control,
+      surface_control = surface_control,
       audit_control = audit_control,
       seed = seed
     )
