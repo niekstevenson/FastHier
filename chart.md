@@ -468,6 +468,39 @@ The implementation is not accepted unless EMC posterior shape improves relative
 to the current clean state, especially in `mu_sv`, `sigma2_sv`,
 `sigma2_v_LogFreq`, and `sigma2_v`.
 
+Implemented gate:
+
+```text
+fit_chart_atlas_population_model()
+local_atlas_benchmark_gate()
+benchmarks/run_emc_chart_atlas_gate.R
+```
+
+The gate is strict by default. Missing baseline comparison, theta audit, frozen
+outer rerun, or fresh endpoint probes are failures, not skipped diagnostics.
+Baseline improvement is evaluated on posterior shape, not only posterior means:
+standardized mean error, quantile-distance error, and posterior width error all
+enter the reported shape score.
+
+The population driver must build atlases, run a q0 preflight certification
+audit, add failed q0 support points as anchors, rebuild/freeze the atlases, run
+outer SMC against that frozen factor set, and then call the gate. A benchmark
+run that only calls the gate on manually assembled objects is not a completed
+phase 9 test.
+
+Numerical surface uncertainty is assessed with independent frozen atlas
+members. If two certified atlas surfaces disagree coherently but have
+complementary posterior errors, combine their posterior draws only with weights
+chosen from held-out fresh endpoint probes:
+
+```text
+weight_k proportional to fresh_probe_rmse_k^{-2}
+```
+
+This is not a substitute for local evidence calibration. It is a diagnostic
+ensemble for residual numerical bias, and the weights must not use Stan/EMC
+reference posterior draws.
+
 ## Non-Goals
 
 1. Do not add another global MBAR pass as the main fix.

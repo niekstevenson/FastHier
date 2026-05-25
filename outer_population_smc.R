@@ -784,6 +784,30 @@ population_factor_set_loglik <- function(factor_set, theta, include_constant = F
   model <- factor_set$population_model
   theta <- .as_hyper_matrix(theta, hyper_names = model$hyper_names, hyper_dim = model$hyper_dim)
 
+  if (inherits(factor_set, "local_evidence_atlas_factor_set")) {
+    if (!exists("local_evidence_atlas_factor_set_loglik", mode = "function")) {
+      stop("local_evidence_atlas_factor_set_loglik() is unavailable; source local_charts.R.")
+    }
+    return(local_evidence_atlas_factor_set_loglik(
+      factor_set = factor_set,
+      theta = theta,
+      include_constant = include_constant,
+      n_cores = n_cores
+    ))
+  }
+
+  if (inherits(factor_set, "local_evidence_corrected_factor_set")) {
+    if (!exists("corrected_factor_set_loglik", mode = "function")) {
+      stop("corrected_factor_set_loglik() is unavailable; source local_charts.R.")
+    }
+    return(corrected_factor_set_loglik(
+      factor_set = factor_set,
+      theta = theta,
+      include_constant = include_constant,
+      n_cores = n_cores
+    ))
+  }
+
   if (inherits(factor_set, "local_likelihood_sketch_factor_set")) {
     out <- local_likelihood_sketch_set_loglik(
       sketch_set = factor_set$sketch_set,
@@ -836,6 +860,30 @@ population_factor_set_loglik_by_local <- function(factor_set,
   model <- factor_set$population_model
   theta <- .as_hyper_matrix(theta, hyper_names = model$hyper_names, hyper_dim = model$hyper_dim)
 
+  if (inherits(factor_set, "local_evidence_atlas_factor_set")) {
+    if (!exists("local_evidence_atlas_factor_set_loglik_by_local", mode = "function")) {
+      stop("local_evidence_atlas_factor_set_loglik_by_local() is unavailable; source local_charts.R.")
+    }
+    return(local_evidence_atlas_factor_set_loglik_by_local(
+      factor_set = factor_set,
+      theta = theta,
+      include_constant = include_constant,
+      n_cores = n_cores
+    ))
+  }
+
+  if (inherits(factor_set, "local_evidence_corrected_factor_set")) {
+    if (!exists("corrected_factor_set_loglik_by_local", mode = "function")) {
+      stop("corrected_factor_set_loglik_by_local() is unavailable; source local_charts.R.")
+    }
+    return(corrected_factor_set_loglik_by_local(
+      factor_set = factor_set,
+      theta = theta,
+      include_constant = include_constant,
+      n_cores = n_cores
+    ))
+  }
+
   if (inherits(factor_set, "local_likelihood_sketch_factor_set")) {
     out <- local_likelihood_sketch_set_log_marginal_matrix(
       sketch_set = factor_set$sketch_set,
@@ -876,6 +924,24 @@ population_factor_set_loglik_by_local <- function(factor_set,
 
 population_factor_set_local_ess <- function(factor_set, theta) {
   stopifnot(inherits(factor_set, "population_factor_set"))
+  if (inherits(factor_set, "local_evidence_corrected_factor_set")) {
+    if (!exists("validate_corrected_local_atlas_factor_set", mode = "function")) {
+      stop("validate_corrected_local_atlas_factor_set() is unavailable; source local_charts.R.")
+    }
+    factor_set <- validate_corrected_local_atlas_factor_set(factor_set)
+    out <- rep(NA_real_, factor_set$n_locals)
+    names(out) <- names(factor_set$base_factor_set$atlases)
+    return(out)
+  }
+  if (inherits(factor_set, "local_evidence_atlas_factor_set")) {
+    if (!exists("validate_local_atlas_factor_set", mode = "function")) {
+      stop("validate_local_atlas_factor_set() is unavailable; source local_charts.R.")
+    }
+    factor_set <- validate_local_atlas_factor_set(factor_set)
+    out <- rep(NA_real_, factor_set$n_locals)
+    names(out) <- names(factor_set$atlases)
+    return(out)
+  }
   vapply(factor_set$factors, population_local_factor_ess, numeric(1), theta = theta)
 }
 
@@ -1395,7 +1461,7 @@ outer_population_smc <- function(factor_set,
     warning("outer_population_smc hit max_rounds before reaching beta_target.")
   }
 
-  list(
+  fit <- list(
     theta = theta,
     w = w,
     logprior = logprior,
@@ -1422,4 +1488,14 @@ outer_population_smc <- function(factor_set,
     initial_proposal = initial_proposal,
     proposal_bridge = proposal_bridge
   )
+  if (inherits(factor_set, "local_evidence_corrected_factor_set") &&
+      exists("summarize_corrected_outer_uncertainty", mode = "function")) {
+    fit$numerical_uncertainty <- summarize_corrected_outer_uncertainty(
+      factor_set = factor_set,
+      fit = fit
+    )
+    fit$log_evidence_numerical_se <- fit$numerical_uncertainty$evidence$numerical_se_log_evidence
+    fit$log_evidence_total_se <- fit$numerical_uncertainty$evidence$combined_se_log_evidence
+  }
+  fit
 }
