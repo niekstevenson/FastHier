@@ -71,6 +71,37 @@ arg_chr_vec <- function(args, key, default) {
   trimws(strsplit(val, ",", fixed = TRUE)[[1L]])
 }
 
+summarize_repair_history <- function(history) {
+  if (!is.data.frame(history) || !nrow(history)) return(data.frame())
+  for (nm in c("calibration_phase", "normalizer_method", "activation_reason", "repair_executor")) {
+    if (!nm %in% names(history)) history[[nm]] <- NA_character_
+    history[[nm]] <- as.character(history[[nm]])
+    history[[nm]][is.na(history[[nm]]) | !nzchar(history[[nm]])] <- "<missing>"
+  }
+  flag <- function(nm) {
+    if (nm %in% names(history)) history[[nm]] %in% TRUE else rep(FALSE, nrow(history))
+  }
+  tab <- data.frame(
+    repair_executor = history$repair_executor,
+    calibration_phase = history$calibration_phase,
+    normalizer_method = history$normalizer_method,
+    activation_reason = history$activation_reason,
+    n_rows = 1,
+    n_selected = as.integer(flag("selected")),
+    n_fresh_probed = as.integer(flag("fresh_probed")),
+    n_activated = as.integer(flag("activation_success")),
+    n_normalizer_certified = as.integer(flag("normalizer_certified")),
+    check.names = FALSE
+  )
+  out <- stats::aggregate(
+    cbind(n_rows, n_selected, n_fresh_probed, n_activated, n_normalizer_certified) ~
+      repair_executor + calibration_phase + normalizer_method + activation_reason,
+    data = tab,
+    FUN = sum
+  )
+  out[order(out$calibration_phase, -out$n_selected, out$normalizer_method, out$activation_reason), , drop = FALSE]
+}
+
 select_theta_profiles <- function(theta, focus_hyper_names, probs, max_points) {
   theta <- as.matrix(theta)
   focus_idx <- match(focus_hyper_names, colnames(theta))
@@ -149,6 +180,11 @@ compression_summary_csv <- arg_chr(
   "compression_summary_csv",
   file.path("benchmarks", "results", sprintf("population_emc_%s_compression_summary.csv", run_label))
 )
+repair_summary_csv <- arg_chr(
+  cli_args,
+  "repair_summary_csv",
+  file.path("benchmarks", "results", sprintf("population_emc_%s_repair_summary.csv", run_label))
+)
 smc_state_file <- arg_chr(
   cli_args,
   "smc_state_file",
@@ -187,7 +223,7 @@ strict_design_coverage <- arg_lgl(cli_args, "strict_design_coverage", TRUE)
 max_chart_distance <- arg_num(cli_args, "max_chart_distance", NA_real_)
 max_prediction_range <- arg_num(cli_args, "max_prediction_range", Inf)
 edge_neighbors <- arg_int(cli_args, "edge_neighbors", 2L)
-max_intermediates <- arg_int(cli_args, "max_intermediates", 2L)
+max_intermediates <- arg_int(cli_args, "max_intermediates", 4L)
 min_overlap_ess <- arg_num(cli_args, "min_overlap_ess", 0.03)
 edge_max_se <- arg_num(cli_args, "edge_max_se", 1.25)
 edge_max_gap <- arg_num(cli_args, "edge_max_forward_reverse_gap", 1.25)
@@ -216,40 +252,30 @@ calibration_rounds <- arg_int(cli_args, "calibration_rounds", 0L)
 calibration_particles <- arg_int(cli_args, "calibration_particles", candidate_particles)
 calibration_max_points <- arg_int(cli_args, "calibration_max_points", 7L)
 calibration_max_updates <- arg_int(cli_args, "calibration_max_updates", 12L)
-calibration_max_fresh_probes <- arg_int(cli_args, "calibration_max_fresh_probes", 64L)
-calibration_abs_delta <- arg_num(cli_args, "calibration_abs_delta", 0.75)
-calibration_z <- arg_num(cli_args, "calibration_z", 4)
-calibration_candidate_pool_multiplier <- arg_int(cli_args, "calibration_candidate_pool_multiplier", 3L)
 calibration_confirmation_reps <- arg_int(cli_args, "calibration_confirmation_reps", 0L)
 calibration_confirmation_particles <- arg_int(cli_args, "calibration_confirmation_particles", calibration_particles)
 calibration_confirmation_max_sd <- arg_num(cli_args, "calibration_confirmation_max_sd", 1.5)
-calibration_adaptive_confirmation_reps <- arg_int(cli_args, "calibration_adaptive_confirmation_reps", 2L)
 calibration_replicate_bootstrap_B <- arg_int(cli_args, "calibration_replicate_bootstrap_B", 200L)
 calibration_max_direct_graph_z <- arg_num(cli_args, "calibration_max_direct_graph_z", 3)
 calibration_max_direct_graph_chart_shift <- arg_num(cli_args, "calibration_max_direct_graph_chart_shift", 0.35)
 calibration_max_direct_graph_existing_shift <- arg_num(cli_args, "calibration_max_direct_graph_existing_shift", 0.15)
-calibration_adaptive_replicate_weight_multiplier <- arg_num(cli_args, "calibration_adaptive_replicate_weight_multiplier", 3)
-calibration_adaptive_replicate_min_theta_weight <- arg_num(cli_args, "calibration_adaptive_replicate_min_theta_weight", 0)
-calibration_adaptive_replicate_max_graph_z <- arg_num(cli_args, "calibration_adaptive_replicate_max_graph_z", 3)
-calibration_adaptive_replicate_graph_shift <- arg_num(cli_args, "calibration_adaptive_replicate_graph_shift", 0.25)
 pre_outer_calibration_rounds <- arg_int(cli_args, "pre_outer_calibration_rounds", 1L)
 pre_outer_calibration_audit_n <- arg_int(cli_args, "pre_outer_calibration_audit_n", max(outer_particles, refine_audit_n))
 pre_outer_calibration_max_points <- arg_int(cli_args, "pre_outer_calibration_max_points", 6L)
 pre_outer_calibration_max_updates <- arg_int(cli_args, "pre_outer_calibration_max_updates", 16L)
-pre_outer_calibration_max_fresh_probes <- arg_int(cli_args, "pre_outer_calibration_max_fresh_probes", 64L)
 initial_certification_rounds <- arg_int(cli_args, "initial_certification_rounds", 1L)
 initial_certification_max_updates <- arg_int(
   cli_args,
   "initial_certification_max_updates",
   max(pre_outer_calibration_max_updates, 16L)
 )
-initial_certification_max_fresh_probes <- arg_int(cli_args, "initial_certification_max_fresh_probes", 64L)
 initial_certification_stop_on_uncertified <- arg_lgl(cli_args, "initial_certification_stop_on_uncertified", FALSE)
 normalizer_robust_method <- arg_chr(cli_args, "normalizer_robust_method", "student_t")
 normalizer_student_t_df <- arg_num(cli_args, "normalizer_student_t_df", 30)
 if (!normalizer_robust_method %in% c("student_t", "huber", "none")) {
   stop("normalizer_robust_method must be one of: student_t, huber, none.")
 }
+repair_executor <- "local_atlas_repair_certification_pairs"
 verbose <- arg_lgl(cli_args, "verbose", FALSE)
 progress_verbose <- arg_lgl(cli_args, "progress_verbose", TRUE)
 trace_verbose <- arg_lgl(cli_args, "trace_verbose", verbose)
@@ -287,6 +313,7 @@ dir.create(dirname(build_history_csv), showWarnings = FALSE, recursive = TRUE)
 dir.create(dirname(calibration_history_csv), showWarnings = FALSE, recursive = TRUE)
 dir.create(dirname(graph_summary_csv), showWarnings = FALSE, recursive = TRUE)
 dir.create(dirname(compression_summary_csv), showWarnings = FALSE, recursive = TRUE)
+dir.create(dirname(repair_summary_csv), showWarnings = FALSE, recursive = TRUE)
 dir.create(dirname(smc_state_file), showWarnings = FALSE, recursive = TRUE)
 
 announce_step("0/6", "Inputs")
@@ -385,19 +412,18 @@ cat(sprintf(
   calibration_rounds,
   normalizer_robust_method
 ))
+cat(sprintf("Repair executor: %s\n", repair_executor))
 cat(sprintf(
-  "Pre-outer certification: rounds=%d | audit theta=%d | max theta=%d | max updates=%d | max fresh=%d\n",
+  "Pre-outer certification: rounds=%d | audit theta=%d | max theta=%d | max updates=%d\n",
   pre_outer_calibration_rounds,
   pre_outer_calibration_audit_n,
   pre_outer_calibration_max_points,
-  pre_outer_calibration_max_updates,
-  pre_outer_calibration_max_fresh_probes
+  pre_outer_calibration_max_updates
 ))
 cat(sprintf(
-  "Initial-cloud certification: rounds=%d | max updates=%d | max fresh=%d\n",
+  "Initial-cloud certification: rounds=%d | max updates=%d\n",
   initial_certification_rounds,
-  initial_certification_max_updates,
-  initial_certification_max_fresh_probes
+  initial_certification_max_updates
 ))
 cat(sprintf("Checkpoint: %s | resume=%s\n", checkpoint_file, if (isTRUE(resume_checkpoint)) "TRUE" else "FALSE"))
 cat(sprintf(
@@ -420,6 +446,7 @@ saveRDS(
     comparison_csv = comparison_csv,
     focus_parameters = focus_parameters,
     focus_hyper_names = focus_hyper_names,
+    repair_executor = repair_executor,
     settings = as.list(cli_args)
   ),
   config_file
@@ -514,32 +541,19 @@ workflow <- fit_chart_atlas_population_model(
     n_mcmc_moves = local_mcmc_moves,
     max_steps = local_max_steps,
     max_updates = calibration_max_updates,
-    max_fresh_probes = calibration_max_fresh_probes,
-    abs_delta_threshold = calibration_abs_delta,
-    z_threshold = calibration_z,
-    candidate_pool_multiplier = calibration_candidate_pool_multiplier,
     confirmation_reps = calibration_confirmation_reps,
     confirmation_M = calibration_confirmation_particles,
-    confirmation_abs_delta_threshold = calibration_abs_delta,
-    confirmation_z_threshold = calibration_z,
     confirmation_max_sd = calibration_confirmation_max_sd,
-    adaptive_confirmation_reps = calibration_adaptive_confirmation_reps,
     replicate_bootstrap_B = calibration_replicate_bootstrap_B,
     max_direct_graph_z = calibration_max_direct_graph_z,
     max_direct_graph_chart_shift = calibration_max_direct_graph_chart_shift,
     max_direct_graph_existing_shift = calibration_max_direct_graph_existing_shift,
-    adaptive_replicate_weight_multiplier = calibration_adaptive_replicate_weight_multiplier,
-    adaptive_replicate_min_theta_weight = calibration_adaptive_replicate_min_theta_weight,
-    adaptive_replicate_max_graph_z = calibration_adaptive_replicate_max_graph_z,
-    adaptive_replicate_graph_shift = calibration_adaptive_replicate_graph_shift,
     pre_outer_rounds = pre_outer_calibration_rounds,
     pre_outer_audit_n = pre_outer_calibration_audit_n,
     pre_outer_max_points = pre_outer_calibration_max_points,
     pre_outer_max_updates = pre_outer_calibration_max_updates,
-    pre_outer_max_fresh_probes = pre_outer_calibration_max_fresh_probes,
     initial_certification_rounds = initial_certification_rounds,
     initial_certification_max_updates = initial_certification_max_updates,
-    initial_certification_max_fresh_probes = initial_certification_max_fresh_probes,
     initial_certification_stop_on_uncertified = initial_certification_stop_on_uncertified
   ),
   proposal_control = list(
@@ -571,6 +585,12 @@ if (is.data.frame(workflow$atlas_build_history) && nrow(workflow$atlas_build_his
 if (is.data.frame(workflow$calibration_history) && nrow(workflow$calibration_history)) {
   utils::write.csv(workflow$calibration_history, calibration_history_csv, row.names = FALSE)
 }
+repair_summary <- summarize_repair_history(workflow$calibration_history)
+if (nrow(repair_summary)) {
+  utils::write.csv(repair_summary, repair_summary_csv, row.names = FALSE)
+  cat("Repair summary:\n")
+  print(repair_summary, row.names = FALSE)
+}
 if (is.data.frame(workflow$graph_summary) && nrow(workflow$graph_summary)) {
   utils::write.csv(workflow$graph_summary, graph_summary_csv, row.names = FALSE)
 }
@@ -591,6 +611,7 @@ saveRDS(
     factor_set = workflow$factor_set,
     compression_summary = workflow$compression_summary,
     graph_summary = workflow$graph_summary,
+    repair_summary = repair_summary,
     settings = workflow$settings
   ),
   smc_state_file,
@@ -632,6 +653,7 @@ saveRDS(
     graph_summary = workflow$graph_summary,
     design_certification = workflow$design_certification,
     calibration_history = workflow$calibration_history,
+    repair_summary = repair_summary,
     settings = list(
       label = run_label,
       seed = base_seed,
@@ -662,29 +684,22 @@ saveRDS(
       calibration_particles = calibration_particles,
       calibration_max_points = calibration_max_points,
       calibration_max_updates = calibration_max_updates,
-      calibration_max_fresh_probes = calibration_max_fresh_probes,
       calibration_confirmation_reps = calibration_confirmation_reps,
       calibration_confirmation_particles = calibration_confirmation_particles,
-      calibration_adaptive_confirmation_reps = calibration_adaptive_confirmation_reps,
       calibration_replicate_bootstrap_B = calibration_replicate_bootstrap_B,
       calibration_max_direct_graph_z = calibration_max_direct_graph_z,
       calibration_max_direct_graph_chart_shift = calibration_max_direct_graph_chart_shift,
       calibration_max_direct_graph_existing_shift = calibration_max_direct_graph_existing_shift,
-      calibration_adaptive_replicate_weight_multiplier = calibration_adaptive_replicate_weight_multiplier,
-      calibration_adaptive_replicate_min_theta_weight = calibration_adaptive_replicate_min_theta_weight,
-      calibration_adaptive_replicate_max_graph_z = calibration_adaptive_replicate_max_graph_z,
-      calibration_adaptive_replicate_graph_shift = calibration_adaptive_replicate_graph_shift,
       pre_outer_calibration_rounds = pre_outer_calibration_rounds,
       pre_outer_calibration_audit_n = pre_outer_calibration_audit_n,
       pre_outer_calibration_max_points = pre_outer_calibration_max_points,
       pre_outer_calibration_max_updates = pre_outer_calibration_max_updates,
-      pre_outer_calibration_max_fresh_probes = pre_outer_calibration_max_fresh_probes,
       initial_certification_rounds = initial_certification_rounds,
       initial_certification_max_updates = initial_certification_max_updates,
-      initial_certification_max_fresh_probes = initial_certification_max_fresh_probes,
       initial_certification_stop_on_uncertified = initial_certification_stop_on_uncertified,
       normalizer_robust_method = normalizer_robust_method,
       normalizer_student_t_df = normalizer_student_t_df,
+      repair_executor = repair_executor,
       min_particle_mis_ess = min_particle_mis_ess,
       min_particle_mis_ess_abs = min_particle_mis_ess_abs,
       max_particle_mis_psis_k = max_particle_mis_psis_k,
@@ -698,8 +713,8 @@ saveRDS(
       config_file = config_file,
       build_history_csv = build_history_csv,
       calibration_history_csv = calibration_history_csv,
-      graph_summary_csv = graph_summary_csv
-      ,
+      graph_summary_csv = graph_summary_csv,
+      repair_summary_csv = repair_summary_csv,
       compression_enabled = compress_local_particles,
       compression_particles = compression_particles,
       compression_theta_points = compression_theta_points,
@@ -718,6 +733,7 @@ saveRDS(
 cat(sprintf("Saved results: %s\n", results_file))
 cat(sprintf("Saved posterior comparison: %s\n", comparison_csv))
 cat(sprintf("Saved posterior plot: %s\n", plot_file))
+if (file.exists(repair_summary_csv)) cat(sprintf("Saved repair summary: %s\n", repair_summary_csv))
 if (file.exists(compression_summary_csv)) cat(sprintf("Saved compression summary: %s\n", compression_summary_csv))
 cat(sprintf("Saved post-outer SMC state: %s\n", smc_state_file))
 cat("Validation gate not run by the fitting script; use benchmarks/validate_emc_chart_atlas_gate.R on saved results.\n")

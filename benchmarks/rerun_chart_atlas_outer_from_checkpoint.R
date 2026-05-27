@@ -153,7 +153,6 @@ pre_outer_rounds <- arg_int(cli_args, "pre_outer_rounds", calibration_control$pr
 pre_outer_audit_n <- arg_int(cli_args, "pre_outer_audit_n", calibration_control$pre_outer_audit_n %||% max(N, 100L))
 pre_outer_max_points <- arg_int(cli_args, "pre_outer_max_points", calibration_control$pre_outer_max_points %||% 6L)
 pre_outer_max_updates <- arg_int(cli_args, "pre_outer_max_updates", calibration_control$pre_outer_max_updates %||% 16L)
-pre_outer_max_fresh_probes <- arg_int(cli_args, "pre_outer_max_fresh_probes", calibration_control$pre_outer_max_fresh_probes %||% 64L)
 pre_outer_particles <- arg_int(cli_args, "pre_outer_particles", calibration_control$M %||% local_control$candidate_M %||% 500L)
 pre_outer_mcmc_moves <- arg_int(cli_args, "pre_outer_mcmc_moves", calibration_control$n_mcmc_moves %||% local_control$n_mcmc_moves %||% 2L)
 pre_outer_max_steps <- arg_int(cli_args, "pre_outer_max_steps", calibration_control$max_steps %||% local_control$max_steps %||% 128L)
@@ -166,11 +165,6 @@ initial_certification_max_updates <- arg_int(
   cli_args,
   "initial_certification_max_updates",
   calibration_control$initial_certification_max_updates %||% pre_outer_max_updates
-)
-initial_certification_max_fresh_probes <- arg_int(
-  cli_args,
-  "initial_certification_max_fresh_probes",
-  calibration_control$initial_certification_max_fresh_probes %||% pre_outer_max_fresh_probes
 )
 stop_on_initial_uncertified <- arg_lgl(cli_args, "stop_on_initial_uncertified", TRUE)
 
@@ -239,7 +233,6 @@ if (pre_outer_rounds > 0L) {
   calibration_control$pre_outer_audit_n <- pre_outer_audit_n
   calibration_control$pre_outer_max_points <- pre_outer_max_points
   calibration_control$pre_outer_max_updates <- pre_outer_max_updates
-  calibration_control$pre_outer_max_fresh_probes <- pre_outer_max_fresh_probes
   calibration_control$M <- pre_outer_particles
   calibration_control$n_mcmc_moves <- pre_outer_mcmc_moves
   calibration_control$max_steps <- pre_outer_max_steps
@@ -286,7 +279,6 @@ if (initial_certification_rounds > 0L) {
     theta_weights = rep(1 / as.integer(N), as.integer(N)),
     max_rounds = as.integer(initial_certification_rounds),
     max_updates = as.integer(initial_certification_max_updates),
-    max_fresh_probes = as.integer(initial_certification_max_fresh_probes),
     n_cores = cores,
     seed = seed + 1900003L,
     verbose = verbose,
@@ -432,13 +424,11 @@ saveRDS(
       pre_outer_audit_n = pre_outer_audit_n,
       pre_outer_max_points = pre_outer_max_points,
       pre_outer_max_updates = pre_outer_max_updates,
-      pre_outer_max_fresh_probes = pre_outer_max_fresh_probes,
       pre_outer_particles = pre_outer_particles,
       pre_outer_mcmc_moves = pre_outer_mcmc_moves,
       pre_outer_max_steps = pre_outer_max_steps,
       initial_certification_rounds = initial_certification_rounds,
       initial_certification_max_updates = initial_certification_max_updates,
-      initial_certification_max_fresh_probes = initial_certification_max_fresh_probes,
       stop_on_initial_uncertified = stop_on_initial_uncertified,
       evaluator_control_override = override_control
     )

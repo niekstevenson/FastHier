@@ -159,15 +159,10 @@ repair_particles <- arg_int(cli_args, "repair_particles", atlas_particles)
 repair_max_updates <- arg_int(cli_args, "repair_max_updates", 99L)
 repair_confirmation_reps <- arg_int(cli_args, "repair_confirmation_reps", 0L)
 repair_confirmation_particles <- arg_int(cli_args, "repair_confirmation_particles", repair_particles)
-repair_adaptive_confirmation_reps <- arg_int(cli_args, "repair_adaptive_confirmation_reps", 2L)
 repair_replicate_bootstrap_B <- arg_int(cli_args, "repair_replicate_bootstrap_B", 200L)
 repair_max_direct_graph_z <- arg_num(cli_args, "repair_max_direct_graph_z", 3)
 repair_max_direct_graph_chart_shift <- arg_num(cli_args, "repair_max_direct_graph_chart_shift", 0.35)
 repair_max_direct_graph_existing_shift <- arg_num(cli_args, "repair_max_direct_graph_existing_shift", 0.15)
-repair_adaptive_replicate_weight_multiplier <- arg_num(cli_args, "repair_adaptive_replicate_weight_multiplier", 3)
-repair_adaptive_replicate_min_theta_weight <- arg_num(cli_args, "repair_adaptive_replicate_min_theta_weight", 0)
-repair_adaptive_replicate_max_graph_z <- arg_num(cli_args, "repair_adaptive_replicate_max_graph_z", 3)
-repair_adaptive_replicate_graph_shift <- arg_num(cli_args, "repair_adaptive_replicate_graph_shift", 0.25)
 normalizer_robust_method <- arg_chr(cli_args, "normalizer_robust_method", "student_t")
 normalizer_student_t_df <- arg_num(cli_args, "normalizer_student_t_df", 30)
 if (!normalizer_robust_method %in% c("student_t", "huber", "none")) {
@@ -554,33 +549,26 @@ for (idx in seq_along(local_positions)) {
     particle_mis_role = "estimator",
     stop_on_uncertified = FALSE
   )
-  repair <- local_atlas_calibrate_posterior_regions(
+  repair <- local_atlas_repair_certification_pairs(
     factor_set = factor_set,
     theta = audit_design$theta,
     data_list = setNames(list(data_list[[local_pos]]), local_id),
     loglik_fn = loglik_emc2,
     theta_weights = rep(1 / nrow(audit_design$theta), nrow(audit_design$theta)),
+    candidate_pairs = data.frame(local_pos = 1L, theta_row = seq_len(nrow(audit_design$theta))),
     local_ids = 1L,
     M = repair_particles,
     target_cess = atlas_target_cess,
     n_mcmc_moves = atlas_mcmc_moves,
     max_steps = atlas_max_steps,
     max_updates = min(repair_max_updates, nrow(audit_design$theta)),
-    abs_delta_threshold = 0.75,
-    z_threshold = 4,
-    candidate_pool_multiplier = 1L,
-    confirmation_reps = repair_confirmation_reps,
-    confirmation_M = repair_confirmation_particles,
-    confirmation_max_sd = 1.5,
-    adaptive_confirmation_reps = repair_adaptive_confirmation_reps,
+    direct_confirmation_reps = repair_confirmation_reps,
+    direct_confirmation_M = repair_confirmation_particles,
+    direct_confirmation_max_sd = 1.5,
     replicate_bootstrap_B = repair_replicate_bootstrap_B,
     max_direct_graph_z = repair_max_direct_graph_z,
     max_direct_graph_chart_shift = repair_max_direct_graph_chart_shift,
     max_direct_graph_existing_shift = repair_max_direct_graph_existing_shift,
-    adaptive_replicate_weight_multiplier = repair_adaptive_replicate_weight_multiplier,
-    adaptive_replicate_min_theta_weight = repair_adaptive_replicate_min_theta_weight,
-    adaptive_replicate_max_graph_z = repair_adaptive_replicate_max_graph_z,
-    adaptive_replicate_graph_shift = repair_adaptive_replicate_graph_shift,
     local_control = list(
       candidate_M = repair_particles,
       bridge_particles = repair_particles,
@@ -597,7 +585,6 @@ for (idx in seq_along(local_positions)) {
       max_cycle_z = 4,
       distance_metric = distance_metric
     ),
-    n_cores = 1L,
     seed = seed + 900001L + 100003L * local_pos,
     verbose = FALSE
   )
@@ -1717,15 +1704,10 @@ saveRDS(
       ref_reps = ref_reps,
       repair_particles = repair_particles,
       repair_confirmation_reps = repair_confirmation_reps,
-      repair_adaptive_confirmation_reps = repair_adaptive_confirmation_reps,
       repair_replicate_bootstrap_B = repair_replicate_bootstrap_B,
       repair_max_direct_graph_z = repair_max_direct_graph_z,
       repair_max_direct_graph_chart_shift = repair_max_direct_graph_chart_shift,
       repair_max_direct_graph_existing_shift = repair_max_direct_graph_existing_shift,
-      repair_adaptive_replicate_weight_multiplier = repair_adaptive_replicate_weight_multiplier,
-      repair_adaptive_replicate_min_theta_weight = repair_adaptive_replicate_min_theta_weight,
-      repair_adaptive_replicate_max_graph_z = repair_adaptive_replicate_max_graph_z,
-      repair_adaptive_replicate_graph_shift = repair_adaptive_replicate_graph_shift,
       normalizer_robust_method = normalizer_robust_method,
       normalizer_student_t_df = normalizer_student_t_df,
       distance_metric = distance_metric,

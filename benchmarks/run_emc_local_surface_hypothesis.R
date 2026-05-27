@@ -129,7 +129,6 @@ ref_target_cess <- arg_num(cli_args, "ref_target_cess", 0.9)
 repair_particles <- arg_int(cli_args, "repair_particles", ref_particles)
 repair_max_updates_per_local <- arg_int(cli_args, "repair_max_updates_per_local", 2L)
 repair_confirmation_reps <- arg_int(cli_args, "repair_confirmation_reps", 1L)
-repair_adaptive_confirmation_reps <- arg_int(cli_args, "repair_adaptive_confirmation_reps", 1L)
 repair_max_steps <- arg_int(cli_args, "repair_max_steps", ref_max_steps)
 repair_mcmc_moves <- arg_int(cli_args, "repair_mcmc_moves", ref_mcmc_moves)
 min_particle_mis_ess <- arg_num(cli_args, "min_particle_mis_ess", 0.05)
@@ -377,7 +376,7 @@ if (is.null(candidate_pairs) || !nrow(candidate_pairs)) {
 }
 candidate_pairs <- unique(candidate_pairs)
 
-repair <- local_atlas_calibrate_posterior_regions(
+repair <- local_atlas_repair_certification_pairs(
   factor_set = factor_sets$post_outer,
   theta = theta_design$theta,
   data_list = data_list,
@@ -390,21 +389,13 @@ repair <- local_atlas_calibrate_posterior_regions(
   n_mcmc_moves = repair_mcmc_moves,
   max_steps = repair_max_steps,
   max_updates = nrow(candidate_pairs),
-  abs_delta_threshold = 0.75,
-  z_threshold = 4,
-  candidate_pool_multiplier = 1L,
-  confirmation_reps = repair_confirmation_reps,
-  confirmation_M = repair_particles,
-  confirmation_max_sd = 1.5,
-  adaptive_confirmation_reps = repair_adaptive_confirmation_reps,
+  direct_confirmation_reps = repair_confirmation_reps,
+  direct_confirmation_M = repair_particles,
+  direct_confirmation_max_sd = 1.5,
   replicate_bootstrap_B = 100L,
   max_direct_graph_z = 3,
   max_direct_graph_chart_shift = 0.35,
   max_direct_graph_existing_shift = 0.15,
-  adaptive_replicate_weight_multiplier = 2,
-  adaptive_replicate_min_theta_weight = 0,
-  adaptive_replicate_max_graph_z = 3,
-  adaptive_replicate_graph_shift = 0.25,
   local_control = list(
     candidate_M = repair_particles,
     bridge_particles = repair_particles,
@@ -421,7 +412,6 @@ repair <- local_atlas_calibrate_posterior_regions(
     max_cycle_z = 4,
     distance_metric = "fisher"
   ),
-  n_cores = cores,
   seed = seed + 900000L,
   verbose = FALSE
 )

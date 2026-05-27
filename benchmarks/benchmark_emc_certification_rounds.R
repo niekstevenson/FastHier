@@ -186,7 +186,6 @@ certification_particles <- arg_int(cli_args, "certification_particles", NA_integ
 certification_mcmc_moves <- arg_int(cli_args, "certification_mcmc_moves", NA_integer_)
 certification_max_steps <- arg_int(cli_args, "certification_max_steps", NA_integer_)
 certification_max_updates <- arg_int(cli_args, "certification_max_updates", NA_integer_)
-certification_max_fresh_probes <- arg_int(cli_args, "certification_max_fresh_probes", NA_integer_)
 
 outer_particles <- arg_int(cli_args, "outer_particles", NA_integer_)
 outer_mcmc_moves <- arg_int(cli_args, "outer_mcmc_moves", NA_integer_)
@@ -238,10 +237,6 @@ if (is.finite(certification_max_steps)) {
 if (!is.finite(certification_max_updates)) {
   certification_max_updates <- calibration_control$initial_certification_max_updates %||%
     calibration_control$pre_outer_max_updates %||% 128L
-}
-if (!is.finite(certification_max_fresh_probes)) {
-  certification_max_fresh_probes <- calibration_control$initial_certification_max_fresh_probes %||%
-    calibration_control$pre_outer_max_fresh_probes %||% 64L
 }
 
 if (!is.finite(outer_particles)) outer_particles <- outer_control$N %||% 500L
@@ -322,7 +317,6 @@ save_round_checkpoint <- function(round_id, factor_set, calibration_history, sta
         certification_mcmc_moves = calibration_control$n_mcmc_moves %||% local_control$n_mcmc_moves %||% NA_integer_,
         certification_max_steps = calibration_control$max_steps %||% local_control$max_steps %||% NA_integer_,
         certification_max_updates = certification_max_updates,
-        certification_max_fresh_probes = certification_max_fresh_probes,
         outer_particles = outer_particles,
         normalizer_robust_method = normalizer_robust_method,
         normalizer_student_t_df = normalizer_student_t_df
@@ -447,10 +441,9 @@ cat(sprintf(
   paste(rounds_to_compare, collapse = ",")
 ))
 cat(sprintf(
-  "Certification M=%s | max_updates=%d | max_fresh=%d | normalizer=%s\n",
+  "Certification M=%s | max_updates=%d | normalizer=%s\n",
   as.character(calibration_control$M %||% local_control$candidate_M %||% NA_integer_),
   certification_max_updates,
-  certification_max_fresh_probes,
   normalizer_robust_method
 ))
 
@@ -482,11 +475,10 @@ for (round_id in seq_len(as.integer(max_certification_rounds))) {
     before <- certification_state(factor_set, theta_cloud, cores)
     if (before$n_uncertified > 0L) {
       cat(sprintf(
-        "Certifying round %d: uncertified=%d | max_updates=%d | max_fresh=%d\n",
+        "Certifying round %d: uncertified=%d | max_updates=%d\n",
         round_id,
         before$n_uncertified,
-        certification_max_updates,
-        certification_max_fresh_probes
+        certification_max_updates
       ))
       certification <- local_atlas_certify_theta_cloud(
         factor_set = factor_set,
@@ -499,7 +491,6 @@ for (round_id in seq_len(as.integer(max_certification_rounds))) {
         theta_weights = theta_weights,
         max_rounds = 1L,
         max_updates = as.integer(certification_max_updates),
-        max_fresh_probes = as.integer(certification_max_fresh_probes),
         n_cores = as.integer(cores),
         seed = as.integer(seed) + 6100003L * as.integer(round_id),
         verbose = verbose,
@@ -572,7 +563,6 @@ saveRDS(
       certification_mcmc_moves = calibration_control$n_mcmc_moves %||% local_control$n_mcmc_moves %||% NA_integer_,
       certification_max_steps = calibration_control$max_steps %||% local_control$max_steps %||% NA_integer_,
       certification_max_updates = certification_max_updates,
-      certification_max_fresh_probes = certification_max_fresh_probes,
       normalizer_robust_method = normalizer_robust_method,
       normalizer_student_t_df = normalizer_student_t_df,
       cores = cores
