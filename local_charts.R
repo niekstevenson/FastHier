@@ -2453,21 +2453,28 @@ solve_atlas_normalizers <- function(atlas,
 
   eta <- rep(1 / length(active_charts), length(active_charts))
   log_eta <- log(eta)
-  logZ <- vapply(active_charts, function(chart) as.numeric(chart$logZ_abs), numeric(1))
-  chart_se <- vapply(active_charts, function(chart) as.numeric(chart$logZ_abs_se), numeric(1))
-  compression <- atlas$particle_mis_compression
-  compression_ok <- isTRUE(use_compressed_particle_mis) &&
-    inherits(compression, "local_atlas_particle_mis_compression") &&
-    identical(as.character(compression$chart_ids), as.character(chart_ids))
-  if (isTRUE(require_compressed_particle_mis) && !compression_ok) {
-    return(data.frame(
-      log_marginal = rep(NA_real_, nrow(theta)),
-      se = rep(Inf, nrow(theta)),
-      status = rep("uncertified", nrow(theta)),
-      reason = rep("missing_or_stale_particle_mis_compression", nrow(theta)),
-      nearest_charts = rep("", nrow(theta)),
-      particle_mis_ess_frac = rep(0, nrow(theta)),
-      particle_mis_ess = rep(0, nrow(theta)),
+	  logZ <- vapply(active_charts, function(chart) as.numeric(chart$logZ_abs), numeric(1))
+	  chart_se <- vapply(active_charts, function(chart) as.numeric(chart$logZ_abs_se), numeric(1))
+	  compression <- atlas$particle_mis_compression
+	  compression_present <- isTRUE(use_compressed_particle_mis) &&
+	    inherits(compression, "local_atlas_particle_mis_compression") &&
+	    identical(as.character(compression$chart_ids), as.character(chart_ids))
+	  compression_certified <- compression_present &&
+	    isTRUE(as.logical(compression$diagnostics$certified[1L] %||% FALSE))
+	  compression_ok <- compression_present && compression_certified
+	  if (isTRUE(require_compressed_particle_mis) && !compression_ok) {
+	    return(data.frame(
+	      log_marginal = rep(NA_real_, nrow(theta)),
+	      se = rep(Inf, nrow(theta)),
+	      status = rep("uncertified", nrow(theta)),
+	      reason = rep(if (compression_present) {
+	        "compressed_particle_mis_not_certified"
+	      } else {
+	        "missing_or_stale_particle_mis_compression"
+	      }, nrow(theta)),
+	      nearest_charts = rep("", nrow(theta)),
+	      particle_mis_ess_frac = rep(0, nrow(theta)),
+	      particle_mis_ess = rep(0, nrow(theta)),
       particle_mis_psis_k = rep(NA_real_, nrow(theta)),
       min_covering_distance = min_distance,
       check.names = FALSE
@@ -2504,25 +2511,23 @@ solve_atlas_normalizers <- function(atlas,
   normalizer_se <- sqrt(sum((eta * pmax(chart_se, 0))^2))
   se <- sqrt(normalizer_se^2 + 1 / pmax(ess, 1))
   se <- pmax(se, as.numeric(se_floor))
-  if (any(exact)) {
-    exact_chart <- nearest[exact]
-    exact_idx <- which(exact)
-    exact_certified <- vapply(active_charts[exact_chart], .local_chart_normalizer_certified, logical(1))
+	  if (any(exact)) {
+	    exact_chart <- nearest[exact]
+	    exact_idx <- which(exact)
+	    exact_certified <- vapply(active_charts[exact_chart], .local_chart_normalizer_certified, logical(1))
     if (any(exact_certified)) {
       keep_idx <- exact_idx[exact_certified]
       keep_chart <- exact_chart[exact_certified]
       log_marginal[keep_idx] <- logZ[keep_chart]
       se[keep_idx] <- pmax(chart_se[keep_chart], as.numeric(se_floor))
       ess_frac[keep_idx] <- 1
-      psis_k[keep_idx] <- -Inf
-    }
-  }
+	      psis_k[keep_idx] <- -Inf
+	    }
+	  }
 
-  compression_certified <- compression_ok &&
-    isTRUE(as.logical(compression$diagnostics$certified[1L] %||% FALSE))
-  psis_ok <- if (compression_ok) {
-    rep(TRUE, nrow(theta))
-  } else {
+	  psis_ok <- if (compression_ok) {
+	    rep(TRUE, nrow(theta))
+	  } else {
     !is.finite(max_psis_k) | (!is.na(psis_k) & psis_k <= as.numeric(max_psis_k))
   }
   sparse_ok <- !is.finite(sparse_chart_max_distance) |
@@ -2533,13 +2538,12 @@ solve_atlas_normalizers <- function(atlas,
     exact_chart <- nearest[exact]
     exact_normalizer_certified[exact] <- vapply(active_charts[exact_chart], .local_chart_normalizer_certified, logical(1))
   }
-  if (compression_ok) {
-    certified <- exact_normalizer_certified | (
-      compression_certified &
-        covering_count >= as.integer(min_covering_charts) &
-        is.finite(log_marginal) &
-        sparse_ok
-    )
+	  if (compression_ok) {
+	    certified <- exact_normalizer_certified | (
+	      covering_count >= as.integer(min_covering_charts) &
+	        is.finite(log_marginal) &
+	        sparse_ok
+	    )
   } else {
     certified <- exact_normalizer_certified | (
       covering_count >= as.integer(min_covering_charts) &
@@ -2554,14 +2558,11 @@ solve_atlas_normalizers <- function(atlas,
   reason <- rep("high_particle_mis_psis", nrow(theta))
   reason[!is.finite(ess_frac) | ess_frac < as.numeric(min_ess_frac)] <- "low_particle_mis_ess"
   reason[!sparse_ok] <- "sparse_chart_extrapolation"
-  reason[covering_count < as.integer(min_covering_charts)] <- "no_active_chart_coverage"
-  reason[exact & !exact_normalizer_certified & covering_count < as.integer(min_covering_charts)] <-
-    "exact_anchor_normalizer_uncertified"
-  if (compression_ok && !compression_certified) {
-    reason[] <- "compressed_particle_mis_not_certified"
-  }
-  reason[certified] <- "particle_mis_global_active_chart_coverage"
-  reason[certified & exact_normalizer_certified] <- "active_exact_anchor"
+	  reason[covering_count < as.integer(min_covering_charts)] <- "no_active_chart_coverage"
+	  reason[exact & !exact_normalizer_certified & covering_count < as.integer(min_covering_charts)] <-
+	    "exact_anchor_normalizer_uncertified"
+	  reason[certified] <- "particle_mis_global_active_chart_coverage"
+	  reason[certified & exact_normalizer_certified] <- "active_exact_anchor"
   nearest_charts <- vapply(seq_len(nrow(theta)), function(i) {
     covered <- chart_ids[covering[i, ]]
     if (length(covered)) paste(covered, collapse = ",") else chart_ids[nearest[i]]
@@ -2907,11 +2908,12 @@ compress_local_atlas_factor_set <- function(factor_set,
                                             chart_weight = 0.05,
                                             include_moments = TRUE,
                                             include_chart = TRUE,
-                                            max_holdout_rmse = Inf,
-                                            stop_on_failure = FALSE,
-                                            n_cores = 1L,
-                                            seed = 123L,
-                                            verbose = TRUE) {
+	                                            max_holdout_rmse = Inf,
+	                                            stop_on_failure = FALSE,
+	                                            require_compressed_particle_mis = FALSE,
+	                                            n_cores = 1L,
+	                                            seed = 123L,
+	                                            verbose = TRUE) {
   factor_set <- validate_local_atlas_factor_set(factor_set)
   model <- factor_set$population_model
   theta <- .as_hyper_matrix(theta, model$hyper_names, model$hyper_dim)
@@ -2955,11 +2957,11 @@ compress_local_atlas_factor_set <- function(factor_set,
   }
   names(atlases) <- names(factor_set$atlases)
   factor_set$atlases <- atlases
-  summary <- local_atlas_compression_summary(factor_set)
-  factor_set$compression_summary <- summary
-  factor_set$evaluator_control$use_compressed_particle_mis <- TRUE
-  factor_set$evaluator_control$require_compressed_particle_mis <- TRUE
-  certified <- as.logical(summary$certified)
+	  summary <- local_atlas_compression_summary(factor_set)
+	  factor_set$compression_summary <- summary
+	  factor_set$evaluator_control$use_compressed_particle_mis <- TRUE
+	  factor_set$evaluator_control$require_compressed_particle_mis <- isTRUE(require_compressed_particle_mis)
+	  certified <- as.logical(summary$certified)
   certified[is.na(certified)] <- FALSE
   if (isTRUE(stop_on_failure) && nrow(summary) && any(!certified)) {
     bad <- summary[!certified, , drop = FALSE]
@@ -9015,11 +9017,12 @@ fit_chart_atlas_population_model <- function(data_list,
       chart_weight = evaluator_control$compressed_particle_mis_chart_weight,
       include_moments = evaluator_control$compressed_particle_mis_include_moments,
       include_chart = evaluator_control$compressed_particle_mis_include_chart,
-      max_holdout_rmse = evaluator_control$compressed_particle_mis_max_holdout_rmse,
-      stop_on_failure = evaluator_control$compressed_particle_mis_stop_on_failure,
-      n_cores = as.integer(n_cores),
-      seed = as.integer(seed) + 7200003L,
-      verbose = verbose
+	      max_holdout_rmse = evaluator_control$compressed_particle_mis_max_holdout_rmse,
+	      stop_on_failure = evaluator_control$compressed_particle_mis_stop_on_failure,
+	      require_compressed_particle_mis = evaluator_control$compressed_particle_mis_require %||% FALSE,
+	      n_cores = as.integer(n_cores),
+	      seed = as.integer(seed) + 7200003L,
+	      verbose = verbose
     )
     summary <- local_atlas_compression_summary(out)
     if (nrow(summary)) {
@@ -9036,12 +9039,13 @@ fit_chart_atlas_population_model <- function(data_list,
     out
   }
 
-  if (isTRUE(evaluator_control$compress_particle_mis)) {
-    if (resume_stage %in% c("post_compression", "post_outer", "complete")) {
-      .local_atlas_log("using checkpointed local particle compression stage\n", verbose = verbose)
-      factor_set$evaluator_control$use_compressed_particle_mis <- TRUE
-      factor_set$evaluator_control$require_compressed_particle_mis <- TRUE
-      factor_set <- validate_local_atlas_factor_set(factor_set)
+	  if (isTRUE(evaluator_control$compress_particle_mis)) {
+	    if (resume_stage %in% c("post_compression", "post_outer", "complete")) {
+	      .local_atlas_log("using checkpointed local particle compression stage\n", verbose = verbose)
+	      factor_set$evaluator_control$use_compressed_particle_mis <- TRUE
+	      factor_set$evaluator_control$require_compressed_particle_mis <-
+	        evaluator_control$compressed_particle_mis_require %||% FALSE
+	      factor_set <- validate_local_atlas_factor_set(factor_set)
     } else {
       factor_set <- compress_factor_set_for_outer("pre-outer")
       atlases <- factor_set$atlases

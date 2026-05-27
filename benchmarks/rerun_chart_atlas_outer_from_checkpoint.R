@@ -50,6 +50,67 @@ arg_lgl <- function(args, key, default = FALSE) {
   tolower(as.character(val)) %in% c("1", "true", "t", "yes", "y")
 }
 
+rmse_finite <- function(x) {
+  x <- as.numeric(x)
+  x <- x[is.finite(x)]
+  if (length(x)) sqrt(mean(x * x)) else NA_real_
+}
+
+compression_theta_from_checkpoint <- function(checkpoint,
+                                              factor_set,
+                                              initial_proposal,
+                                              n_theta,
+                                              seed) {
+  model <- factor_set$population_model
+  active_anchor_theta <- lapply(factor_set$atlases, function(atlas) {
+    active <- Filter(function(chart) identical(chart$status, "active"), atlas$charts)
+    if (!length(active)) return(NULL)
+    do.call(rbind, lapply(active, function(chart) chart$theta_anchor))
+  })
+  active_anchor_theta <- active_anchor_theta[!vapply(active_anchor_theta, is.null, logical(1))]
+  active_anchor_theta <- if (length(active_anchor_theta)) do.call(rbind, active_anchor_theta) else NULL
+  fit_theta <- checkpoint$fit$theta %||% NULL
+  if (!is.null(fit_theta) && nrow(as.matrix(fit_theta)) > as.integer(n_theta)) {
+    set.seed(as.integer(seed) + 901L)
+    fit_theta <- fit_theta[sample.int(nrow(fit_theta), as.integer(n_theta)), , drop = FALSE]
+  }
+  proposal_n <- max(0L, as.integer(n_theta) - nrow(as.matrix(fit_theta %||% checkpoint$theta_cloud %||% checkpoint$theta_root)))
+  proposal_theta <- if (!is.null(initial_proposal) && proposal_n > 0L) {
+    theta_proposal_sample(initial_proposal, n = proposal_n, seed = as.integer(seed) + 1009L)
+  } else {
+    NULL
+  }
+  pool <- .local_atlas_unique_theta(
+    do.call(rbind, Filter(Negate(is.null), list(
+      checkpoint$theta_root,
+      checkpoint$theta_design,
+      checkpoint$theta_cloud,
+      active_anchor_theta,
+      fit_theta,
+      proposal_theta
+    ))),
+    model
+  )
+  if (nrow(pool) <= as.integer(n_theta)) return(pool)
+  seed_design <- .local_atlas_unique_theta(
+    do.call(rbind, Filter(Negate(is.null), list(
+      checkpoint$theta_root,
+      active_anchor_theta,
+      checkpoint$theta_design
+    ))),
+    model
+  )
+  seed_keep <- min(nrow(seed_design), max(1L, floor(0.5 * as.integer(n_theta))))
+  .local_atlas_metric_farthest_design(
+    theta_cloud = pool,
+    population_model = model,
+    theta_root = checkpoint$theta_root %||% seed_design[1L, , drop = FALSE],
+    max_anchors = as.integer(n_theta),
+    distance_metric = factor_set$evaluator_control$distance_metric %||% "fisher",
+    initial_design = seed_design[seq_len(seed_keep), , drop = FALSE]
+  )
+}
+
 cli_args <- parse_cli_args(commandArgs(trailingOnly = TRUE))
 checkpoint_file <- arg_chr(cli_args, "checkpoint_file")
 if (is.null(checkpoint_file) || !nzchar(checkpoint_file)) {
@@ -76,6 +137,8 @@ baseline_file <- arg_chr(
 )
 plot_file <- arg_chr(cli_args, "plot_file", paste0(out_prefix, "_outer_rerun_posteriors.png"))
 comparison_csv <- arg_chr(cli_args, "comparison_csv", paste0(out_prefix, "_outer_rerun_posterior_comparison.csv"))
+compression_summary_csv <- arg_chr(cli_args, "compression_summary_csv", paste0(out_prefix, "_outer_rerun_compression_summary.csv"))
+compression_audit_csv <- arg_chr(cli_args, "compression_audit_csv", paste0(out_prefix, "_outer_rerun_compression_audit.csv"))
 compare_emc <- arg_lgl(cli_args, "compare_emc", file.exists(data_file))
 allow_non_frozen <- arg_lgl(cli_args, "allow_non_frozen", FALSE)
 
@@ -167,6 +230,15 @@ initial_certification_max_updates <- arg_int(
   calibration_control$initial_certification_max_updates %||% pre_outer_max_updates
 )
 stop_on_initial_uncertified <- arg_lgl(cli_args, "stop_on_initial_uncertified", TRUE)
+compress_local_particles <- arg_lgl(cli_args, "compress_local_particles", FALSE)
+compression_particles <- arg_int(cli_args, "compression_particles", 256L)
+compression_theta_points <- arg_int(cli_args, "compression_theta_points", 384L)
+compression_holdout_fraction <- arg_num(cli_args, "compression_holdout_fraction", 0.33)
+compression_max_holdout_rmse <- arg_num(cli_args, "compression_max_holdout_rmse", 0.05)
+compression_stop_on_failure <- arg_lgl(cli_args, "compression_stop_on_failure", FALSE)
+compression_require_all <- arg_lgl(cli_args, "compression_require_all", FALSE)
+compression_audit_n <- arg_int(cli_args, "compression_audit_n", min(N, 384L))
+compression_max_total_centered_rmse <- arg_num(cli_args, "compression_max_total_centered_rmse", Inf)
 
 population_model <- checkpoint$population_model %||% factor_set$population_model
 initial_proposal <- normalize_theta_proposal(
@@ -323,6 +395,91 @@ if (!is.null(initial_uncertified_error)) {
   stop(initial_uncertified_error)
 }
 
+compression_summary <- data.frame()
+compression_audit <- data.frame()
+compression_audit_summary <- data.frame()
+if (isTRUE(compress_local_particles)) {
+  compression_theta <- compression_theta_from_checkpoint(
+    checkpoint = checkpoint,
+    factor_set = factor_set,
+    initial_proposal = initial_proposal,
+    n_theta = as.integer(compression_theta_points),
+    seed = seed + 7100003L
+  )
+  compressed_factor_set <- compress_local_atlas_factor_set(
+    factor_set = factor_set,
+    theta = compression_theta,
+    K = as.integer(compression_particles),
+    holdout_fraction = compression_holdout_fraction,
+    max_holdout_rmse = compression_max_holdout_rmse,
+    stop_on_failure = compression_stop_on_failure,
+    require_compressed_particle_mis = compression_require_all,
+    n_cores = cores,
+    seed = seed + 7200003L,
+    verbose = TRUE
+  )
+  compression_summary <- local_atlas_compression_summary(compressed_factor_set)
+  dir.create(dirname(compression_summary_csv), recursive = TRUE, showWarnings = FALSE)
+  utils::write.csv(compression_summary, compression_summary_csv, row.names = FALSE)
+
+  audit_theta <- checkpoint$fit$theta %||% compression_theta
+  audit_theta <- .as_hyper_matrix(audit_theta, population_model$hyper_names, population_model$hyper_dim)
+  if (nrow(audit_theta) > as.integer(compression_audit_n)) {
+    set.seed(as.integer(seed) + 7300003L)
+    audit_theta <- audit_theta[sample.int(nrow(audit_theta), as.integer(compression_audit_n)), , drop = FALSE]
+  }
+  raw_factor_set <- factor_set
+  raw_factor_set$evaluator_control$use_compressed_particle_mis <- FALSE
+  raw_factor_set$evaluator_control$require_compressed_particle_mis <- FALSE
+  raw_factor_set <- validate_local_atlas_factor_set(raw_factor_set)
+  compressed_loglik <- population_factor_set_loglik(
+    compressed_factor_set,
+    audit_theta,
+    include_constant = FALSE,
+    n_cores = cores
+  )
+  raw_loglik <- population_factor_set_loglik(
+    raw_factor_set,
+    audit_theta,
+    include_constant = FALSE,
+    n_cores = cores
+  )
+  compression_error <- compressed_loglik - raw_loglik
+  compression_audit <- data.frame(
+    theta_row = seq_len(nrow(audit_theta)),
+    raw_loglik = raw_loglik,
+    compressed_loglik = compressed_loglik,
+    compression_error = compression_error,
+    centered_compression_error = compression_error - mean(compression_error[is.finite(compression_error)], na.rm = TRUE),
+    check.names = FALSE
+  )
+  compression_audit_summary <- data.frame(
+    n_theta = nrow(compression_audit),
+    certified_locals = sum(compression_summary$certified %in% TRUE),
+    fallback_locals = sum(!(compression_summary$certified %in% TRUE)),
+    median_selected_particles = stats::median(compression_summary$selected_particles, na.rm = TRUE),
+    median_raw_particles = stats::median(compression_summary$raw_particles, na.rm = TRUE),
+    median_holdout_rmse = stats::median(compression_summary$holdout_rmse, na.rm = TRUE),
+    max_holdout_rmse = max(compression_summary$holdout_rmse, na.rm = TRUE),
+    total_error_rmse = rmse_finite(compression_audit$compression_error),
+    total_centered_error_rmse = rmse_finite(compression_audit$centered_compression_error),
+    total_max_abs_centered_error = max(abs(compression_audit$centered_compression_error), na.rm = TRUE),
+    check.names = FALSE
+  )
+  dir.create(dirname(compression_audit_csv), recursive = TRUE, showWarnings = FALSE)
+  utils::write.csv(compression_audit, compression_audit_csv, row.names = FALSE)
+  print(compression_audit_summary, row.names = FALSE)
+  if (is.finite(compression_max_total_centered_rmse) &&
+      compression_audit_summary$total_centered_error_rmse > compression_max_total_centered_rmse) {
+    stop(
+      "Compressed factor set failed total-error audit: centered RMSE=",
+      signif(compression_audit_summary$total_centered_error_rmse, 4),
+      " threshold=", signif(compression_max_total_centered_rmse, 4)
+    )
+  }
+  factor_set <- compressed_factor_set
+}
+
 start_time <- Sys.time()
 fit <- outer_population_smc(
   factor_set = factor_set,
@@ -354,6 +511,8 @@ workflow <- list(
   calibration_history = calibration_history,
   initial_certification = initial_certification,
   graph_summary = local_atlas_graph_summary(factor_set),
+  compression_summary = compression_summary,
+  compression_audit_summary = compression_audit_summary,
   settings = settings
 )
 
@@ -398,6 +557,9 @@ saveRDS(
     design_certification = checkpoint$design_certification,
     calibration_history = calibration_history,
     initial_certification = initial_certification,
+    compression_summary = compression_summary,
+    compression_audit = compression_audit,
+    compression_audit_summary = compression_audit_summary,
     emc_draws = emc_draws,
     workflow_draws = workflow_draws,
     baseline_draws = baseline_draws,
@@ -430,6 +592,16 @@ saveRDS(
       initial_certification_rounds = initial_certification_rounds,
       initial_certification_max_updates = initial_certification_max_updates,
       stop_on_initial_uncertified = stop_on_initial_uncertified,
+      compress_local_particles = compress_local_particles,
+      compression_particles = compression_particles,
+      compression_theta_points = compression_theta_points,
+      compression_holdout_fraction = compression_holdout_fraction,
+      compression_max_holdout_rmse = compression_max_holdout_rmse,
+      compression_stop_on_failure = compression_stop_on_failure,
+      compression_require_all = compression_require_all,
+      compression_audit_n = compression_audit_n,
+      compression_summary_csv = if (isTRUE(compress_local_particles)) compression_summary_csv else NULL,
+      compression_audit_csv = if (isTRUE(compress_local_particles)) compression_audit_csv else NULL,
       evaluator_control_override = override_control
     )
   ),
@@ -444,6 +616,8 @@ post_outer_checkpoint$population_model <- population_model
 post_outer_checkpoint$initial_proposal <- initial_proposal
 post_outer_checkpoint$calibration_history <- calibration_history
 post_outer_checkpoint$graph_summary <- workflow$graph_summary
+post_outer_checkpoint$compression_summary <- compression_summary
+post_outer_checkpoint$compression_audit_summary <- compression_audit_summary
 post_outer_checkpoint$outer_rerun_source_checkpoint <- checkpoint_file
 post_outer_checkpoint$outer_rerun_results_file <- results_file
 post_outer_checkpoint$checkpoint_time <- Sys.time()
@@ -457,6 +631,10 @@ cat(sprintf("Saved post-outer checkpoint: %s\n", post_outer_checkpoint_file))
 cat(sprintf("Source checkpoint: %s stage=%s\n", checkpoint_file, checkpoint_stage))
 cat(sprintf("Elapsed seconds: %.1f\n", elapsed_sec))
 cat(sprintf("Log evidence: %.6f\n", as.numeric(fit$log_evidence %||% NA_real_)))
+if (isTRUE(compress_local_particles)) {
+  cat(sprintf("Saved compression summary: %s\n", compression_summary_csv))
+  cat(sprintf("Saved compression audit: %s\n", compression_audit_csv))
+}
 if (isTRUE(compare_emc)) {
   cat(sprintf("Saved posterior comparison: %s\n", comparison_csv))
   cat(sprintf("Saved posterior plot: %s\n", plot_file))
