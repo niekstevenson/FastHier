@@ -304,9 +304,19 @@ normalize_theta_proposal <- function(proposal, population_model = NULL) {
     component$weight <- as.numeric(component$weight) / total
     component$mean <- as.numeric(component$mean)
     names(component$mean) <- model$hyper_names
-    component$cov <- regularize_cov(component$cov, min_eig = 1e-8, cond_cap = 1e8)
+    component$cov <- as.matrix(component$cov)
     dimnames(component$cov) <- list(model$hyper_names, model$hyper_names)
-    component$chol <- chol(component$cov)
+    chol_ok <- !is.null(component$chol) &&
+      identical(dim(as.matrix(component$chol)), dim(component$cov)) &&
+      all(is.finite(component$chol))
+    if (isTRUE(chol_ok)) {
+      component$chol <- as.matrix(component$chol)
+      dimnames(component$chol) <- list(model$hyper_names, model$hyper_names)
+    } else {
+      component$cov <- regularize_cov(component$cov, min_eig = 1e-8, cond_cap = 1e8)
+      dimnames(component$cov) <- list(model$hyper_names, model$hyper_names)
+      component$chol <- chol(component$cov)
+    }
     component$df <- as.numeric(component$df)
     component
   })

@@ -144,6 +144,17 @@ atlas_surface_value_nugget <- arg_num(cli_args, "atlas_surface_value_nugget", 0.
 atlas_surface_gradient_weight <- arg_num(cli_args, "atlas_surface_gradient_weight", 1.0)
 atlas_surface_curvature_weight <- arg_num(cli_args, "atlas_surface_curvature_weight", 0.2)
 atlas_surface_ridge <- arg_num(cli_args, "atlas_surface_ridge", 1e-8)
+shape_patch <- arg_lgl(cli_args, "shape_patch", FALSE)
+shape_patch_particles <- arg_int(cli_args, "shape_patch_particles", atlas_particles)
+shape_patch_reps <- arg_int(cli_args, "shape_patch_reps", 2L)
+shape_patch_top_theta <- arg_int(cli_args, "shape_patch_top_theta", 6L)
+shape_patch_diag_theta <- arg_int(cli_args, "shape_patch_diag_theta", 4L)
+shape_patch_radius <- arg_int(cli_args, "shape_patch_radius", 1L)
+shape_patch_max_theta <- arg_int(cli_args, "shape_patch_max_theta", 16L)
+shape_patch_kernel_scale <- arg_num(cli_args, "shape_patch_kernel_scale", 0.5)
+shape_patch_scale_floor <- arg_num(cli_args, "shape_patch_scale_floor", 0.25)
+shape_patch_min_train <- arg_int(cli_args, "shape_patch_min_train", 4L)
+shape_patch_shrink <- arg_num(cli_args, "shape_patch_shrink", 2)
 
 results_file <- arg_chr(
   cli_args,
@@ -170,6 +181,16 @@ posterior_csv <- arg_chr(
   "posterior_csv",
   file.path("benchmarks", "results", paste0(label, "_theta_posterior_summary.csv"))
 )
+high_smc_csv <- arg_chr(
+  cli_args,
+  "high_smc_csv",
+  file.path("benchmarks", "results", paste0(label, "_high_smc_comparison.csv"))
+)
+shape_patch_csv <- arg_chr(
+  cli_args,
+  "shape_patch_csv",
+  file.path("benchmarks", "results", paste0(label, "_shape_patch_diagnostics.csv"))
+)
 error_plot_file <- arg_chr(
   cli_args,
   "error_plot_file",
@@ -186,6 +207,8 @@ dir.create(dirname(summary_csv), showWarnings = FALSE, recursive = TRUE)
 dir.create(dirname(rows_csv), showWarnings = FALSE, recursive = TRUE)
 dir.create(dirname(total_csv), showWarnings = FALSE, recursive = TRUE)
 dir.create(dirname(posterior_csv), showWarnings = FALSE, recursive = TRUE)
+dir.create(dirname(high_smc_csv), showWarnings = FALSE, recursive = TRUE)
+dir.create(dirname(shape_patch_csv), showWarnings = FALSE, recursive = TRUE)
 dir.create(dirname(error_plot_file), showWarnings = FALSE, recursive = TRUE)
 dir.create(dirname(posterior_plot_file), showWarnings = FALSE, recursive = TRUE)
 
@@ -497,6 +520,310 @@ atlas_parts <- lapply(seq_along(data_list), function(local_pos) {
 })
 atlas_rows <- do.call(rbind, lapply(atlas_parts, `[[`, "rows"))
 
+theta_neighbors <- function(theta_rows, radius = 1L) {
+  radius <- max(0L, as.integer(radius))
+  if (!length(theta_rows)) return(integer())
+  mu_vals <- sort(unique(theta_grid[, "mu_alpha"]))
+  s2_vals <- sort(unique(theta_grid[, "log_sigma2_alpha"]))
+  out <- integer()
+  for (theta_row in unique(as.integer(theta_rows))) {
+    if (!is.finite(theta_row) || theta_row < 1L || theta_row > nrow(theta_grid)) next
+    ix <- match(theta_grid[theta_row, "mu_alpha"], mu_vals)
+    iy <- match(theta_grid[theta_row, "log_sigma2_alpha"], s2_vals)
+    ix_set <- seq.int(max(1L, ix - radius), min(length(mu_vals), ix + radius))
+    iy_set <- seq.int(max(1L, iy - radius), min(length(s2_vals), iy + radius))
+    keep <- which(theta_grid[, "mu_alpha"] %in% mu_vals[ix_set] &
+                    theta_grid[, "log_sigma2_alpha"] %in% s2_vals[iy_set])
+    out <- c(out, keep)
+  }
+  sort(unique(out))
+}
+
+run_shape_patch_probe <- function(local_pos, theta_rows, M, rep_id) {
+  rows <- lapply(seq_along(theta_rows), function(j) {
+    theta_row <- as.integer(theta_rows[j])
+    run <- .local_chart_run_smc(
+      local_id = names(data_list)[local_pos],
+      theta_anchor = theta_grid[theta_row, , drop = FALSE],
+      data_i = data_list[[local_pos]],
+      loglik_fn = loglik_normal_local,
+      population_model = population_model,
+      M = as.integer(M),
+      target_cess = target_cess,
+      resample_threshold = 0.5,
+      n_mcmc_moves = smc_moves,
+      rw_scale = 0.75,
+      G_mix = 8L,
+      da_enable = TRUE,
+      refit_every = 2L,
+      max_steps = smc_max_steps,
+      deterministic_resampling = FALSE,
+      n_cores = 1L,
+      seed = seed + 5000003L * rep_id + 1009L * local_pos + 9176L * theta_row + as.integer(M),
+      verbose = FALSE,
+      source = "shape_patch_probe"
+    )
+    data.frame(
+      local = names(data_list)[local_pos],
+      local_pos = local_pos,
+      theta_row = theta_row,
+      replicate = rep_id,
+      estimate = run$logZ,
+      se = run$logZ_se,
+      check.names = FALSE
+    )
+  })
+  do.call(rbind, rows)
+}
+
+combine_logz_replicates <- function(df) {
+  split_rows <- split(df, list(df$local_pos, df$theta_row), drop = TRUE)
+  do.call(rbind, lapply(split_rows, function(part) {
+    z <- as.numeric(part$estimate)
+    z <- z[is.finite(z)]
+    se <- as.numeric(part$se)
+    se <- se[is.finite(se)]
+    center <- if (length(z)) logsumexp(z) - log(length(z)) else NA_real_
+    data.frame(
+      local = part$local[1L],
+      local_pos = part$local_pos[1L],
+      theta_row = part$theta_row[1L],
+      probe_log_m = center,
+      probe_sd = if (length(z) > 1L) stats::sd(z) else if (length(se)) se[1L] else NA_real_,
+      probe_reps = length(z),
+      probe_min = if (length(z)) min(z) else NA_real_,
+      probe_max = if (length(z)) max(z) else NA_real_,
+      check.names = FALSE
+    )
+  }))
+}
+
+fit_shape_patch_local <- function(train, base_rows, posterior_weight) {
+  theta <- theta_grid[, population_model$hyper_names, drop = FALSE]
+  base <- base_rows$estimate[match(seq_len(nrow(theta_grid)), base_rows$theta_row)]
+  train <- train[is.finite(train$delta) & is.finite(train$probe_sd), , drop = FALSE]
+  if (nrow(train) < as.integer(shape_patch_min_train)) {
+    return(list(
+      estimate = base,
+      diagnostics = data.frame(
+        local = if (nrow(train)) train$local[1L] else NA_character_,
+        local_pos = if (nrow(train)) train$local_pos[1L] else NA_integer_,
+        status = "too_few_patch_points_no_correction",
+        n_train = nrow(train),
+        offset = NA_real_,
+        signal_sd = NA_real_,
+        loo_rmse = NA_real_,
+        shape_scale = 0,
+        check.names = FALSE
+      )
+    ))
+  }
+  w_post <- posterior_weight
+  w_post[!is.finite(w_post) | w_post < 0] <- 0
+  if (sum(w_post) <= 0) w_post <- rep(1 / nrow(theta), nrow(theta)) else w_post <- w_post / sum(w_post)
+  center <- colSums(theta * w_post)
+  scale <- sqrt(colSums(sweep(theta, 2L, center, "-")^2 * w_post))
+  grid_scale <- apply(theta, 2L, stats::sd)
+  scale <- pmax(scale, as.numeric(shape_patch_scale_floor) * grid_scale, 1e-8)
+  scale[!is.finite(scale) | scale < 1e-8] <- 1
+  y <- as.numeric(train$delta)
+  local_weight <- posterior_weight[train$theta_row]
+  local_weight[!is.finite(local_weight) | local_weight < 0] <- 0
+  if (sum(local_weight) <= 0) local_weight <- rep(1, nrow(train))
+  noise_var <- pmax(as.numeric(train$probe_sd), 0.05)^2
+  w <- local_weight / pmax(noise_var, .Machine$double.eps)
+  w <- w / mean(w)
+
+  offset <- weighted_center(y, local_weight)
+  y_shape <- y - offset
+  z_all <- sweep(theta, 2L, center, "-")
+  z_all <- sweep(z_all, 2L, scale, "/")
+  z_train <- z_all[train$theta_row, , drop = FALSE]
+  bandwidth <- max(as.numeric(shape_patch_kernel_scale), 1e-8)
+  smooth_at <- function(z_query, keep = seq_along(y_shape)) {
+    if (!length(keep)) return(0)
+    d2 <- rowSums(sweep(z_train[keep, , drop = FALSE], 2L, z_query, "-")^2)
+    kw <- exp(-0.5 * d2 / bandwidth^2) * w[keep]
+    if (!any(is.finite(kw)) || sum(kw) <= 0) return(0)
+    sum(kw * y_shape[keep]) / sum(kw)
+  }
+  pred_train <- vapply(seq_len(nrow(train)), function(j) smooth_at(z_train[j, ]), numeric(1))
+  residual <- y_shape - pred_train
+  loo <- rep(NA_real_, nrow(train))
+  if (nrow(train) > 1L) {
+    for (j in seq_len(nrow(train))) {
+      keep <- setdiff(seq_len(nrow(train)), j)
+      loo[j] <- y_shape[j] - smooth_at(z_train[j, ], keep = keep)
+    }
+  }
+  signal_sd <- sqrt(weighted_center(y_shape^2, local_weight))
+  loo_rmse <- finite_rmse(loo)
+  if (!is.finite(loo_rmse)) loo_rmse <- sqrt(mean(residual^2))
+  reliability <- if (is.finite(signal_sd) && is.finite(loo_rmse)) {
+    signal_sd^2 / (signal_sd^2 + loo_rmse^2 + 1e-8)
+  } else {
+    0
+  }
+  shape_scale <- max(0, min(1, as.numeric(shape_patch_shrink) * reliability))
+  pred_all <- vapply(seq_len(nrow(z_all)), function(j) smooth_at(z_all[j, ]), numeric(1))
+  pred_center <- weighted_center(pred_all, w_post)
+  dist <- vapply(seq_len(nrow(z_all)), function(i) {
+    sqrt(min(rowSums(sweep(z_train, 2L, z_all[i, ], "-")^2)))
+  }, numeric(1))
+  coverage <- exp(-0.5 * (dist / bandwidth)^2)
+  correction <- offset + shape_scale * (pred_all - pred_center)
+  list(
+    estimate = base + correction,
+    diagnostics = data.frame(
+      local = train$local[1L],
+      local_pos = train$local_pos[1L],
+      status = "fitted",
+      n_train = nrow(train),
+      offset = offset,
+      signal_sd = signal_sd,
+      loo_rmse = loo_rmse,
+      training_rmse = sqrt(mean(residual^2)),
+      shape_scale = shape_scale,
+      bandwidth = bandwidth,
+      scale_floor = as.numeric(shape_patch_scale_floor),
+      mean_coverage = mean(coverage),
+      min_coverage = min(coverage),
+      max_coverage = max(coverage),
+      check.names = FALSE
+    )
+  )
+}
+
+shape_patch_rows <- data.frame()
+shape_patch_diagnostics <- data.frame()
+shape_patch_replicates <- data.frame()
+if (isTRUE(shape_patch)) {
+  atlas_total <- do.call(rbind, lapply(
+    split(atlas_rows, atlas_rows$theta_row),
+    function(df) {
+      data.frame(
+        theta_row = df$theta_row[1L],
+        total_log_m = if (all(is.finite(df$estimate)) && nrow(df) == n_locals) sum(df$estimate) else NA_real_,
+        check.names = FALSE
+      )
+    }
+  ))
+  atlas_total <- atlas_total[match(seq_len(nrow(theta_grid)), atlas_total$theta_row), , drop = FALSE]
+  logprior_patch <- population_model_log_hyperprior(population_model, theta_grid)
+  logw_patch <- logprior_patch + atlas_total$total_log_m
+  logw_patch[!is.finite(logw_patch)] <- -Inf
+  posterior_weight <- if (all(!is.finite(logw_patch))) {
+    rep(1 / nrow(theta_grid), nrow(theta_grid))
+  } else {
+    exp(logw_patch - logsumexp(logw_patch))
+  }
+  top_theta <- head(order(posterior_weight, decreasing = TRUE), max(1L, as.integer(shape_patch_top_theta)))
+  diag_score <- rep(0, nrow(theta_grid))
+  if (nrow(atlas_rows)) {
+    atlas_rows$diag_score <- (
+      ifelse(atlas_rows$status != "certified", 5, 0) +
+        pmax(as.numeric(atlas_rows$particle_mis_psis_k) - atlas_eval_max_particle_mis_psis_k, 0, na.rm = TRUE) +
+        pmax(atlas_eval_min_particle_mis_ess - as.numeric(atlas_rows$particle_mis_ess_frac), 0, na.rm = TRUE) /
+          max(atlas_eval_min_particle_mis_ess, 1e-8) +
+        pmin(pmax(as.numeric(atlas_rows$se), 0), 2)
+    )
+    diag_theta <- aggregate(
+      diag_score ~ theta_row,
+      atlas_rows,
+      max,
+      na.rm = TRUE
+    )
+    diag_score[diag_theta$theta_row] <- diag_theta$diag_score
+  }
+  diag_theta <- head(order(diag_score * sqrt(pmax(posterior_weight, 1e-12)), decreasing = TRUE),
+                     max(0L, as.integer(shape_patch_diag_theta)))
+  patch_theta_rows <- theta_neighbors(unique(c(top_theta, diag_theta)), radius = shape_patch_radius)
+  if (length(patch_theta_rows) > as.integer(shape_patch_max_theta)) {
+    rank <- posterior_weight[patch_theta_rows] + 0.1 * diag_score[patch_theta_rows]
+    patch_theta_rows <- patch_theta_rows[head(order(rank, decreasing = TRUE), as.integer(shape_patch_max_theta))]
+    patch_theta_rows <- sort(unique(patch_theta_rows))
+  }
+  cat("Shape-patch theta rows:", paste(patch_theta_rows, collapse = ", "), "\n")
+  patch_jobs <- expand.grid(
+    local_pos = seq_along(data_list),
+    rep_id = seq_len(max(1L, as.integer(shape_patch_reps))),
+    KEEP.OUT.ATTRS = FALSE
+  )
+  patch_parts <- if (cores <= 1L || nrow(patch_jobs) <= 1L) {
+    lapply(seq_len(nrow(patch_jobs)), function(k) {
+      run_shape_patch_probe(
+        local_pos = patch_jobs$local_pos[k],
+        theta_rows = patch_theta_rows,
+        M = shape_patch_particles,
+        rep_id = patch_jobs$rep_id[k]
+      )
+    })
+  } else {
+    parallel::mclapply(seq_len(nrow(patch_jobs)), function(k) {
+      run_shape_patch_probe(
+        local_pos = patch_jobs$local_pos[k],
+        theta_rows = patch_theta_rows,
+        M = shape_patch_particles,
+        rep_id = patch_jobs$rep_id[k]
+      )
+    }, mc.cores = min(cores, nrow(patch_jobs)))
+  }
+  shape_patch_replicates <- do.call(rbind, patch_parts)
+  patch_summary <- combine_logz_replicates(shape_patch_replicates)
+  base_patch <- atlas_rows[, c("local", "local_pos", "theta_row", "estimate", "se"), drop = FALSE]
+  names(base_patch)[names(base_patch) == "estimate"] <- "atlas_estimate"
+  names(base_patch)[names(base_patch) == "se"] <- "atlas_se"
+  patch_summary <- merge(patch_summary, base_patch, by = c("local", "local_pos", "theta_row"), all.x = TRUE, sort = FALSE)
+  patch_summary$delta <- patch_summary$probe_log_m - patch_summary$atlas_estimate
+  patch_summary$theta_weight <- posterior_weight[patch_summary$theta_row]
+  patch_fits <- lapply(seq_along(data_list), function(local_pos) {
+    train <- patch_summary[patch_summary$local_pos == local_pos, , drop = FALSE]
+    base <- atlas_rows[atlas_rows$local_pos == local_pos, , drop = FALSE]
+    fit_shape_patch_local(train, base, posterior_weight)
+  })
+  shape_patch_rows <- do.call(rbind, lapply(seq_along(patch_fits), function(local_pos) {
+    est <- patch_fits[[local_pos]]$estimate
+    data.frame(
+      method = "atlas_shape_patch",
+      local = names(data_list)[local_pos],
+      local_pos = local_pos,
+      theta_row = seq_len(nrow(theta_grid)),
+      replicate = NA_integer_,
+      estimate = est,
+      se = NA_real_,
+      status = ifelse(is.finite(est), "ok", "uncertified"),
+      reason = ifelse(is.finite(est), "posterior_shape_patch", "shape_patch_failed"),
+      check.names = FALSE
+    )
+  }))
+  shape_patch_diagnostics <- do.call(rbind, lapply(patch_fits, `[[`, "diagnostics"))
+  design_diag <- data.frame(
+    local = "ALL",
+    local_pos = NA_integer_,
+    status = "design",
+    n_train = length(patch_theta_rows),
+    offset = NA_real_,
+    signal_sd = NA_real_,
+    loo_rmse = NA_real_,
+    training_rmse = NA_real_,
+    shape_scale = NA_real_,
+    mean_coverage = NA_real_,
+    min_coverage = NA_real_,
+    max_coverage = NA_real_,
+    patch_theta_rows = paste(patch_theta_rows, collapse = ","),
+    check.names = FALSE
+  )
+  shape_patch_diagnostics$patch_theta_rows <- NA_character_
+  diag_cols <- unique(c(names(design_diag), names(shape_patch_diagnostics)))
+  for (nm in setdiff(diag_cols, names(design_diag))) design_diag[[nm]] <- NA
+  for (nm in setdiff(diag_cols, names(shape_patch_diagnostics))) shape_patch_diagnostics[[nm]] <- NA
+  shape_patch_diagnostics <- rbind(
+    design_diag[, diag_cols, drop = FALSE],
+    shape_patch_diagnostics[, diag_cols, drop = FALSE]
+  )
+  utils::write.csv(shape_patch_diagnostics, shape_patch_csv, row.names = FALSE)
+}
+
 align_rows <- function(parts) {
   cols <- unique(unlist(lapply(parts, names), use.names = FALSE))
   lapply(parts, function(df) {
@@ -506,7 +833,7 @@ align_rows <- function(parts) {
   })
 }
 
-all_rows <- do.call(rbind, align_rows(list(reference_rows, nested_rows, atlas_rows)))
+all_rows <- do.call(rbind, align_rows(list(reference_rows, nested_rows, atlas_rows, shape_patch_rows)))
 theta_frame <- data.frame(theta_row = seq_len(nrow(theta_grid)), theta_grid, check.names = FALSE)
 truth <- reference_rows[, c("local_pos", "theta_row", "estimate")]
 names(truth)[3L] <- "truth"
@@ -580,6 +907,57 @@ total_summary <- do.call(rbind, lapply(
   }
 ))
 total_summary <- total_summary[order(total_summary$centered_total_rmse), , drop = FALSE]
+
+high_smc_method <- sprintf("nested_M%d", max(as.integer(nested_particles)))
+high_ref_local <- all_rows[all_rows$method == high_smc_method, c("local_pos", "theta_row", "estimate"), drop = FALSE]
+names(high_ref_local)[3L] <- "high_smc_estimate"
+high_cmp_local <- merge(
+  all_rows[all_rows$method != high_smc_method, , drop = FALSE],
+  high_ref_local,
+  by = c("local_pos", "theta_row"),
+  all.x = TRUE,
+  sort = FALSE
+)
+high_cmp_local$local_error_vs_high_smc <- high_cmp_local$estimate - high_cmp_local$high_smc_estimate
+high_ref_total <- total_log_m[total_log_m$method == high_smc_method, c("theta_row", "total_log_m"), drop = FALSE]
+names(high_ref_total)[2L] <- "high_smc_total_log_m"
+high_cmp_total <- merge(
+  total_log_m[total_log_m$method != high_smc_method, , drop = FALSE],
+  high_ref_total,
+  by = "theta_row",
+  all.x = TRUE,
+  sort = FALSE
+)
+high_cmp_total$total_error_vs_high_smc <- high_cmp_total$total_log_m - high_cmp_total$high_smc_total_log_m
+high_cmp_total <- do.call(rbind, lapply(split(high_cmp_total, high_cmp_total$method), function(df) {
+  df$centered_total_error_vs_high_smc <- df$total_error_vs_high_smc -
+    mean(df$total_error_vs_high_smc[is.finite(df$total_error_vs_high_smc)], na.rm = TRUE)
+  df
+}))
+high_smc_summary <- do.call(rbind, lapply(split(high_cmp_local, high_cmp_local$method), function(df) {
+  centered_local <- unlist(lapply(split(df, df$local_pos), function(part) {
+    part$local_error_vs_high_smc -
+      mean(part$local_error_vs_high_smc[is.finite(part$local_error_vs_high_smc)], na.rm = TRUE)
+  }))
+  tdf <- high_cmp_total[high_cmp_total$method == df$method[1L], , drop = FALSE]
+  data.frame(
+    method = df$method[1L],
+    high_smc_method = high_smc_method,
+    local_rmse_vs_high_smc = finite_rmse(df$local_error_vs_high_smc),
+    local_centered_rmse_vs_high_smc = finite_rmse(centered_local),
+    local_mae_vs_high_smc = finite_mae(df$local_error_vs_high_smc),
+    total_rmse_vs_high_smc = finite_rmse(tdf$total_error_vs_high_smc),
+    centered_total_rmse_vs_high_smc = finite_rmse(tdf$centered_total_error_vs_high_smc),
+    finite_theta_fraction_vs_high_smc = mean(is.finite(tdf$total_error_vs_high_smc)),
+    check.names = FALSE
+  )
+}))
+high_smc_summary <- high_smc_summary[
+  order(high_smc_summary$centered_total_rmse_vs_high_smc,
+        high_smc_summary$local_centered_rmse_vs_high_smc),
+  ,
+  drop = FALSE
+]
 
 logprior <- population_model_log_hyperprior(population_model, theta_grid)
 posterior_grid <- do.call(rbind, lapply(split(total_log_m, total_log_m$method), function(df) {
@@ -732,6 +1110,7 @@ utils::write.csv(summary_rows, summary_csv, row.names = FALSE)
 utils::write.csv(scored, rows_csv, row.names = FALSE)
 utils::write.csv(total_summary, total_csv, row.names = FALSE)
 utils::write.csv(posterior_summary, posterior_csv, row.names = FALSE)
+utils::write.csv(high_smc_summary, high_smc_csv, row.names = FALSE)
 saveRDS(
   list(
     data_list = data_list,
@@ -742,11 +1121,17 @@ saveRDS(
     nested_rows_raw = nested_rows_raw,
     nested_rows = nested_rows,
     atlas_rows = atlas_rows,
+    shape_patch_rows = shape_patch_rows,
+    shape_patch_replicates = shape_patch_replicates,
+    shape_patch_diagnostics = shape_patch_diagnostics,
     atlas_objects = lapply(atlas_parts, `[[`, "atlas"),
     scored = scored,
     summary = summary_rows,
     total_log_m = total_log_m,
     total_summary = total_summary,
+    high_smc_summary = high_smc_summary,
+    high_smc_comparison_local = high_cmp_local,
+    high_smc_comparison_total = high_cmp_total,
     posterior_grid = posterior_grid,
     posterior_summary = posterior_summary,
     settings = list(
@@ -777,6 +1162,17 @@ saveRDS(
       atlas_surface_gradient_weight = atlas_surface_gradient_weight,
       atlas_surface_curvature_weight = atlas_surface_curvature_weight,
       atlas_surface_ridge = atlas_surface_ridge,
+      shape_patch = shape_patch,
+      shape_patch_particles = shape_patch_particles,
+      shape_patch_reps = shape_patch_reps,
+      shape_patch_top_theta = shape_patch_top_theta,
+      shape_patch_diag_theta = shape_patch_diag_theta,
+      shape_patch_radius = shape_patch_radius,
+      shape_patch_max_theta = shape_patch_max_theta,
+      shape_patch_kernel_scale = shape_patch_kernel_scale,
+      shape_patch_scale_floor = shape_patch_scale_floor,
+      shape_patch_min_train = shape_patch_min_train,
+      shape_patch_shrink = shape_patch_shrink,
       atlas_eval_max_chart_distance = atlas_eval_max_chart_distance,
       atlas_eval_min_covering_charts = atlas_eval_min_covering_charts,
       atlas_eval_max_prediction_range = atlas_eval_max_prediction_range,
@@ -795,6 +1191,8 @@ saveRDS(
     rows_csv = rows_csv,
     total_csv = total_csv,
     posterior_csv = posterior_csv,
+    high_smc_csv = high_smc_csv,
+    shape_patch_csv = shape_patch_csv,
     error_plot_file = error_plot_file,
     posterior_plot_file = posterior_plot_file
   ),
@@ -806,11 +1204,17 @@ cat(sprintf("Saved summary: %s\n", summary_csv))
 cat(sprintf("Saved rows: %s\n", rows_csv))
 cat(sprintf("Saved total log m summary: %s\n", total_csv))
 cat(sprintf("Saved theta-grid posterior summary: %s\n", posterior_csv))
+cat(sprintf("Saved high-SMC comparison: %s\n", high_smc_csv))
+if (isTRUE(shape_patch)) {
+  cat(sprintf("Saved shape-patch diagnostics: %s\n", shape_patch_csv))
+}
 cat(sprintf("Saved error diagnostics plot: %s\n", error_plot_file))
 cat(sprintf("Saved theta-grid posterior diagnostic plot: %s\n", posterior_plot_file))
 cat("\nSummary:\n")
 print(summary_rows, row.names = FALSE)
 cat("\nTotal log m summary:\n")
 print(total_summary, row.names = FALSE)
+cat("\nHigh-particle nested SMC comparison:\n")
+print(high_smc_summary, row.names = FALSE)
 cat("\nTheta-grid diagnostic posterior summary:\n")
 print(posterior_summary, row.names = FALSE)

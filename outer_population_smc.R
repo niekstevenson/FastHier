@@ -1066,6 +1066,11 @@ population_factor_set_logposterior <- function(factor_set, theta, include_consta
   if (proposal_bridge) {
     initial_proposal <- normalize_theta_proposal(initial_proposal, population_model = factor_set$population_model)
   }
+  proposal_factor_set <- factor_set
+  if (inherits(proposal_factor_set, "local_evidence_atlas_factor_set")) {
+    proposal_factor_set$evaluator_control$stop_on_uncertified <- FALSE
+    proposal_factor_set$evaluator_control$use_uncertified_estimates <- FALSE
+  }
   logbase <- as.numeric(logbase %||% logprior)
   bridge_stat <- as.numeric(bridge_stat %||% loglik_dynamic)
 
@@ -1111,11 +1116,12 @@ population_factor_set_logposterior <- function(factor_set, theta, include_consta
     logfactor_prop <- rep(-Inf, N)
     if (any(ok)) {
       logfactor_prop[ok] <- population_factor_set_loglik(
-        factor_set,
+        proposal_factor_set,
         theta = theta_prop[ok, , drop = FALSE],
         include_constant = FALSE,
         n_cores = n_cores
       )
+      logfactor_prop[!is.finite(logfactor_prop)] <- -Inf
     }
     if (proposal_bridge) {
       logq_prop <- rep(-Inf, N)

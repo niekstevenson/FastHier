@@ -2325,6 +2325,7 @@ solve_atlas_normalizers <- function(atlas,
                                       population_model,
                                       eta = NULL,
                                       min_ess_frac = 0.02,
+                                      min_ess = 50,
                                       max_psis_k = 0.7) {
   model <- normalize_population_model(population_model)
   theta <- .as_hyper_matrix(theta, model$hyper_names, model$hyper_dim)
@@ -2376,7 +2377,9 @@ solve_atlas_normalizers <- function(atlas,
   psis_k <- .local_chart_psis_k(log_ratios[finite])
   normalizer_se <- sqrt(sum((eta * pmax(chart_se, 0))^2))
   mcse <- 1 / sqrt(max(ess, 1))
-  ess_ok <- is.finite(ess_frac) && ess_frac >= as.numeric(min_ess_frac)
+  ess_frac_ok <- is.finite(ess_frac) && ess_frac >= as.numeric(min_ess_frac)
+  ess_abs_ok <- is.finite(ess) && is.finite(min_ess) && ess >= as.numeric(min_ess)
+  ess_ok <- ess_frac_ok || ess_abs_ok
   psis_ok <- !is.finite(max_psis_k) || (!is.na(psis_k) && psis_k <= as.numeric(max_psis_k))
   status <- if (ess_ok && psis_ok) {
     "certified"
@@ -2408,11 +2411,14 @@ solve_atlas_normalizers <- function(atlas,
                                                   max_chart_distance = Inf,
                                                   min_covering_charts = 3L,
                                                   min_ess_frac = 0.05,
+                                                  min_ess = 50,
                                                   max_psis_k = 0.7,
                                                   sparse_chart_min_covering = 3L,
                                                   sparse_chart_max_distance = Inf,
                                                   distance_metric = "euclidean",
                                                   se_floor = 1e-6,
+                                                  use_compressed_particle_mis = FALSE,
+                                                  require_compressed_particle_mis = FALSE,
                                                   use_uncertified_estimates = FALSE) {
   model <- normalize_population_model(population_model)
   atlas <- validate_local_atlas(atlas)
@@ -2450,10 +2456,35 @@ solve_atlas_normalizers <- function(atlas,
   log_eta <- log(eta)
   logZ <- vapply(active_charts, function(chart) as.numeric(chart$logZ_abs), numeric(1))
   chart_se <- vapply(active_charts, function(chart) as.numeric(chart$logZ_abs_se), numeric(1))
-  alpha <- do.call(rbind, lapply(active_charts, function(chart) chart$alpha_particles))
-  sample_log_weight <- unlist(Map(function(chart, eta_s) {
-    log(eta_s) + log(pmax(.local_chart_normalize_weights(chart$weights, nrow(chart$alpha_particles)), .Machine$double.eps))
-  }, active_charts, eta), use.names = FALSE)
+  compression <- atlas$particle_mis_compression
+  compression_ok <- isTRUE(use_compressed_particle_mis) &&
+    inherits(compression, "local_atlas_particle_mis_compression") &&
+    identical(as.character(compression$chart_ids), as.character(chart_ids))
+  if (isTRUE(require_compressed_particle_mis) && !compression_ok) {
+    return(data.frame(
+      log_marginal = rep(NA_real_, nrow(theta)),
+      se = rep(Inf, nrow(theta)),
+      status = rep("uncertified", nrow(theta)),
+      reason = rep("missing_or_stale_particle_mis_compression", nrow(theta)),
+      nearest_charts = rep("", nrow(theta)),
+      particle_mis_ess_frac = rep(0, nrow(theta)),
+      particle_mis_ess = rep(0, nrow(theta)),
+      particle_mis_psis_k = rep(NA_real_, nrow(theta)),
+      min_covering_distance = min_distance,
+      check.names = FALSE
+    ))
+  }
+  if (compression_ok) {
+    alpha <- .local_chart_align_alpha(compression$alpha, model)
+    sample_log_weight <- log(pmax(.local_chart_normalize_weights(compression$weights, nrow(alpha)), .Machine$double.eps))
+    particle_count_denominator <- nrow(alpha)
+  } else {
+    alpha <- do.call(rbind, lapply(active_charts, function(chart) chart$alpha_particles))
+    sample_log_weight <- unlist(Map(function(chart, eta_s) {
+      log(eta_s) + log(pmax(.local_chart_normalize_weights(chart$weights, nrow(chart$alpha_particles)), .Machine$double.eps))
+    }, active_charts, eta), use.names = FALSE)
+    particle_count_denominator <- nrow(alpha)
+  }
 
   anchor_logp <- population_model_log_alpha_given_theta_many(model, alpha = alpha, theta = anchors)
   den_terms <- sweep(anchor_logp, 1L, log_eta - logZ, "+")
@@ -2467,7 +2498,7 @@ solve_atlas_normalizers <- function(atlas,
   contribution <- exp(sweep(log_terms, 1L, max_terms, "-"))
   contribution <- sweep(contribution, 1L, rowSums(contribution), "/")
   ess <- 1 / rowSums(contribution * contribution)
-  ess_frac <- ess / ncol(log_terms)
+  ess_frac <- ess / max(particle_count_denominator, 1L)
   psis_k <- vapply(seq_len(nrow(log_terms)), function(j) {
     .local_chart_psis_k(log_ratios[j, ])
   }, numeric(1))
@@ -2488,7 +2519,13 @@ solve_atlas_normalizers <- function(atlas,
     }
   }
 
-  psis_ok <- !is.finite(max_psis_k) | (!is.na(psis_k) & psis_k <= as.numeric(max_psis_k))
+  compression_certified <- compression_ok &&
+    isTRUE(as.logical(compression$diagnostics$certified[1L] %||% FALSE))
+  psis_ok <- if (compression_ok) {
+    rep(TRUE, nrow(theta))
+  } else {
+    !is.finite(max_psis_k) | (!is.na(psis_k) & psis_k <= as.numeric(max_psis_k))
+  }
   sparse_ok <- !is.finite(sparse_chart_max_distance) |
     covering_count >= as.integer(sparse_chart_min_covering) |
     min_distance <= as.numeric(sparse_chart_max_distance)
@@ -2497,35 +2534,35 @@ solve_atlas_normalizers <- function(atlas,
     exact_chart <- nearest[exact]
     exact_normalizer_certified[exact] <- vapply(active_charts[exact_chart], .local_chart_normalizer_certified, logical(1))
   }
-  certified <- exact_normalizer_certified | (
-    covering_count >= as.integer(min_covering_charts) &
-      is.finite(log_marginal) &
-      is.finite(ess_frac) &
-      ess_frac >= as.numeric(min_ess_frac) &
-      psis_ok &
-      sparse_ok
-  )
-  reason <- ifelse(
-    certified,
-    ifelse(exact_normalizer_certified, "active_exact_anchor", "particle_mis_global_active_chart_coverage"),
-    ifelse(
-      exact & !exact_normalizer_certified & covering_count < as.integer(min_covering_charts),
-      "exact_anchor_normalizer_uncertified",
-      ifelse(
-      covering_count < as.integer(min_covering_charts),
-      "no_active_chart_coverage",
-      ifelse(
-        !sparse_ok,
-        "sparse_chart_extrapolation",
-        ifelse(
-          !is.finite(ess_frac) | ess_frac < as.numeric(min_ess_frac),
-          "low_particle_mis_ess",
-          "high_particle_mis_psis"
-        )
-      )
-      )
+  if (compression_ok) {
+    certified <- exact_normalizer_certified | (
+      compression_certified &
+        covering_count >= as.integer(min_covering_charts) &
+        is.finite(log_marginal) &
+        sparse_ok
     )
-  )
+  } else {
+    certified <- exact_normalizer_certified | (
+      covering_count >= as.integer(min_covering_charts) &
+        is.finite(log_marginal) &
+        is.finite(ess_frac) &
+        (ess_frac >= as.numeric(min_ess_frac) |
+           (is.finite(min_ess) & is.finite(ess) & ess >= as.numeric(min_ess))) &
+        psis_ok &
+        sparse_ok
+    )
+  }
+  reason <- rep("high_particle_mis_psis", nrow(theta))
+  reason[!is.finite(ess_frac) | ess_frac < as.numeric(min_ess_frac)] <- "low_particle_mis_ess"
+  reason[!sparse_ok] <- "sparse_chart_extrapolation"
+  reason[covering_count < as.integer(min_covering_charts)] <- "no_active_chart_coverage"
+  reason[exact & !exact_normalizer_certified & covering_count < as.integer(min_covering_charts)] <-
+    "exact_anchor_normalizer_uncertified"
+  if (compression_ok && !compression_certified) {
+    reason[] <- "compressed_particle_mis_not_certified"
+  }
+  reason[certified] <- "particle_mis_global_active_chart_coverage"
+  reason[certified & exact_normalizer_certified] <- "active_exact_anchor"
   nearest_charts <- vapply(seq_len(nrow(theta)), function(i) {
     covered <- chart_ids[covering[i, ]]
     if (length(covered)) paste(covered, collapse = ",") else chart_ids[nearest[i]]
@@ -2535,12 +2572,476 @@ solve_atlas_normalizers <- function(atlas,
     log_marginal = ifelse(returned, log_marginal, NA_real_),
     se = ifelse(returned, se, Inf),
     status = ifelse(certified, "certified", "uncertified"),
-    reason = reason,
+    reason = ifelse(
+      certified & compression_ok & reason == "particle_mis_global_active_chart_coverage",
+      "compressed_particle_mis_global_active_chart_coverage",
+      reason
+    ),
     nearest_charts = nearest_charts,
     particle_mis_ess_frac = ess_frac,
+    particle_mis_ess = ess,
     particle_mis_psis_k = psis_k,
     min_covering_distance = min_distance,
     check.names = FALSE
+  )
+}
+
+.local_atlas_particle_mis_cache <- function(atlas,
+                                            theta,
+                                            population_model) {
+  atlas <- validate_local_atlas(atlas)
+  model <- normalize_population_model(population_model)
+  theta <- .as_hyper_matrix(theta, model$hyper_names, model$hyper_dim)
+  active <- .local_atlas_active_charts(atlas)
+  if (!length(active)) {
+    stop("Cannot compress a local atlas with no active charts.")
+  }
+  chart_ids <- names(active)
+  eta <- rep(1 / length(active), length(active))
+  log_eta <- log(eta)
+  anchors <- do.call(rbind, lapply(active, function(chart) chart$theta_anchor))
+  colnames(anchors) <- model$hyper_names
+  logZ <- vapply(active, function(chart) as.numeric(chart$logZ_abs), numeric(1))
+  alpha <- do.call(rbind, lapply(active, function(chart) chart$alpha_particles))
+  alpha <- .local_chart_align_alpha(alpha, model)
+  chart_index <- rep(seq_along(active), vapply(active, function(chart) nrow(chart$alpha_particles), integer(1)))
+  sample_log_weight <- unlist(Map(function(chart, eta_s) {
+    log(eta_s) + log(pmax(.local_chart_normalize_weights(chart$weights, nrow(chart$alpha_particles)), .Machine$double.eps))
+  }, active, eta), use.names = FALSE)
+  sample_weight <- exp(sample_log_weight - logsumexp(sample_log_weight))
+
+  anchor_logp <- population_model_log_alpha_given_theta_many(model, alpha = alpha, theta = anchors)
+  den_terms <- sweep(anchor_logp, 1L, log_eta - logZ, "+")
+  log_den <- as.numeric(matrixStats::colLogSumExps(den_terms))
+  theta_logp <- population_model_log_alpha_given_theta_many(model, alpha = alpha, theta = theta)
+  log_h <- sweep(theta_logp, 2L, log_den, "-")
+  full_log_terms <- sweep(log_h, 2L, sample_log_weight, "+")
+  full_log_m <- .rowLogSumExp(full_log_terms)
+  max_terms <- matrixStats::rowMaxs(full_log_terms)
+  contribution <- exp(sweep(full_log_terms, 1L, max_terms, "-"))
+  contribution <- sweep(contribution, 1L, rowSums(contribution), "/")
+  full_ess <- 1 / rowSums(contribution * contribution)
+  full_psis_k <- vapply(seq_len(nrow(log_h)), function(j) .local_chart_psis_k(log_h[j, ]), numeric(1))
+
+  list(
+    chart_ids = chart_ids,
+    anchors = anchors,
+    logZ = logZ,
+    alpha = alpha,
+    chart_index = chart_index,
+    sample_weight = sample_weight,
+    sample_log_weight = sample_log_weight,
+    log_h = log_h,
+    full_log_m = as.numeric(full_log_m),
+    full_ess = as.numeric(full_ess),
+    full_ess_frac = as.numeric(full_ess / ncol(log_h)),
+    full_psis_k = as.numeric(full_psis_k)
+  )
+}
+
+.local_atlas_compression_fit_simplex <- function(features,
+                                                 target,
+                                                 ridge = 1e-8) {
+  features <- as.matrix(features)
+  target <- as.numeric(target)
+  K <- nrow(features)
+  if (K <= 0L) {
+    stop("Compression simplex fit requires at least one selected particle.")
+  }
+  if (K == 1L) {
+    return(1)
+  }
+  if (!requireNamespace("quadprog", quietly = TRUE)) {
+    stop("quadprog is required for local atlas particle compression.")
+  }
+  X <- t(features)
+  Dmat <- 2 * (crossprod(X) + diag(as.numeric(ridge), K))
+  dvec <- as.numeric(2 * crossprod(X, target))
+  Amat <- cbind(rep(1, K), diag(K))
+  bvec <- c(1, rep(0, K))
+  sol <- tryCatch(
+    quadprog::solve.QP(Dmat = Dmat, dvec = dvec, Amat = Amat, bvec = bvec, meq = 1L)$solution,
+    error = function(e) NULL
+  )
+  if (is.null(sol) || any(!is.finite(sol))) {
+    sol <- rep(1 / K, K)
+  }
+  sol <- pmax(as.numeric(sol), 0)
+  total <- sum(sol)
+  if (!is.finite(total) || total <= 0) {
+    rep(1 / K, K)
+  } else {
+    sol / total
+  }
+}
+
+.local_atlas_compression_sparse_quadrature <- function(features,
+                                                       target,
+                                                       K,
+                                                       ridge = 1e-8,
+                                                       min_weight = 1e-12) {
+  features <- as.matrix(features)
+  target <- as.numeric(target)
+  K <- min(as.integer(K), nrow(features))
+  if (K <= 0L) {
+    stop("Compression K must be positive.")
+  }
+  selected <- integer(0)
+  active_weight <- numeric(0)
+  current <- rep(0, ncol(features))
+  available <- rep(TRUE, nrow(features))
+  for (k in seq_len(K)) {
+    residual <- target - current
+    score <- as.numeric(features %*% residual)
+    score[!available] <- -Inf
+    pick <- which.max(score)
+    if (!length(pick) || !is.finite(score[pick])) {
+      break
+    }
+    selected <- c(selected, pick)
+    available[pick] <- FALSE
+    active_features <- features[selected, , drop = FALSE]
+    active_weight <- .local_atlas_compression_fit_simplex(active_features, target, ridge = ridge)
+    keep <- active_weight > as.numeric(min_weight)
+    if (!any(keep)) {
+      active_weight <- rep(1 / length(selected), length(selected))
+      keep <- rep(TRUE, length(selected))
+    }
+    selected <- selected[keep]
+    active_weight <- active_weight[keep]
+    active_weight <- active_weight / sum(active_weight)
+    current <- as.numeric(crossprod(active_weight, features[selected, , drop = FALSE]))
+  }
+  ord <- order(selected)
+  list(index = selected[ord], weight = active_weight[ord])
+}
+
+.local_atlas_compression_features <- function(cache,
+                                              train_rows,
+                                              evidence_weight = 1,
+                                              moment_weight = 0.05,
+                                              chart_weight = 0.05,
+                                              include_moments = TRUE,
+                                              include_chart = TRUE) {
+  train_rows <- as.integer(train_rows)
+  evidence <- t(exp(sweep(cache$log_h[train_rows, , drop = FALSE], 1L, cache$full_log_m[train_rows], "-")))
+  raw <- evidence
+  target <- rep(1, length(train_rows))
+  scale <- rep(1, length(train_rows))
+  penalty_weight <- rep(as.numeric(evidence_weight), length(train_rows))
+
+  if (isTRUE(include_moments)) {
+    alpha <- as.matrix(cache$alpha)
+    w <- cache$sample_weight
+    alpha_mean <- colSums(w * alpha)
+    alpha_centered <- sweep(alpha, 2L, alpha_mean, "-")
+    alpha_sd <- sqrt(colSums(w * alpha_centered * alpha_centered))
+    alpha_sd <- pmax(alpha_sd, 1e-8)
+    z <- sweep(alpha_centered, 2L, alpha_sd, "/")
+    moment_raw <- cbind(z, z * z)
+    moment_target <- colSums(w * moment_raw)
+    moment_scale <- sqrt(pmax(colSums(w * sweep(moment_raw, 2L, moment_target, "-")^2), 1e-8))
+    raw <- cbind(raw, moment_raw)
+    target <- c(target, moment_target)
+    scale <- c(scale, moment_scale)
+    penalty_weight <- c(penalty_weight, rep(as.numeric(moment_weight), ncol(moment_raw)))
+  }
+
+  if (isTRUE(include_chart)) {
+    chart <- matrix(0, nrow = nrow(cache$alpha), ncol = length(cache$chart_ids))
+    chart[cbind(seq_len(nrow(chart)), cache$chart_index)] <- 1
+    chart_target <- colSums(cache$sample_weight * chart)
+    chart_scale <- sqrt(pmax(chart_target * (1 - chart_target), 1e-8))
+    raw <- cbind(raw, chart)
+    target <- c(target, chart_target)
+    scale <- c(scale, chart_scale)
+    penalty_weight <- c(penalty_weight, rep(as.numeric(chart_weight), ncol(chart)))
+  }
+
+  scaled <- sweep(raw, 2L, scale, "/")
+  scaled <- sweep(scaled, 2L, sqrt(pmax(penalty_weight, 0)), "*")
+  target_scaled <- target / scale * sqrt(pmax(penalty_weight, 0))
+  list(features = scaled, target = target_scaled)
+}
+
+.local_atlas_compression_evaluate <- function(log_h,
+                                              index,
+                                              weight) {
+  log_weight <- log(pmax(as.numeric(weight), .Machine$double.eps))
+  log_terms <- sweep(log_h[, index, drop = FALSE], 2L, log_weight, "+")
+  log_m <- .rowLogSumExp(log_terms)
+  max_terms <- matrixStats::rowMaxs(log_terms)
+  contribution <- exp(sweep(log_terms, 1L, max_terms, "-"))
+  contribution <- sweep(contribution, 1L, rowSums(contribution), "/")
+  ess <- 1 / rowSums(contribution * contribution)
+  psis_k <- vapply(seq_len(nrow(log_h)), function(j) .local_chart_psis_k(log_h[j, index]), numeric(1))
+  list(
+    log_marginal = as.numeric(log_m),
+    ess = as.numeric(ess),
+    ess_frac = as.numeric(ess / length(index)),
+    psis_k = as.numeric(psis_k)
+  )
+}
+
+compress_local_atlas_particle_mis <- function(atlas,
+                                              theta,
+                                              population_model,
+                                              K = 64L,
+                                              holdout_fraction = 0.25,
+                                              ridge = 1e-8,
+                                              evidence_weight = 1,
+                                              moment_weight = 0.05,
+                                              chart_weight = 0.05,
+                                              include_moments = TRUE,
+                                              include_chart = TRUE,
+                                              max_holdout_rmse = Inf,
+                                              seed = NULL) {
+  model <- normalize_population_model(population_model)
+  atlas <- validate_local_atlas(atlas)
+  theta <- .as_hyper_matrix(theta, model$hyper_names, model$hyper_dim)
+  if (nrow(theta) < 2L) {
+    stop("Particle-MIS compression needs at least two theta certification points.")
+  }
+  if (!is.null(seed)) {
+    old_seed <- if (exists(".Random.seed", envir = .GlobalEnv, inherits = FALSE)) {
+      get(".Random.seed", envir = .GlobalEnv, inherits = FALSE)
+    } else {
+      NULL
+    }
+    on.exit({
+      if (is.null(old_seed)) {
+        if (exists(".Random.seed", envir = .GlobalEnv, inherits = FALSE)) rm(".Random.seed", envir = .GlobalEnv)
+      } else {
+        assign(".Random.seed", old_seed, envir = .GlobalEnv)
+      }
+    }, add = TRUE)
+    set.seed(as.integer(seed))
+  }
+  cache <- .local_atlas_particle_mis_cache(atlas, theta, model)
+  n_theta <- nrow(theta)
+  holdout_n <- floor(n_theta * max(0, min(0.8, as.numeric(holdout_fraction))))
+  if (holdout_n > 0L && n_theta - holdout_n >= 2L) {
+    holdout_rows <- sort(sample.int(n_theta, holdout_n))
+    train_rows <- setdiff(seq_len(n_theta), holdout_rows)
+  } else {
+    holdout_rows <- integer(0)
+    train_rows <- seq_len(n_theta)
+  }
+  features <- .local_atlas_compression_features(
+    cache = cache,
+    train_rows = train_rows,
+    evidence_weight = evidence_weight,
+    moment_weight = moment_weight,
+    chart_weight = chart_weight,
+    include_moments = include_moments,
+    include_chart = include_chart
+  )
+  selection <- .local_atlas_compression_sparse_quadrature(
+    features = features$features,
+    target = features$target,
+    K = as.integer(K),
+    ridge = ridge
+  )
+  compressed_eval <- .local_atlas_compression_evaluate(cache$log_h, selection$index, selection$weight)
+  error <- compressed_eval$log_marginal - cache$full_log_m
+  rmse <- function(x) {
+    x <- as.numeric(x)
+    x <- x[is.finite(x)]
+    if (length(x)) sqrt(mean(x * x)) else NA_real_
+  }
+  centered_rmse <- function(x) {
+    ok <- is.finite(x)
+    if (!any(ok)) return(NA_real_)
+    y <- x[ok] - mean(x[ok])
+    sqrt(mean(y * y))
+  }
+  diagnostics <- data.frame(
+    local = as.character(atlas$local_id),
+    raw_particles = nrow(cache$alpha),
+    selected_particles = length(selection$index),
+    quadrature_weight_ess = 1 / sum(selection$weight * selection$weight),
+    compression_ratio = nrow(cache$alpha) / max(length(selection$index), 1L),
+    theta_points = n_theta,
+    train_points = length(train_rows),
+    holdout_points = length(holdout_rows),
+    train_rmse = rmse(error[train_rows]),
+    holdout_rmse = if (length(holdout_rows)) rmse(error[holdout_rows]) else NA_real_,
+    all_rmse = rmse(error),
+    all_centered_rmse = centered_rmse(error),
+    max_abs_error = if (any(is.finite(error))) max(abs(error[is.finite(error)])) else NA_real_,
+    median_full_ess_frac = stats::median(cache$full_ess_frac, na.rm = TRUE),
+    median_compressed_ess_frac = stats::median(compressed_eval$ess_frac, na.rm = TRUE),
+    median_full_psis_k = stats::median(cache$full_psis_k, na.rm = TRUE),
+    median_compressed_psis_k = stats::median(compressed_eval$psis_k, na.rm = TRUE),
+    certified = if (length(holdout_rows) && is.finite(max_holdout_rmse)) {
+      is.finite(rmse(error[holdout_rows])) && rmse(error[holdout_rows]) <= as.numeric(max_holdout_rmse)
+    } else {
+      TRUE
+    },
+    check.names = FALSE
+  )
+  compression <- structure(
+    list(
+      method = "function_aware_sparse_quadrature",
+      chart_ids = cache$chart_ids,
+      alpha = cache$alpha[selection$index, , drop = FALSE],
+      weights = .local_chart_normalize_weights(selection$weight, length(selection$weight)),
+      selected_index = selection$index,
+      theta = theta,
+      train_rows = train_rows,
+      holdout_rows = holdout_rows,
+      diagnostics = diagnostics
+    ),
+    class = "local_atlas_particle_mis_compression"
+  )
+  atlas$particle_mis_compression <- compression
+  atlas
+}
+
+compress_local_atlas_factor_set <- function(factor_set,
+                                            theta,
+                                            K = 64L,
+                                            holdout_fraction = 0.25,
+                                            ridge = 1e-8,
+                                            evidence_weight = 1,
+                                            moment_weight = 0.05,
+                                            chart_weight = 0.05,
+                                            include_moments = TRUE,
+                                            include_chart = TRUE,
+                                            max_holdout_rmse = Inf,
+                                            stop_on_failure = FALSE,
+                                            n_cores = 1L,
+                                            seed = 123L,
+                                            verbose = TRUE) {
+  factor_set <- validate_local_atlas_factor_set(factor_set)
+  model <- factor_set$population_model
+  theta <- .as_hyper_matrix(theta, model$hyper_names, model$hyper_dim)
+  if (!requireNamespace("quadprog", quietly = TRUE)) {
+    stop("quadprog is required for local atlas particle compression.")
+  }
+  compress_one <- function(pos) {
+    compress_local_atlas_particle_mis(
+      atlas = factor_set$atlases[[pos]],
+      theta = theta,
+      population_model = model,
+      K = K,
+      holdout_fraction = holdout_fraction,
+      ridge = ridge,
+      evidence_weight = evidence_weight,
+      moment_weight = moment_weight,
+      chart_weight = chart_weight,
+      include_moments = include_moments,
+      include_chart = include_chart,
+      max_holdout_rmse = max_holdout_rmse,
+      seed = as.integer(seed) + 7919L * pos
+    )
+  }
+  if (isTRUE(verbose)) {
+    .local_atlas_log(
+      "compressing local particle-MIS rules: locals=", length(factor_set$atlases),
+      " K=", as.integer(K),
+      " theta_points=", nrow(theta), "\n",
+      verbose = TRUE
+    )
+  }
+  atlases <- if (as.integer(n_cores) <= 1L || length(factor_set$atlases) <= 1L) {
+    lapply(seq_along(factor_set$atlases), compress_one)
+  } else {
+    parallel::mclapply(
+      seq_along(factor_set$atlases),
+      compress_one,
+      mc.cores = as.integer(min(n_cores, length(factor_set$atlases))),
+      mc.preschedule = FALSE
+    )
+  }
+  names(atlases) <- names(factor_set$atlases)
+  factor_set$atlases <- atlases
+  summary <- local_atlas_compression_summary(factor_set)
+  factor_set$compression_summary <- summary
+  factor_set$evaluator_control$use_compressed_particle_mis <- TRUE
+  factor_set$evaluator_control$require_compressed_particle_mis <- TRUE
+  certified <- as.logical(summary$certified)
+  certified[is.na(certified)] <- FALSE
+  if (isTRUE(stop_on_failure) && nrow(summary) && any(!certified)) {
+    bad <- summary[!certified, , drop = FALSE]
+    bad <- utils::head(bad[order(-bad$holdout_rmse), , drop = FALSE], 8L)
+    stop(
+      "Local atlas particle compression failed certification:\n",
+      paste(sprintf("local=%s holdout_rmse=%s selected=%s raw=%s",
+                    bad$local, signif(bad$holdout_rmse, 4), bad$selected_particles, bad$raw_particles),
+            collapse = "\n")
+    )
+  }
+  factor_set
+}
+
+local_atlas_compression_summary <- function(factor_set) {
+  factor_set <- validate_local_atlas_factor_set(factor_set)
+  rows <- lapply(factor_set$atlases, function(atlas) {
+    compression <- atlas$particle_mis_compression
+    if (!inherits(compression, "local_atlas_particle_mis_compression")) {
+      return(data.frame(
+        local = as.character(atlas$local_id),
+        raw_particles = NA_integer_,
+        selected_particles = NA_integer_,
+        compression_ratio = NA_real_,
+        certified = FALSE,
+        check.names = FALSE
+      ))
+    }
+    compression$diagnostics
+  })
+  out <- do.call(rbind, rows)
+  rownames(out) <- NULL
+  out
+}
+
+.local_atlas_compression_theta_design <- function(theta_design,
+                                                  theta_cloud,
+                                                  initial_proposal,
+                                                  population_model,
+                                                  theta_root,
+                                                  n_theta = 96L,
+                                                  distance_metric = "fisher",
+                                                  seed = 123L) {
+  model <- normalize_population_model(population_model)
+  n_theta <- as.integer(n_theta)
+  if (!is.finite(n_theta) || n_theta < 2L) {
+    stop("compressed_particle_mis_n_theta must be at least 2.")
+  }
+  theta_design <- .as_hyper_matrix(theta_design, model$hyper_names, model$hyper_dim)
+  theta_cloud <- .as_hyper_matrix(theta_cloud, model$hyper_names, model$hyper_dim)
+  proposal_theta <- NULL
+  proposal_n <- max(0L, n_theta - nrow(theta_design))
+  if (!is.null(initial_proposal) && proposal_n > 0L) {
+    proposal_theta <- theta_proposal_sample(
+      initial_proposal,
+      n = proposal_n,
+      seed = as.integer(seed) + 1000003L
+    )
+  }
+  pool <- .local_atlas_unique_theta(rbind(theta_design, theta_cloud, proposal_theta), model)
+  if (nrow(pool) <= n_theta) {
+    return(pool)
+  }
+  seed_design <- theta_design
+  seed_keep <- min(nrow(seed_design), max(1L, floor(0.5 * n_theta)))
+  if (nrow(seed_design) > seed_keep) {
+    seed_design <- .local_atlas_metric_farthest_design(
+      theta_cloud = seed_design,
+      population_model = model,
+      theta_root = theta_root,
+      max_anchors = seed_keep,
+      distance_metric = distance_metric
+    )
+  }
+  .local_atlas_metric_farthest_design(
+    theta_cloud = pool,
+    population_model = model,
+    theta_root = theta_root,
+    max_anchors = n_theta,
+    distance_metric = distance_metric,
+    initial_design = seed_design
   )
 }
 
@@ -2555,6 +3056,7 @@ evaluate_local_atlas <- function(atlas,
                                  use_particle_mis = TRUE,
                                  require_particle_mis = TRUE,
                                  min_particle_mis_ess = 0.05,
+                                 min_particle_mis_ess_abs = 50,
                                  max_particle_mis_psis_k = 0.7,
                                  max_quadratic_particle_gap = 0.05,
                                  sparse_chart_min_covering = 3L,
@@ -2791,6 +3293,7 @@ evaluate_local_atlas <- function(atlas,
     population_model = model,
     eta = NULL,
     min_ess_frac = min_particle_mis_ess,
+    min_ess = min_particle_mis_ess_abs,
     max_psis_k = max_particle_mis_psis_k
   )
   gap <- if (is.finite(particle$log_marginal %||% NA_real_) &&
@@ -2850,6 +3353,7 @@ evaluate_local_atlas_many <- function(atlas,
                                       use_particle_mis = TRUE,
                                       require_particle_mis = TRUE,
                                       min_particle_mis_ess = 0.05,
+                                      min_particle_mis_ess_abs = 50,
                                       max_particle_mis_psis_k = 0.7,
                                       max_quadratic_particle_gap = 0.05,
                                       sparse_chart_min_covering = 3L,
@@ -2879,6 +3383,7 @@ evaluate_local_atlas_many <- function(atlas,
       use_particle_mis = use_particle_mis,
       require_particle_mis = require_particle_mis,
       min_particle_mis_ess = min_particle_mis_ess,
+      min_particle_mis_ess_abs = min_particle_mis_ess_abs,
       max_particle_mis_psis_k = max_particle_mis_psis_k,
       max_quadratic_particle_gap = max_quadratic_particle_gap,
       sparse_chart_min_covering = sparse_chart_min_covering,
@@ -2908,6 +3413,11 @@ evaluate_local_atlas_many <- function(atlas,
     particle_mis_ess_frac = vapply(
       results,
       function(x) as.numeric(x$diagnostics$particle_mis$ess_frac %||% NA_real_),
+      numeric(1)
+    ),
+    particle_mis_ess = vapply(
+      results,
+      function(x) as.numeric(x$diagnostics$particle_mis$ess %||% NA_real_),
       numeric(1)
     ),
     particle_mis_psis_k = vapply(
@@ -2964,6 +3474,7 @@ build_local_atlas_factor_set <- function(atlases,
                                          use_particle_mis = TRUE,
                                          require_particle_mis = TRUE,
                                          min_particle_mis_ess = 0.05,
+                                         min_particle_mis_ess_abs = 50,
                                          max_particle_mis_psis_k = 0.7,
                                          max_quadratic_particle_gap = 0.05,
                                          sparse_chart_min_covering = 3L,
@@ -2979,6 +3490,8 @@ build_local_atlas_factor_set <- function(atlases,
                                          surface_ridge = 1e-8,
                                          particle_mis_role = "estimator",
                                          particle_mis_batch = TRUE,
+                                         use_compressed_particle_mis = FALSE,
+                                         require_compressed_particle_mis = FALSE,
                                          stop_on_uncertified = TRUE,
                                          use_uncertified_estimates = FALSE) {
   model <- normalize_population_model(population_model)
@@ -3020,6 +3533,7 @@ build_local_atlas_factor_set <- function(atlases,
         use_particle_mis = isTRUE(use_particle_mis),
         require_particle_mis = isTRUE(require_particle_mis),
         min_particle_mis_ess = as.numeric(min_particle_mis_ess),
+        min_particle_mis_ess_abs = as.numeric(min_particle_mis_ess_abs),
         max_particle_mis_psis_k = as.numeric(max_particle_mis_psis_k),
         max_quadratic_particle_gap = max_quadratic_particle_gap,
         sparse_chart_min_covering = as.integer(sparse_chart_min_covering),
@@ -3035,6 +3549,8 @@ build_local_atlas_factor_set <- function(atlases,
         surface_ridge = as.numeric(surface_ridge),
         particle_mis_role = .local_atlas_particle_mis_role(particle_mis_role),
         particle_mis_batch = isTRUE(particle_mis_batch),
+        use_compressed_particle_mis = isTRUE(use_compressed_particle_mis),
+        require_compressed_particle_mis = isTRUE(require_compressed_particle_mis),
         stop_on_uncertified = isTRUE(stop_on_uncertified),
         use_uncertified_estimates = isTRUE(use_uncertified_estimates)
       )
@@ -3066,6 +3582,7 @@ validate_local_atlas_factor_set <- function(factor_set) {
   control$use_particle_mis <- isTRUE(control$use_particle_mis %||% TRUE)
   control$require_particle_mis <- isTRUE(control$require_particle_mis %||% TRUE)
   control$min_particle_mis_ess <- as.numeric(control$min_particle_mis_ess %||% 0.05)
+  control$min_particle_mis_ess_abs <- as.numeric(control$min_particle_mis_ess_abs %||% 50)
   control$max_particle_mis_psis_k <- as.numeric(control$max_particle_mis_psis_k %||% 0.7)
   control$max_quadratic_particle_gap <- control$max_quadratic_particle_gap %||% 0.05
   control$sparse_chart_min_covering <- as.integer(control$sparse_chart_min_covering %||% 3L)
@@ -3081,6 +3598,8 @@ validate_local_atlas_factor_set <- function(factor_set) {
   control$surface_ridge <- as.numeric(control$surface_ridge %||% 1e-8)
   control$particle_mis_role <- .local_atlas_particle_mis_role(control$particle_mis_role %||% "estimator")
   control$particle_mis_batch <- isTRUE(control$particle_mis_batch %||% TRUE)
+  control$use_compressed_particle_mis <- isTRUE(control$use_compressed_particle_mis %||% FALSE)
+  control$require_compressed_particle_mis <- isTRUE(control$require_compressed_particle_mis %||% FALSE)
   control$stop_on_uncertified <- isTRUE(control$stop_on_uncertified %||% TRUE)
   control$use_uncertified_estimates <- isTRUE(control$use_uncertified_estimates %||% FALSE)
   factor_set$evaluator_control <- control
@@ -3107,11 +3626,14 @@ validate_local_atlas_factor_set <- function(factor_set) {
         max_chart_distance = control$max_chart_distance,
         min_covering_charts = control$min_covering_charts,
         min_ess_frac = control$min_particle_mis_ess,
+        min_ess = control$min_particle_mis_ess_abs,
         max_psis_k = control$max_particle_mis_psis_k,
         sparse_chart_min_covering = control$sparse_chart_min_covering,
         sparse_chart_max_distance = control$sparse_chart_max_distance,
         distance_metric = control$distance_metric,
         se_floor = control$se_floor,
+        use_compressed_particle_mis = control$use_compressed_particle_mis,
+        require_compressed_particle_mis = control$require_compressed_particle_mis,
         use_uncertified_estimates = control$use_uncertified_estimates
       )
     } else {
@@ -3127,6 +3649,7 @@ validate_local_atlas_factor_set <- function(factor_set) {
         use_particle_mis = control$use_particle_mis,
         require_particle_mis = control$require_particle_mis,
         min_particle_mis_ess = control$min_particle_mis_ess,
+        min_particle_mis_ess_abs = control$min_particle_mis_ess_abs,
         max_particle_mis_psis_k = control$max_particle_mis_psis_k,
         max_quadratic_particle_gap = control$max_quadratic_particle_gap,
         sparse_chart_min_covering = control$sparse_chart_min_covering,
@@ -3606,6 +4129,458 @@ local_atlas_select_theta_profiles <- function(theta,
   out
 }
 
+local_atlas_hyperparameter_families <- function(population_model) {
+  model <- normalize_population_model(population_model)
+  if (!identical(model$fast_family %||% NA_character_, "gaussian") ||
+      model$hyper_dim != 2L * model$alpha_dim) {
+    stop("adaptive chart design currently requires the diagonal Gaussian population model.")
+  }
+  rows <- lapply(seq_len(model$alpha_dim), function(j) {
+    hyper_names <- c(model$hyper_names[j], model$hyper_names[model$alpha_dim + j])
+    data.frame(
+      family = model$alpha_names[j],
+      alpha_name = model$alpha_names[j],
+      mu_hyper = hyper_names[1L],
+      log_sigma2_hyper = hyper_names[2L],
+      hyper_names = paste(hyper_names, collapse = ","),
+      check.names = FALSE
+    )
+  })
+  do.call(rbind, rows)
+}
+
+.local_atlas_weighted_sd <- function(x, weights) {
+  x <- as.numeric(x)
+  weights <- .local_chart_normalize_weights(weights, length(x))
+  ok <- is.finite(x) & is.finite(weights) & weights > 0
+  if (!any(ok)) {
+    return(0)
+  }
+  x <- x[ok]
+  weights <- weights[ok] / sum(weights[ok])
+  center <- sum(weights * x)
+  sqrt(sum(weights * (x - center)^2))
+}
+
+.local_atlas_root_scout_atlas <- function(local_id,
+                                          data_i,
+                                          loglik_fn,
+                                          population_model,
+                                          theta_root,
+                                          local_control,
+                                          seed,
+                                          verbose = FALSE) {
+  model <- normalize_population_model(population_model)
+  root <- build_local_root_chart(
+    local_id = local_id,
+    theta_anchor = theta_root,
+    data_i = data_i,
+    loglik_fn = loglik_fn,
+    population_model = model,
+    chart_id = "root",
+    M = as.integer(local_control$root_M),
+    target_cess = local_control$target_cess,
+    resample_threshold = local_control$resample_threshold,
+    n_mcmc_moves = as.integer(local_control$n_mcmc_moves),
+    rw_scale = local_control$rw_scale,
+    G_mix = as.integer(local_control$G_mix),
+    da_enable = isTRUE(local_control$da_enable),
+    refit_every = as.integer(local_control$refit_every),
+    max_steps = as.integer(local_control$max_steps),
+    deterministic_resampling = isTRUE(local_control$deterministic_resampling),
+    n_cores = as.integer(local_control$n_cores_per_local),
+    seed = as.integer(seed),
+    verbose = isTRUE(verbose),
+    confirm = local_control$root_confirm,
+    confirmation_M = as.integer(local_control$root_confirmation_M %||% max(100L, ceiling(as.integer(local_control$root_M) / 2L))),
+    confirmation_abs_tol = local_control$root_confirmation_abs_tol
+  )
+  atlas <- new_local_atlas(
+    local_id = local_id,
+    root_chart_id = "root",
+    charts = list(root),
+    edges = list()
+  )
+  solve_atlas_normalizers(atlas)
+}
+
+validate_chart_design_plan <- function(plan) {
+  if (!inherits(plan, "chart_design_plan")) {
+    stop("plan must inherit from 'chart_design_plan'.")
+  }
+  required <- c(
+    "theta_root",
+    "theta_cloud",
+    "families",
+    "family_scores",
+    "local_family_scores",
+    "selected_families",
+    "selected_hyper_names",
+    "local_anchor_budgets",
+    "candidate_theta",
+    "local_theta_designs",
+    "root_atlases",
+    "diagnostics"
+  )
+  missing <- setdiff(required, names(plan))
+  if (length(missing)) {
+    stop("chart_design_plan is missing: ", paste(missing, collapse = ", "))
+  }
+  if (!is.data.frame(plan$family_scores) || !nrow(plan$family_scores)) {
+    stop("chart_design_plan family_scores must be a non-empty data frame.")
+  }
+  if (!is.data.frame(plan$local_family_scores) || !nrow(plan$local_family_scores)) {
+    stop("chart_design_plan local_family_scores must be a non-empty data frame.")
+  }
+  if (!is.list(plan$local_theta_designs) || !length(plan$local_theta_designs)) {
+    stop("chart_design_plan local_theta_designs must be a non-empty list.")
+  }
+  plan
+}
+
+chart_design_plan_theta_union <- function(plan,
+                                          population_model = NULL) {
+  plan <- validate_chart_design_plan(plan)
+  theta <- do.call(rbind, plan$local_theta_designs)
+  if (is.null(population_model)) {
+    theta <- .as_hyper_matrix(theta, hyper_names = colnames(plan$theta_root), hyper_dim = ncol(plan$theta_root))
+    key <- apply(signif(theta, 14L), 1L, paste, collapse = "\r")
+    return(theta[!duplicated(key), , drop = FALSE])
+  }
+  .local_atlas_unique_theta(theta, normalize_population_model(population_model))
+}
+
+new_chart_design_plan <- function(theta_root,
+                                  theta_cloud,
+                                  theta_weights,
+                                  families,
+                                  family_scores,
+                                  local_scores,
+                                  local_family_scores,
+                                  selected_families,
+                                  selected_hyper_names,
+                                  local_anchor_budgets,
+                                  candidate_theta,
+                                  local_theta_designs,
+                                  root_atlases,
+                                  diagnostics = list(),
+                                  population_model = NULL) {
+  structure(
+    list(
+      theta_root = theta_root,
+      theta_cloud = theta_cloud,
+      theta_weights = theta_weights,
+      families = families,
+      family_scores = family_scores,
+      local_scores = local_scores,
+      local_family_scores = local_family_scores,
+      selected_families = selected_families,
+      selected_hyper_names = selected_hyper_names,
+      local_anchor_budgets = local_anchor_budgets,
+      candidate_theta = candidate_theta,
+      local_theta_designs = local_theta_designs,
+      root_atlases = root_atlases,
+      diagnostics = diagnostics
+    ),
+    class = "chart_design_plan",
+    population_model = population_model
+  ) |>
+    validate_chart_design_plan()
+}
+
+build_chart_design_plan <- function(data_list,
+                                    loglik_fn,
+                                    population_model,
+                                    theta_root,
+                                    theta_cloud,
+                                    theta_weights = NULL,
+                                    local_control = list(),
+                                    design_control = list(),
+                                    n_cores = 1L,
+                                    seed = 123L,
+                                    verbose = TRUE,
+                                    trace_verbose = FALSE) {
+  model <- normalize_population_model(population_model)
+  if (!is.list(data_list) || !length(data_list)) {
+    stop("data_list must be a non-empty list.")
+  }
+  if (!is.function(loglik_fn)) {
+    stop("loglik_fn must be a function.")
+  }
+  theta_root <- .local_chart_align_theta_one(theta_root, model)
+  theta_cloud_raw <- .as_hyper_matrix(theta_cloud, model$hyper_names, model$hyper_dim)
+  theta_weights_raw <- theta_weights
+  theta_cloud <- .local_atlas_unique_theta(rbind(theta_root, theta_cloud_raw), model)
+  if (is.null(theta_weights_raw)) {
+    theta_weights <- rep(1 / nrow(theta_cloud), nrow(theta_cloud))
+  } else if (length(theta_weights_raw) == nrow(theta_cloud)) {
+    theta_weights <- .local_chart_normalize_weights(theta_weights_raw, nrow(theta_cloud))
+  } else if (length(theta_weights_raw) == nrow(theta_cloud_raw)) {
+    raw_weights <- .local_chart_normalize_weights(theta_weights_raw, nrow(theta_cloud_raw))
+    key <- function(x) apply(signif(as.matrix(x), 14L), 1L, paste, collapse = "\r")
+    raw_key <- key(theta_cloud_raw)
+    cloud_key <- key(theta_cloud)
+    theta_weights <- rowsum(raw_weights, raw_key, reorder = FALSE)
+    theta_weights <- as.numeric(theta_weights[match(cloud_key, rownames(theta_weights)), , drop = TRUE])
+    theta_weights[!is.finite(theta_weights)] <- 0
+    if (sum(theta_weights) <= 0) {
+      theta_weights <- rep(1 / nrow(theta_cloud), nrow(theta_cloud))
+    } else {
+      theta_weights <- theta_weights / sum(theta_weights)
+    }
+  } else {
+    stop("theta_weights must match theta_cloud before or after root insertion.")
+  }
+  local_control <- .local_atlas_merge_control(local_control, .local_atlas_default_local_control())
+  local_control$n_cores_per_local <- 1L
+  design_control <- .local_atlas_merge_control(design_control, list(
+    tail_probs = c(0.05, 0.5, 0.95),
+    distance_metric = "fisher",
+    max_anchors = 9L,
+    scout_min_families = 1L,
+    scout_max_families = 4L,
+    scout_relative_threshold = 0.25,
+    scout_logz_se_weight = 1,
+    scout_weak_path_weight = 1,
+    scout_min_anchors_per_local = 3L,
+    scout_mean_anchors_per_local = 6L,
+    scout_max_anchors_per_local = NULL,
+    scout_candidate_pool_size = NULL
+  ))
+
+  idx <- seq_along(data_list)
+  local_names <- names(data_list) %||% as.character(idx)
+  .local_atlas_log(
+    "building root scout charts: locals=", length(data_list),
+    " root_M=", as.integer(local_control$root_M), "\n",
+    verbose = verbose
+  )
+  build_one <- function(i) {
+    if (isTRUE(verbose)) {
+      cat(sprintf(
+        "Building root scout for local %s (%d/%d)\n",
+        local_names[i],
+        i,
+        length(data_list)
+      ))
+    }
+    .local_atlas_root_scout_atlas(
+      local_id = local_names[i],
+      data_i = data_list[[i]],
+      loglik_fn = loglik_fn,
+      population_model = model,
+      theta_root = theta_root,
+      local_control = local_control,
+      seed = as.integer(seed) + 100003L * i,
+      verbose = isTRUE(trace_verbose)
+    )
+  }
+  root_atlases <- if (as.integer(n_cores) <= 1L || length(idx) <= 1L) {
+    lapply(idx, build_one)
+  } else {
+    parallel::mclapply(idx, build_one, mc.cores = as.integer(min(n_cores, length(idx))))
+  }
+  names(root_atlases) <- local_names
+
+  families <- local_atlas_hyperparameter_families(model)
+  family_hyper <- strsplit(families$hyper_names, ",", fixed = TRUE)
+  rows <- list()
+  local_rows <- list()
+  theta_center <- as.numeric(theta_root[1L, ])
+  names(theta_center) <- model$hyper_names
+  for (local_pos in seq_along(root_atlases)) {
+    atlas <- validate_local_atlas(root_atlases[[local_pos]])
+    root <- atlas$charts[[atlas$root_chart_id]]
+    g <- as.numeric(root$score)
+    names(g) <- model$hyper_names
+    H <- as.matrix(root$curvature)
+    dimnames(H) <- list(model$hyper_names, model$hyper_names)
+    logZ_se <- as.numeric(root$logZ_abs_se)
+    weak_path <- isTRUE(root$diagnostics$weak_path)
+    reliability <- 1 +
+      as.numeric(design_control$scout_logz_se_weight) * max(logZ_se, 0, na.rm = TRUE) +
+      as.numeric(design_control$scout_weak_path_weight) * as.numeric(weak_path)
+    if (!is.finite(reliability) || reliability <= 0) {
+      reliability <- 1
+    }
+    total_risk <- 0
+    for (f in seq_len(nrow(families))) {
+      hyper_names <- family_hyper[[f]]
+      hyper_idx <- match(hyper_names, model$hyper_names)
+      delta <- sweep(theta_cloud[, hyper_idx, drop = FALSE], 2L, theta_center[hyper_idx], "-")
+      Hf <- H[hyper_idx, hyper_idx, drop = FALSE]
+      local_taylor <- as.numeric(delta %*% g[hyper_idx]) +
+        0.5 * rowSums((delta %*% Hf) * delta)
+      variation <- .local_atlas_weighted_sd(local_taylor, theta_weights)
+      risk <- max(variation, 0) * reliability
+      total_risk <- total_risk + risk
+      rows[[length(rows) + 1L]] <- data.frame(
+        local = local_names[local_pos],
+        local_pos = local_pos,
+        family = families$family[f],
+        alpha_name = families$alpha_name[f],
+        hyper_names = paste(hyper_names, collapse = ","),
+        taylor_variation = variation,
+        reliability = reliability,
+        logZ_se = logZ_se,
+        weak_path = weak_path,
+        risk = risk,
+        check.names = FALSE
+      )
+    }
+    local_rows[[length(local_rows) + 1L]] <- data.frame(
+      local = local_names[local_pos],
+      local_pos = local_pos,
+      total_risk = total_risk,
+      logZ_se = logZ_se,
+      weak_path = weak_path,
+      reliability = reliability,
+      check.names = FALSE
+    )
+  }
+  local_family_scores <- do.call(rbind, rows)
+  local_scores <- do.call(rbind, local_rows)
+  family_scores <- stats::aggregate(
+    risk ~ family + alpha_name + hyper_names,
+    data = local_family_scores,
+    FUN = sum
+  )
+  names(family_scores)[names(family_scores) == "risk"] <- "total_risk"
+  family_scores <- family_scores[order(family_scores$total_risk, decreasing = TRUE), , drop = FALSE]
+  max_risk <- max(family_scores$total_risk, na.rm = TRUE)
+  if (!is.finite(max_risk) || max_risk <= 0) {
+    max_risk <- 0
+  }
+  family_scores$relative_risk <- if (max_risk > 0) family_scores$total_risk / max_risk else 0
+  min_families <- max(1L, as.integer(design_control$scout_min_families))
+  max_families <- max(min_families, as.integer(design_control$scout_max_families))
+  eligible <- family_scores$relative_risk >= as.numeric(design_control$scout_relative_threshold)
+  if (sum(eligible) < min_families) {
+    eligible[seq_len(min(min_families, nrow(family_scores)))] <- TRUE
+  }
+  selected_idx <- which(eligible)
+  selected_idx <- selected_idx[seq_len(min(length(selected_idx), max_families))]
+  family_scores$selected <- seq_len(nrow(family_scores)) %in% selected_idx
+  selected_families <- family_scores$family[selected_idx]
+  selected_hyper_names <- unlist(strsplit(family_scores$hyper_names[selected_idx], ",", fixed = TRUE), use.names = FALSE)
+  selected_hyper_names <- unique(selected_hyper_names)
+
+  local_selected <- local_family_scores[local_family_scores$family %in% selected_families, , drop = FALSE]
+  selected_local_risk <- stats::aggregate(risk ~ local + local_pos, data = local_selected, FUN = sum)
+  names(selected_local_risk)[names(selected_local_risk) == "risk"] <- "selected_risk"
+  local_scores <- merge(local_scores, selected_local_risk, by = c("local", "local_pos"), all.x = TRUE, sort = FALSE)
+  local_scores$selected_risk[!is.finite(local_scores$selected_risk)] <- 0
+
+  n_locals <- nrow(local_scores)
+  max_anchors <- max(1L, as.integer(design_control$max_anchors))
+  min_budget <- max(1L, min(max_anchors, as.integer(design_control$scout_min_anchors_per_local)))
+  mean_budget <- max(min_budget, min(max_anchors, as.integer(design_control$scout_mean_anchors_per_local)))
+  max_budget <- as.integer(design_control$scout_max_anchors_per_local %||% max_anchors)
+  max_budget <- max(min_budget, min(max_anchors, max_budget))
+  total_budget <- max(n_locals * min_budget, min(n_locals * max_budget, n_locals * mean_budget))
+  extra_total <- max(0L, total_budget - n_locals * min_budget)
+  risk_weight <- local_scores$selected_risk
+  if (!any(is.finite(risk_weight)) || sum(risk_weight, na.rm = TRUE) <= 0) {
+    risk_weight <- rep(1, n_locals)
+  }
+  risk_weight[!is.finite(risk_weight) | risk_weight < 0] <- 0
+  risk_weight <- risk_weight / sum(risk_weight)
+  extra <- floor(extra_total * risk_weight)
+  remainder <- extra_total - sum(extra)
+  if (remainder > 0L) {
+    add_order <- order(extra_total * risk_weight - extra, decreasing = TRUE)
+    extra[add_order[seq_len(remainder)]] <- extra[add_order[seq_len(remainder)]] + 1L
+  }
+  budget <- pmin(max_budget, min_budget + extra)
+  while (sum(budget) < total_budget && any(budget < max_budget)) {
+    add_order <- order(risk_weight, decreasing = TRUE)
+    for (j in add_order) {
+      if (budget[j] < max_budget) {
+        budget[j] <- budget[j] + 1L
+        break
+      }
+    }
+  }
+  local_anchor_budgets <- data.frame(
+    local = local_scores$local,
+    local_pos = local_scores$local_pos,
+    selected_risk = local_scores$selected_risk,
+    anchor_budget = as.integer(budget),
+    check.names = FALSE
+  )
+
+  candidate_pool_size <- as.integer(design_control$scout_candidate_pool_size %||%
+    max(max_anchors, 1L + length(selected_hyper_names) * length(design_control$tail_probs) * 2L))
+  candidate_theta <- .local_atlas_design_from_cloud(
+    theta_cloud = theta_cloud,
+    population_model = model,
+    theta_root = theta_root,
+    max_anchors = candidate_pool_size,
+    axis_count = length(selected_hyper_names),
+    tail_probs = design_control$tail_probs,
+    focus_hyper_names = selected_hyper_names,
+    include_axis_profiles = TRUE,
+    include_cloud_profiles = TRUE,
+    design_method = "hybrid",
+    distance_metric = design_control$distance_metric
+  )
+
+  selected_idx_hyper <- match(selected_hyper_names, model$hyper_names)
+  local_theta_designs <- vector("list", n_locals)
+  names(local_theta_designs) <- local_scores$local
+  for (local_pos in seq_len(n_locals)) {
+    atlas <- root_atlases[[local_pos]]
+    root <- atlas$charts[[atlas$root_chart_id]]
+    g <- as.numeric(root$score)
+    names(g) <- model$hyper_names
+    H <- as.matrix(root$curvature)
+    dimnames(H) <- list(model$hyper_names, model$hyper_names)
+    delta <- sweep(candidate_theta[, selected_idx_hyper, drop = FALSE], 2L, theta_center[selected_idx_hyper], "-")
+    Hs <- H[selected_idx_hyper, selected_idx_hyper, drop = FALSE]
+    score <- abs(as.numeric(delta %*% g[selected_idx_hyper]) +
+      0.5 * rowSums((delta %*% Hs) * delta))
+    is_root <- rowSums(sweep(candidate_theta, 2L, theta_root[1L, ], "-")^2) <= 1e-20
+    score[is_root] <- Inf
+    order_idx <- order(score, decreasing = TRUE)
+    take <- order_idx[seq_len(min(length(order_idx), local_anchor_budgets$anchor_budget[local_pos]))]
+    design <- .local_atlas_unique_theta(candidate_theta[take, , drop = FALSE], model)
+    if (!any(rowSums(sweep(design, 2L, theta_root[1L, ], "-")^2) <= 1e-20)) {
+      design <- .local_atlas_unique_theta(rbind(theta_root, design), model)
+      design <- design[seq_len(min(nrow(design), local_anchor_budgets$anchor_budget[local_pos])), , drop = FALSE]
+    }
+    local_theta_designs[[local_pos]] <- design
+  }
+
+  new_chart_design_plan(
+    theta_root = theta_root,
+    theta_cloud = theta_cloud,
+    theta_weights = theta_weights,
+    families = families,
+    family_scores = family_scores,
+    local_scores = local_scores,
+    local_family_scores = local_family_scores,
+    selected_families = selected_families,
+    selected_hyper_names = selected_hyper_names,
+    local_anchor_budgets = local_anchor_budgets,
+    candidate_theta = candidate_theta,
+    local_theta_designs = local_theta_designs,
+    root_atlases = root_atlases,
+    diagnostics = list(
+      design_method = "adaptive_scout",
+      distance_metric = design_control$distance_metric,
+      tail_probs = design_control$tail_probs,
+      min_families = min_families,
+      max_families = max_families,
+      relative_threshold = as.numeric(design_control$scout_relative_threshold),
+      min_anchor_budget = min_budget,
+      mean_anchor_budget = mean_budget,
+      max_anchor_budget = max_budget,
+      candidate_pool_size = nrow(candidate_theta)
+    ),
+    population_model = model
+  )
+}
+
 .local_atlas_nearest_design_radius <- function(theta_cloud,
                                                theta_design,
                                                population_model,
@@ -3976,8 +4951,31 @@ local_atlas_select_theta_profiles <- function(theta,
 
   success <- identical(atlas$charts[[target_id]]$status, "active")
   if (!isTRUE(success)) {
-    atlas <- .local_atlas_quarantine_chart(atlas, target_id, "no_certified_path_to_root")
-    last_reason <- last_reason %||% "no_certified_path_to_root"
+    if (isTRUE(local_control$direct_anchor_admission) &&
+        .local_chart_direct_smc_certifiable(
+          atlas$charts[[target_id]],
+          min_final_ess_frac = local_control$direct_anchor_min_final_ess_frac,
+          min_path_ess_frac = local_control$direct_anchor_min_path_ess_frac,
+          min_accept_rate = local_control$direct_anchor_min_accept_rate,
+          max_logZ_se = local_control$direct_anchor_max_logZ_se
+        )) {
+      chart <- atlas$charts[[target_id]]
+      chart$status <- "active"
+      chart$diagnostics$status_reason <- "certified_by_direct_anchor_smc"
+      chart$diagnostics$direct_observation_role <- "anchor"
+      chart <- .local_chart_set_normalizer_certification(
+        chart,
+        certified = TRUE,
+        method = "direct_smc_path",
+        reason = "direct_calibration_anchor_admitted_without_certified_edge"
+      )
+      atlas$charts[[target_id]] <- validate_local_chart(chart, model)
+      success <- TRUE
+      last_reason <- "certified_by_direct_anchor_smc"
+    } else {
+      atlas <- .local_atlas_quarantine_chart(atlas, target_id, "no_certified_path_to_root")
+      last_reason <- last_reason %||% "no_certified_path_to_root"
+    }
   }
   atlas <- solve_atlas_normalizers(atlas, require_connected = TRUE)
   list(
@@ -4189,54 +5187,24 @@ local_atlas_select_theta_profiles <- function(theta,
   )
 }
 
-build_local_atlas <- function(local_id,
-                              data_i,
-                              loglik_fn,
-                              population_model,
-                              theta_design,
-                              theta_root = theta_design[1L, , drop = FALSE],
-                              local_control = list(),
-                              edge_control = list(),
-                              n_cores = 1L,
-                              seed = 123L,
-                              verbose = FALSE) {
+.local_atlas_expand_design <- function(atlas,
+                                       local_id,
+                                       data_i,
+                                       loglik_fn,
+                                       population_model,
+                                       theta_design,
+                                       theta_root,
+                                       local_control,
+                                       edge_control,
+                                       seed,
+                                       verbose = FALSE) {
   model <- normalize_population_model(population_model)
-  theta_design <- .local_atlas_unique_theta(theta_design, model)
+  atlas <- validate_local_atlas(atlas)
+  theta_design <- .local_atlas_unique_theta(rbind(theta_root, theta_design), model)
   theta_root <- .local_chart_align_theta_one(theta_root, model)
-  local_control <- .local_atlas_merge_control(local_control, .local_atlas_default_local_control())
-  edge_control <- .local_atlas_merge_control(edge_control, .local_atlas_default_edge_control())
-  local_control$n_cores_per_local <- min(as.integer(local_control$n_cores_per_local), as.integer(n_cores))
-
-  root <- build_local_root_chart(
-    local_id = local_id,
-    theta_anchor = theta_root,
-    data_i = data_i,
-    loglik_fn = loglik_fn,
-    population_model = model,
-    chart_id = "root",
-    M = as.integer(local_control$root_M),
-    target_cess = local_control$target_cess,
-    resample_threshold = local_control$resample_threshold,
-    n_mcmc_moves = as.integer(local_control$n_mcmc_moves),
-    rw_scale = local_control$rw_scale,
-    G_mix = as.integer(local_control$G_mix),
-    da_enable = isTRUE(local_control$da_enable),
-    refit_every = as.integer(local_control$refit_every),
-    max_steps = as.integer(local_control$max_steps),
-    deterministic_resampling = isTRUE(local_control$deterministic_resampling),
-    n_cores = as.integer(local_control$n_cores_per_local),
-    seed = as.integer(seed),
-    verbose = isTRUE(verbose),
-    confirm = local_control$root_confirm,
-    confirmation_M = as.integer(local_control$root_confirmation_M %||% max(100L, ceiling(as.integer(local_control$root_M) / 2L))),
-    confirmation_abs_tol = local_control$root_confirmation_abs_tol
-  )
-  atlas <- solve_atlas_normalizers(new_local_atlas(
-    local_id = local_id,
-    root_chart_id = "root",
-    charts = list(root),
-    edges = list()
-  ))
+  if (!identical(as.character(atlas$local_id), as.character(local_id))) {
+    stop("root atlas local_id does not match requested local_id.")
+  }
 
   target_rows <- seq_len(nrow(theta_design))
   is_root <- apply(theta_design, 1L, function(x) isTRUE(all.equal(as.numeric(x), as.numeric(theta_root[1L, ]))))
@@ -4348,6 +5316,502 @@ build_local_atlas <- function(local_id,
   validate_local_atlas(atlas)
 }
 
+build_local_atlas <- function(local_id,
+                              data_i,
+                              loglik_fn,
+                              population_model,
+                              theta_design,
+                              theta_root = theta_design[1L, , drop = FALSE],
+                              local_control = list(),
+                              edge_control = list(),
+                              n_cores = 1L,
+                              seed = 123L,
+                              verbose = FALSE) {
+  model <- normalize_population_model(population_model)
+  theta_design <- .local_atlas_unique_theta(theta_design, model)
+  theta_root <- .local_chart_align_theta_one(theta_root, model)
+  local_control <- .local_atlas_merge_control(local_control, .local_atlas_default_local_control())
+  edge_control <- .local_atlas_merge_control(edge_control, .local_atlas_default_edge_control())
+  local_control$n_cores_per_local <- min(as.integer(local_control$n_cores_per_local), as.integer(n_cores))
+
+  root <- build_local_root_chart(
+    local_id = local_id,
+    theta_anchor = theta_root,
+    data_i = data_i,
+    loglik_fn = loglik_fn,
+    population_model = model,
+    chart_id = "root",
+    M = as.integer(local_control$root_M),
+    target_cess = local_control$target_cess,
+    resample_threshold = local_control$resample_threshold,
+    n_mcmc_moves = as.integer(local_control$n_mcmc_moves),
+    rw_scale = local_control$rw_scale,
+    G_mix = as.integer(local_control$G_mix),
+    da_enable = isTRUE(local_control$da_enable),
+    refit_every = as.integer(local_control$refit_every),
+    max_steps = as.integer(local_control$max_steps),
+    deterministic_resampling = isTRUE(local_control$deterministic_resampling),
+    n_cores = as.integer(local_control$n_cores_per_local),
+    seed = as.integer(seed),
+    verbose = isTRUE(verbose),
+    confirm = local_control$root_confirm,
+    confirmation_M = as.integer(local_control$root_confirmation_M %||% max(100L, ceiling(as.integer(local_control$root_M) / 2L))),
+    confirmation_abs_tol = local_control$root_confirmation_abs_tol
+  )
+  atlas <- solve_atlas_normalizers(new_local_atlas(
+    local_id = local_id,
+    root_chart_id = "root",
+    charts = list(root),
+    edges = list()
+  ))
+
+  .local_atlas_expand_design(
+    atlas = atlas,
+    local_id = local_id,
+    data_i = data_i,
+    loglik_fn = loglik_fn,
+    population_model = model,
+    theta_design = theta_design,
+    theta_root = theta_root,
+    local_control = local_control,
+    edge_control = edge_control,
+    seed = as.integer(seed),
+    verbose = isTRUE(verbose)
+  )
+}
+
+build_local_atlas_from_root <- function(root_atlas,
+                                        data_i,
+                                        loglik_fn,
+                                        population_model,
+                                        theta_design,
+                                        theta_root = NULL,
+                                        local_control = list(),
+                                        edge_control = list(),
+                                        n_cores = 1L,
+                                        seed = 123L,
+                                        verbose = FALSE) {
+  model <- normalize_population_model(population_model)
+  root_atlas <- validate_local_atlas(root_atlas)
+  theta_root <- theta_root %||% root_atlas$charts[[root_atlas$root_chart_id]]$theta_anchor
+  theta_root <- .local_chart_align_theta_one(theta_root, model)
+  local_control <- .local_atlas_merge_control(local_control, .local_atlas_default_local_control())
+  edge_control <- .local_atlas_merge_control(edge_control, .local_atlas_default_edge_control())
+  local_control$n_cores_per_local <- min(as.integer(local_control$n_cores_per_local), as.integer(n_cores))
+
+  .local_atlas_expand_design(
+    atlas = root_atlas,
+    local_id = root_atlas$local_id,
+    data_i = data_i,
+    loglik_fn = loglik_fn,
+    population_model = model,
+    theta_design = theta_design,
+    theta_root = theta_root,
+    local_control = local_control,
+    edge_control = edge_control,
+    seed = as.integer(seed),
+    verbose = isTRUE(verbose)
+  )
+}
+
+local_atlas_pre_outer_certify <- function(factor_set,
+                                          data_list,
+                                          loglik_fn,
+                                          initial_proposal,
+                                          local_control = list(),
+                                          edge_control = list(),
+                                          calibration_control = list(),
+                                          outer_control = list(),
+                                          design_control = list(),
+                                          calibration_history = list(),
+                                          n_cores = 1L,
+                                          seed = 123L,
+                                          outer_seed = as.integer(seed) + 900001L,
+                                          verbose = TRUE,
+                                          trace_verbose = FALSE,
+                                          checkpoint_callback = NULL) {
+  factor_set <- validate_local_atlas_factor_set(factor_set)
+  if (!is.list(data_list) || length(data_list) < length(factor_set$atlases)) {
+    stop("data_list must contain one entry per atlas.")
+  }
+  if (!is.function(loglik_fn)) {
+    stop("loglik_fn must be a function.")
+  }
+  if (is.null(initial_proposal)) {
+    stop("initial_proposal is required for pre-outer certification.")
+  }
+  local_control <- .local_atlas_merge_control(local_control, .local_atlas_default_local_control())
+  edge_control <- .local_atlas_merge_control(edge_control, .local_atlas_default_edge_control())
+  calibration_control <- .local_atlas_merge_control(calibration_control, list(
+    M = as.integer(local_control$candidate_M %||% 500L),
+    target_cess = local_control$target_cess %||% 0.9,
+    n_mcmc_moves = as.integer(local_control$n_mcmc_moves %||% 2L),
+    max_steps = as.integer(local_control$max_steps %||% 128L),
+    max_updates = 12L,
+    abs_delta_threshold = 0.75,
+    z_threshold = 4,
+    candidate_pool_multiplier = 3L,
+    confirmation_reps = 0L,
+    confirmation_M = as.integer(local_control$candidate_M %||% 500L),
+    confirmation_abs_delta_threshold = 0.75,
+    confirmation_z_threshold = 4,
+    confirmation_max_sd = 1.5,
+    adaptive_confirmation_reps = 2L,
+    replicate_bootstrap_B = 200L,
+    max_direct_graph_z = 3,
+    max_direct_graph_chart_shift = 0.35,
+    max_direct_graph_existing_shift = 0.15,
+    adaptive_replicate_weight_multiplier = 3,
+    adaptive_replicate_min_theta_weight = 0,
+    adaptive_replicate_max_graph_z = 3,
+    adaptive_replicate_graph_shift = 0.25,
+    pre_outer_rounds = 1L,
+    pre_outer_audit_n = NULL,
+    pre_outer_max_points = 6L,
+    pre_outer_max_updates = 16L,
+    pre_outer_max_fresh_probes = 64L,
+    max_fresh_probes = 64L
+  ))
+  outer_control <- .local_atlas_merge_control(outer_control, list(N = 1000L))
+  if (is.data.frame(calibration_history)) {
+    calibration_history <- list(calibration_history)
+  }
+  if (!is.list(calibration_history)) {
+    calibration_history <- list()
+  }
+
+  model <- factor_set$population_model
+  max_pre_outer_rounds <- as.integer(calibration_control$pre_outer_rounds %||% 0L)
+  for (pre_round in seq_len(max_pre_outer_rounds)) {
+    pre_start <- Sys.time()
+    pre_audit_n <- as.integer(calibration_control$pre_outer_audit_n %||%
+      max(as.integer(outer_control$N), as.integer(design_control$refine_audit_n %||% outer_control$N)))
+    .local_atlas_log("pre-outer audit round ", pre_round, ": theta=", pre_audit_n, "\n", verbose = verbose)
+    audit_theta <- theta_proposal_sample(
+      initial_proposal,
+      n = pre_audit_n,
+      seed = as.integer(seed) + 39000017L * pre_round
+    )
+    outer_init_theta <- theta_proposal_sample(
+      initial_proposal,
+      n = as.integer(outer_control$N),
+      seed = as.integer(outer_seed)
+    )
+    audit_theta <- .local_atlas_unique_theta(rbind(outer_init_theta, audit_theta), model)
+    protected_theta_rows <- seq_len(min(nrow(outer_init_theta), nrow(audit_theta)))
+    audit_parts <- .local_atlas_factor_set_by_local(factor_set, audit_theta, n_cores = as.integer(n_cores))
+    bad <- .local_atlas_factor_set_uncertified(audit_parts)
+    if (!nrow(bad)) {
+      .local_atlas_log("pre-outer audit round ", pre_round, ": no uncertified pairs\n", verbose = verbose)
+      break
+    }
+
+    theta_counts <- sort(table(bad$theta_row), decreasing = TRUE)
+    local_counts <- table(bad$local)
+    bad$local_pos <- match(as.character(bad$local), names(factor_set$atlases))
+    bad$theta_bad_count <- as.numeric(theta_counts[match(as.character(bad$theta_row), names(theta_counts))])
+    bad$local_bad_count <- as.numeric(local_counts[match(as.character(bad$local), names(local_counts))])
+    bad$priority <- bad$theta_bad_count + 0.25 * bad$local_bad_count
+    bad <- bad[order(bad$priority, decreasing = TRUE), , drop = FALSE]
+
+    max_pre_theta <- as.integer(calibration_control$pre_outer_max_points)
+    max_pre_updates <- as.integer(calibration_control$pre_outer_max_updates)
+    counted_rows <- as.integer(names(theta_counts))
+    protected_bad_rows <- intersect(protected_theta_rows, counted_rows)
+    max_pre_theta <- max(max_pre_theta, length(protected_bad_rows))
+    keep_rows <- unique(c(
+      protected_bad_rows,
+      setdiff(counted_rows, protected_bad_rows)
+    ))
+    keep_rows <- keep_rows[seq_len(min(length(keep_rows), max_pre_theta))]
+    eligible_bad <- bad[bad$theta_row %in% keep_rows, , drop = FALSE]
+    if (!nrow(eligible_bad)) {
+      eligible_bad <- bad
+    }
+    eligible_bad$protected_outer_initial <- eligible_bad$theta_row %in% protected_bad_rows
+    selected_idx <- integer()
+    selected_key <- character()
+    add_selected <- function(idx) {
+      key <- paste(eligible_bad$local_pos[idx], eligible_bad$theta_row[idx], sep = ":")
+      take <- !key %in% selected_key
+      if (any(take)) {
+        selected_idx <<- c(selected_idx, idx[take])
+        selected_key <<- c(selected_key, key[take])
+      }
+    }
+    for (theta_row in protected_bad_rows) {
+      theta_idx <- which(eligible_bad$theta_row == theta_row)
+      if (!length(theta_idx)) next
+      theta_idx <- theta_idx[order(
+        eligible_bad$local_bad_count[theta_idx],
+        eligible_bad$priority[theta_idx],
+        decreasing = TRUE
+      )]
+      for (idx_one in theta_idx) {
+        add_selected(idx_one)
+        if (length(selected_idx) >= max_pre_updates) break
+      }
+      if (length(selected_idx) >= max_pre_updates) break
+    }
+    for (loc in names(sort(local_counts, decreasing = TRUE))) {
+      if (length(selected_idx) >= max_pre_updates) break
+      loc_idx <- which(eligible_bad$local == loc)
+      if (!length(loc_idx)) next
+      loc_idx <- loc_idx[order(
+        eligible_bad$theta_bad_count[loc_idx],
+        eligible_bad$priority[loc_idx],
+        decreasing = TRUE
+      )]
+      add_selected(loc_idx[1L])
+      if (length(selected_idx) >= max_pre_updates) break
+    }
+    if (length(selected_idx) < max_pre_updates) {
+      for (theta_row in keep_rows) {
+        theta_idx <- which(eligible_bad$theta_row == theta_row)
+        if (!length(theta_idx)) next
+        theta_idx <- theta_idx[order(
+          eligible_bad$local_bad_count[theta_idx],
+          eligible_bad$priority[theta_idx],
+          decreasing = TRUE
+        )]
+        for (idx_one in theta_idx) {
+          add_selected(idx_one)
+          if (length(selected_idx) >= max_pre_updates) break
+        }
+        if (length(selected_idx) >= max_pre_updates) break
+      }
+    }
+    if (length(selected_idx) < max_pre_updates) {
+      for (idx_one in seq_len(nrow(eligible_bad))) {
+        add_selected(idx_one)
+        if (length(selected_idx) >= max_pre_updates) break
+      }
+    }
+    selected_bad <- eligible_bad[selected_idx[seq_len(min(length(selected_idx), max_pre_updates))], , drop = FALSE]
+    .local_atlas_log(
+      "pre-outer audit round ", pre_round,
+      ": uncertified_pairs=", nrow(bad),
+      " selected_pairs=", nrow(selected_bad),
+      " fresh_cap=", as.integer(calibration_control$pre_outer_max_fresh_probes %||%
+        calibration_control$max_fresh_probes %||% 64L),
+      " selected_theta=", length(unique(selected_bad$theta_row)),
+      " selected_locals=", length(unique(selected_bad$local_pos)), "\n",
+      verbose = verbose
+    )
+
+    repair_weights <- numeric(nrow(audit_theta))
+    repair_weights[as.integer(names(theta_counts))] <- as.numeric(theta_counts)
+    repair_weights <- .local_chart_normalize_weights(repair_weights, length(repair_weights))
+    repair_locals <- unique(selected_bad$local_pos)
+    calibration <- local_atlas_calibrate_posterior_regions(
+      factor_set = factor_set,
+      theta = audit_theta,
+      data_list = data_list,
+      loglik_fn = loglik_fn,
+      theta_weights = repair_weights,
+      candidate_pairs = selected_bad[, c("local_pos", "theta_row"), drop = FALSE],
+      local_ids = repair_locals,
+      M = as.integer(calibration_control$M),
+      target_cess = calibration_control$target_cess,
+      n_mcmc_moves = as.integer(calibration_control$n_mcmc_moves),
+      max_steps = as.integer(calibration_control$max_steps),
+      max_updates = as.integer(calibration_control$pre_outer_max_updates),
+      abs_delta_threshold = calibration_control$abs_delta_threshold,
+      z_threshold = calibration_control$z_threshold,
+      candidate_pool_multiplier = as.integer(calibration_control$candidate_pool_multiplier),
+      confirmation_reps = as.integer(calibration_control$confirmation_reps),
+      confirmation_M = as.integer(calibration_control$confirmation_M),
+      confirmation_abs_delta_threshold = calibration_control$confirmation_abs_delta_threshold,
+      confirmation_z_threshold = calibration_control$confirmation_z_threshold,
+      confirmation_max_sd = calibration_control$confirmation_max_sd,
+      adaptive_confirmation_reps = as.integer(calibration_control$adaptive_confirmation_reps),
+      replicate_bootstrap_B = as.integer(calibration_control$replicate_bootstrap_B),
+      max_fresh_probes = as.integer(calibration_control$pre_outer_max_fresh_probes %||%
+        calibration_control$max_fresh_probes %||% 64L),
+      max_direct_graph_z = calibration_control$max_direct_graph_z,
+      max_direct_graph_chart_shift = calibration_control$max_direct_graph_chart_shift,
+      max_direct_graph_existing_shift = calibration_control$max_direct_graph_existing_shift,
+      adaptive_replicate_weight_multiplier = calibration_control$adaptive_replicate_weight_multiplier,
+      adaptive_replicate_min_theta_weight = calibration_control$adaptive_replicate_min_theta_weight,
+      adaptive_replicate_max_graph_z = calibration_control$adaptive_replicate_max_graph_z,
+      adaptive_replicate_graph_shift = calibration_control$adaptive_replicate_graph_shift,
+      local_control = local_control,
+      edge_control = edge_control,
+      n_cores = as.integer(n_cores),
+      seed = as.integer(seed) + 49000019L * pre_round,
+      verbose = isTRUE(trace_verbose)
+    )
+    calibration_history[[length(calibration_history) + 1L]] <- data.frame(
+      calibration_phase = "pre_outer",
+      calibration_round = pre_round,
+      n_audit_theta = nrow(audit_theta),
+      n_uncertified_pairs = nrow(bad),
+      calibration$probes,
+      check.names = FALSE
+    )
+    factor_set <- calibration$factor_set
+    .local_atlas_log(
+      "pre-outer repair round ", pre_round,
+      " finished in ", round(as.numeric(difftime(Sys.time(), pre_start, units = "mins")), 3),
+      " min | activated=", calibration$n_activated,
+      " selected=", calibration$n_selected, "\n",
+      verbose = verbose
+    )
+    if (is.function(checkpoint_callback)) {
+      checkpoint_callback(
+        stage = paste0("pre_outer_round_", pre_round),
+        factor_set = factor_set,
+        atlases = factor_set$atlases,
+        calibration_history = calibration_history
+      )
+    }
+    if (!isTRUE(calibration$n_activated > 0L)) {
+      break
+    }
+  }
+
+  structure(
+    list(
+      factor_set = factor_set,
+      atlases = factor_set$atlases,
+      calibration_history = calibration_history,
+      calibration_history_table = .local_atlas_rbind_fill(calibration_history)
+    ),
+    class = "local_atlas_pre_outer_certification"
+  )
+}
+
+local_atlas_certify_theta_cloud <- function(factor_set,
+                                            theta,
+                                            data_list,
+                                            loglik_fn,
+                                            local_control = list(),
+                                            edge_control = list(),
+                                            calibration_control = list(),
+                                            theta_weights = NULL,
+                                            max_rounds = 2L,
+                                            max_updates = calibration_control$pre_outer_max_updates %||% calibration_control$max_updates %||% 16L,
+                                            max_fresh_probes = calibration_control$initial_certification_max_fresh_probes %||%
+                                              calibration_control$max_fresh_probes %||%
+                                              min(as.integer(max_updates), 64L),
+                                            n_cores = 1L,
+                                            seed = 123L,
+                                            verbose = TRUE,
+                                            trace_verbose = FALSE) {
+  factor_set <- validate_local_atlas_factor_set(factor_set)
+  model <- factor_set$population_model
+  theta <- .as_hyper_matrix(theta, model$hyper_names, model$hyper_dim)
+  theta_weights <- .local_chart_normalize_weights(theta_weights, nrow(theta))
+  local_control <- .local_atlas_merge_control(local_control, .local_atlas_default_local_control())
+  edge_control <- .local_atlas_merge_control(edge_control, .local_atlas_default_edge_control())
+  calibration_control <- .local_atlas_merge_control(calibration_control, list(
+    M = as.integer(local_control$candidate_M %||% 500L),
+    target_cess = local_control$target_cess %||% 0.9,
+    n_mcmc_moves = as.integer(local_control$n_mcmc_moves %||% 2L),
+    max_steps = as.integer(local_control$max_steps %||% 128L),
+    abs_delta_threshold = 0.75,
+    z_threshold = 4,
+    candidate_pool_multiplier = 1L,
+    confirmation_reps = 0L,
+    confirmation_M = as.integer(local_control$candidate_M %||% 500L),
+    confirmation_abs_delta_threshold = 0.75,
+    confirmation_z_threshold = 4,
+    confirmation_max_sd = 1.5,
+    adaptive_confirmation_reps = 2L,
+    replicate_bootstrap_B = 200L,
+    max_direct_graph_z = 3,
+    max_direct_graph_chart_shift = 0.35,
+    max_direct_graph_existing_shift = 0.15,
+    adaptive_replicate_weight_multiplier = 3,
+    adaptive_replicate_min_theta_weight = 0,
+    adaptive_replicate_max_graph_z = 3,
+    adaptive_replicate_graph_shift = 0.25
+  ))
+
+  history <- list()
+  bad <- data.frame()
+  for (round_id in seq_len(as.integer(max_rounds))) {
+    parts <- .local_atlas_factor_set_by_local(factor_set, theta, n_cores = as.integer(n_cores))
+    bad <- .local_atlas_factor_set_uncertified(parts)
+    if (!nrow(bad)) {
+      .local_atlas_log("theta-cloud certification round ", round_id, ": no uncertified pairs\n", verbose = verbose)
+      break
+    }
+    bad$local_pos <- match(as.character(bad$local), names(factor_set$atlases))
+    bad$theta_weight <- theta_weights[bad$theta_row]
+    bad <- bad[order(-bad$theta_weight, bad$local_pos, bad$theta_row), , drop = FALSE]
+    selected_bad <- bad[seq_len(min(nrow(bad), as.integer(max_updates))), , drop = FALSE]
+    .local_atlas_log(
+      "theta-cloud certification round ", round_id,
+      ": uncertified_pairs=", nrow(bad),
+      " selected_pairs=", nrow(selected_bad),
+      " fresh_cap=", as.integer(max_fresh_probes), "\n",
+      verbose = verbose
+    )
+    calibration <- local_atlas_calibrate_posterior_regions(
+      factor_set = factor_set,
+      theta = theta,
+      data_list = data_list,
+      loglik_fn = loglik_fn,
+      theta_weights = theta_weights,
+      candidate_pairs = selected_bad[, c("local_pos", "theta_row"), drop = FALSE],
+      local_ids = unique(selected_bad$local_pos),
+      M = as.integer(calibration_control$M),
+      target_cess = calibration_control$target_cess,
+      n_mcmc_moves = as.integer(calibration_control$n_mcmc_moves),
+      max_steps = as.integer(calibration_control$max_steps),
+      max_updates = as.integer(max_updates),
+      abs_delta_threshold = calibration_control$abs_delta_threshold,
+      z_threshold = calibration_control$z_threshold,
+      candidate_pool_multiplier = as.integer(calibration_control$candidate_pool_multiplier),
+      confirmation_reps = as.integer(calibration_control$confirmation_reps),
+      confirmation_M = as.integer(calibration_control$confirmation_M),
+      confirmation_abs_delta_threshold = calibration_control$confirmation_abs_delta_threshold,
+      confirmation_z_threshold = calibration_control$confirmation_z_threshold,
+      confirmation_max_sd = calibration_control$confirmation_max_sd,
+      adaptive_confirmation_reps = as.integer(calibration_control$adaptive_confirmation_reps),
+      replicate_bootstrap_B = as.integer(calibration_control$replicate_bootstrap_B),
+      max_fresh_probes = as.integer(max_fresh_probes),
+      max_direct_graph_z = calibration_control$max_direct_graph_z,
+      max_direct_graph_chart_shift = calibration_control$max_direct_graph_chart_shift,
+      max_direct_graph_existing_shift = calibration_control$max_direct_graph_existing_shift,
+      adaptive_replicate_weight_multiplier = calibration_control$adaptive_replicate_weight_multiplier,
+      adaptive_replicate_min_theta_weight = calibration_control$adaptive_replicate_min_theta_weight,
+      adaptive_replicate_max_graph_z = calibration_control$adaptive_replicate_max_graph_z,
+      adaptive_replicate_graph_shift = calibration_control$adaptive_replicate_graph_shift,
+      local_control = local_control,
+      edge_control = edge_control,
+      n_cores = as.integer(n_cores),
+      seed = as.integer(seed) + 6100003L * round_id,
+      verbose = isTRUE(trace_verbose)
+    )
+    history[[length(history) + 1L]] <- data.frame(
+      calibration_phase = "theta_cloud",
+      calibration_round = round_id,
+      n_theta = nrow(theta),
+      n_uncertified_pairs = nrow(bad),
+      calibration$probes,
+      check.names = FALSE
+    )
+    factor_set <- calibration$factor_set
+    if (!isTRUE(calibration$n_activated > 0L)) {
+      break
+    }
+  }
+  parts <- .local_atlas_factor_set_by_local(factor_set, theta, n_cores = as.integer(n_cores))
+  bad <- .local_atlas_factor_set_uncertified(parts)
+  structure(
+    list(
+      factor_set = factor_set,
+      atlases = factor_set$atlases,
+      calibration_history = history,
+      uncertified = bad,
+      certified = !nrow(bad)
+    ),
+    class = "local_atlas_theta_cloud_certification"
+  )
+}
+
 fit_chart_atlas_population_model <- function(data_list,
                                              loglik_fn,
                                              population_model,
@@ -4365,6 +5829,7 @@ fit_chart_atlas_population_model <- function(data_list,
                                              n_cores = 1L,
                                              seed = 123L,
                                              verbose = TRUE,
+                                             trace_verbose = verbose,
                                              checkpoint_file = NULL,
                                              resume_checkpoint = FALSE) {
   model <- normalize_population_model(population_model)
@@ -4374,6 +5839,8 @@ fit_chart_atlas_population_model <- function(data_list,
   if (!is.function(loglik_fn)) {
     stop("loglik_fn must be a function.")
   }
+  design_control_input <- design_control
+  evaluator_control_input <- evaluator_control
   design_control <- .local_atlas_merge_control(design_control, list(
     n_cloud = 4000L,
     max_anchors = 9L,
@@ -4400,6 +5867,18 @@ fit_chart_atlas_population_model <- function(data_list,
     refine_particle_gap_threshold = NULL,
     refine_psis_threshold = NULL,
     refine_min_score = 0,
+    checkpoint_local_batch_size = Inf,
+    scout_only = FALSE,
+    scout_min_families = 1L,
+    scout_max_families = 4L,
+    scout_relative_threshold = 0.25,
+    scout_logz_se_weight = 1,
+    scout_weak_path_weight = 1,
+    scout_min_anchors_per_local = 3L,
+    scout_mean_anchors_per_local = 6L,
+    scout_max_anchors_per_local = NULL,
+    scout_candidate_pool_size = NULL,
+    stop_after_atlas_build = FALSE,
     strict_design_coverage = TRUE
   ))
   proposal_control <- .local_atlas_merge_control(proposal_control, list(
@@ -4449,12 +5928,21 @@ fit_chart_atlas_population_model <- function(data_list,
     adaptive_replicate_min_theta_weight = 0,
     adaptive_replicate_max_graph_z = 3,
     adaptive_replicate_graph_shift = 0.25,
+    max_fresh_probes = 64L,
     pre_outer_rounds = 1L,
     pre_outer_audit_n = NULL,
     pre_outer_max_points = 6L,
     pre_outer_max_updates = 16L,
-    rerun_outer = TRUE
+    pre_outer_max_fresh_probes = 64L,
+    initial_certification_rounds = 2L,
+    initial_certification_max_updates = NULL,
+    initial_certification_max_fresh_probes = 64L,
+    initial_certification_stop_on_uncertified = TRUE
   ))
+  calibration_control$initial_certification_max_updates <- as.integer(
+    calibration_control$initial_certification_max_updates %||%
+      calibration_control$pre_outer_max_updates
+  )
 
   theta_root <- .local_chart_align_theta_one(theta_root %||% .local_atlas_default_theta(model, seed = seed), model)
   if (is.null(theta_cloud)) {
@@ -4467,19 +5955,24 @@ fit_chart_atlas_population_model <- function(data_list,
   theta_cloud <- .as_hyper_matrix(theta_cloud, model$hyper_names, model$hyper_dim)
   theta_cloud <- rbind(theta_root, theta_cloud)
   if (is.null(theta_design)) {
-    theta_design <- .local_atlas_design_from_cloud(
-      theta_cloud = theta_cloud,
-      population_model = model,
-      theta_root = theta_root,
-      max_anchors = as.integer(design_control$max_anchors),
-      axis_count = as.integer(design_control$axis_count),
-      tail_probs = design_control$tail_probs,
-      focus_hyper_names = design_control$focus_hyper_names,
-      include_axis_profiles = isTRUE(design_control$include_axis_profiles),
-      include_cloud_profiles = isTRUE(design_control$include_cloud_profiles),
-      design_method = design_control$design_method %||% "profiles",
-      distance_metric = design_control$distance_metric %||% "euclidean"
-    )
+    if (identical(as.character(design_control$design_method %||% ""), "adaptive_scout") ||
+        isTRUE(design_control$scout_only)) {
+      theta_design <- .local_atlas_unique_theta(theta_root, model)
+    } else {
+      theta_design <- .local_atlas_design_from_cloud(
+        theta_cloud = theta_cloud,
+        population_model = model,
+        theta_root = theta_root,
+        max_anchors = as.integer(design_control$max_anchors),
+        axis_count = as.integer(design_control$axis_count),
+        tail_probs = design_control$tail_probs,
+        focus_hyper_names = design_control$focus_hyper_names,
+        include_axis_profiles = isTRUE(design_control$include_axis_profiles),
+        include_cloud_profiles = isTRUE(design_control$include_cloud_profiles),
+        design_method = design_control$design_method %||% "profiles",
+        distance_metric = design_control$distance_metric %||% "euclidean"
+      )
+    }
   } else {
     theta_design <- .local_atlas_unique_theta(rbind(theta_root, theta_design), model)
   }
@@ -4502,6 +5995,7 @@ fit_chart_atlas_population_model <- function(data_list,
       label = "chart_atlas_outer_q0"
     )
   }
+  initial_proposal <- normalize_theta_proposal(initial_proposal, population_model = model)
 
   evaluator_control <- .local_atlas_merge_control(evaluator_control, list(
     max_chart_distance = NULL,
@@ -4512,6 +6006,7 @@ fit_chart_atlas_population_model <- function(data_list,
     use_particle_mis = TRUE,
     require_particle_mis = TRUE,
     min_particle_mis_ess = 0.05,
+    min_particle_mis_ess_abs = 50,
     max_particle_mis_psis_k = 0.7,
     max_quadratic_particle_gap = 0.05,
     sparse_chart_min_covering = 3L,
@@ -4527,6 +6022,18 @@ fit_chart_atlas_population_model <- function(data_list,
     surface_ridge = 1e-8,
     particle_mis_role = "estimator",
     particle_mis_batch = TRUE,
+    compress_particle_mis = FALSE,
+    compressed_particle_mis_K = 64L,
+    compressed_particle_mis_n_theta = 96L,
+    compressed_particle_mis_holdout_fraction = 0.25,
+    compressed_particle_mis_max_holdout_rmse = Inf,
+    compressed_particle_mis_stop_on_failure = FALSE,
+    compressed_particle_mis_ridge = 1e-8,
+    compressed_particle_mis_evidence_weight = 1,
+    compressed_particle_mis_moment_weight = 0.05,
+    compressed_particle_mis_chart_weight = 0.05,
+    compressed_particle_mis_include_moments = TRUE,
+    compressed_particle_mis_include_chart = TRUE,
     stop_on_uncertified = TRUE,
     use_uncertified_estimates = FALSE
   ))
@@ -4570,7 +6077,15 @@ fit_chart_atlas_population_model <- function(data_list,
                                atlas_build_history = list(),
                                design_certification = NULL,
                                proposal_certification = NULL,
-                               calibration_history = list()) {
+                               calibration_history = list(),
+                               initial_certification = NULL,
+                               refine_round = NULL,
+                               chart_design_plan = NULL) {
+    plan_for_checkpoint <- chart_design_plan
+    if (is.null(plan_for_checkpoint) &&
+        exists("chart_design_plan", envir = parent.frame(), inherits = FALSE)) {
+      plan_for_checkpoint <- get("chart_design_plan", envir = parent.frame(), inherits = FALSE)
+    }
     .local_atlas_write_checkpoint(
       checkpoint_file,
       stage = stage,
@@ -4587,6 +6102,9 @@ fit_chart_atlas_population_model <- function(data_list,
         proposal_certification = proposal_certification,
         atlas_build_history = atlas_build_history,
         calibration_history = calibration_history,
+        initial_certification = initial_certification,
+        refine_round = refine_round,
+        chart_design_plan = plan_for_checkpoint,
         settings = list(
           local_control = local_control,
           design_control = design_control,
@@ -4611,11 +6129,30 @@ fit_chart_atlas_population_model <- function(data_list,
   atlases <- NULL
   fit <- NULL
   calibration_history <- list()
-  completed_stages <- c("post_atlas_build", "post_pre_outer", "post_outer", "complete")
+  initial_certification <- NULL
+  chart_design_plan <- NULL
+  completed_stages <- c("chart_design_plan", "post_atlas_build", "post_pre_outer", "post_compression", "post_outer", "complete")
+  partial_atlases <- NULL
+  partial_refine_round <- NA_integer_
+  if (!is.null(checkpoint) && grepl("^atlas_partial_round_", resume_stage)) {
+    theta_design <- checkpoint$theta_design %||% theta_design
+    theta_cloud <- checkpoint$theta_cloud %||% theta_cloud
+    initial_proposal <- checkpoint$initial_proposal %||% initial_proposal
+    atlas_build_history <- checkpoint$atlas_build_history %||% list()
+    partial_atlases <- checkpoint$atlases %||% NULL
+    partial_refine_round <- as.integer(checkpoint$refine_round %||% NA_integer_)
+    .local_atlas_log(
+      "resuming partial atlas build: round=", partial_refine_round,
+      " completed_locals=", sum(vapply(partial_atlases %||% list(), Negate(is.null), logical(1))),
+      "\n",
+      verbose = verbose
+    )
+  }
   if (!is.null(checkpoint) && resume_stage %in% completed_stages) {
     factor_set <- checkpoint$factor_set
     atlases <- checkpoint$atlases
     fit <- checkpoint$fit
+    chart_design_plan <- checkpoint$chart_design_plan
     theta_design <- checkpoint$theta_design %||% theta_design
     theta_cloud <- checkpoint$theta_cloud %||% theta_cloud
     initial_proposal <- checkpoint$initial_proposal %||% initial_proposal
@@ -4623,6 +6160,7 @@ fit_chart_atlas_population_model <- function(data_list,
     proposal_certification <- checkpoint$proposal_certification
     atlas_build_history <- checkpoint$atlas_build_history %||% list()
     calibration_history <- checkpoint$calibration_history %||% list()
+    initial_certification <- checkpoint$initial_certification
     if (!is.null(factor_set)) {
       factor_set$evaluator_control <- modifyList(
         factor_set$evaluator_control %||% list(),
@@ -4631,10 +6169,101 @@ fit_chart_atlas_population_model <- function(data_list,
       factor_set <- validate_local_atlas_factor_set(factor_set)
     }
   }
+  adaptive_scout <- identical(as.character(design_control$design_method %||% ""), "adaptive_scout")
+  if (isTRUE(adaptive_scout) && is.null(design_control_input$stop_after_atlas_build)) {
+    design_control$stop_after_atlas_build <- TRUE
+  }
+  if ((isTRUE(adaptive_scout) || isTRUE(design_control$scout_only)) && is.null(chart_design_plan)) {
+    chart_design_plan <- build_chart_design_plan(
+      data_list = data_list,
+      loglik_fn = loglik_fn,
+      population_model = model,
+      theta_root = theta_root,
+      theta_cloud = theta_cloud,
+      local_control = local_control,
+      design_control = design_control,
+      n_cores = as.integer(n_cores),
+      seed = as.integer(seed),
+      verbose = verbose,
+      trace_verbose = trace_verbose
+    )
+    atlases <- chart_design_plan$root_atlases
+    checkpoint_state(
+      "chart_design_plan",
+      atlases = atlases,
+      chart_design_plan = chart_design_plan
+    )
+  }
+  if ((isTRUE(adaptive_scout) || isTRUE(design_control$scout_only)) && !is.null(chart_design_plan)) {
+    theta_design <- chart_design_plan_theta_union(chart_design_plan, model)
+    if (is.null(evaluator_control_input$max_chart_distance)) {
+      coverage_audit_n <- as.integer(design_control$coverage_audit_n %||%
+        max(nrow(theta_cloud), as.integer(outer_control$N)))
+      coverage_theta <- theta_cloud
+      if (!is.null(initial_proposal) && coverage_audit_n > 0L) {
+        coverage_theta <- rbind(
+          coverage_theta,
+          theta_proposal_sample(initial_proposal, n = coverage_audit_n, seed = as.integer(seed) + 900001L)
+        )
+      }
+      evaluator_control$max_chart_distance <- .local_atlas_nearest_design_radius(
+        theta_cloud = coverage_theta,
+        theta_design = theta_design,
+        population_model = model,
+        coverage_prob = design_control$coverage_prob,
+        inflation = design_control$coverage_inflation,
+        distance_metric = evaluator_control$distance_metric
+      )
+      if (is.null(evaluator_control_input$distance_scale)) {
+        evaluator_control$distance_scale <- evaluator_control$max_chart_distance
+      }
+    }
+  }
+  if (isTRUE(design_control$scout_only)) {
+    return(structure(
+      list(
+        fit = NULL,
+        factor_set = NULL,
+        atlases = chart_design_plan$root_atlases,
+        population_model = model,
+        initial_proposal = initial_proposal,
+        theta_root = theta_root,
+        theta_design = chart_design_plan_theta_union(chart_design_plan, model),
+        theta_cloud = theta_cloud,
+        chart_design_plan = chart_design_plan,
+        design_certification = NULL,
+        proposal_certification = NULL,
+        atlas_build_history = data.frame(),
+        calibration_history = data.frame(),
+        graph_summary = data.frame(),
+        settings = list(
+          local_control = local_control,
+          design_control = design_control,
+          edge_control = edge_control,
+          evaluator_control = evaluator_control,
+          calibration_control = calibration_control,
+          proposal_control = proposal_control,
+          outer_control = outer_control,
+          n_cores = as.integer(n_cores),
+          seed = as.integer(seed)
+        )
+      ),
+      class = c("chart_design_plan_fit", "chart_atlas_population_fit")
+    ))
+  }
   max_refine_rounds <- as.integer(design_control$refine_rounds)
+  if (isTRUE(adaptive_scout) && max_refine_rounds > 0L) {
+    stop("adaptive_scout production expansion uses the fixed chart_design_plan; set refine_rounds = 0 and regenerate the plan instead of running global refinement.")
+  }
   if (is.null(factor_set)) {
+  local_names <- names(data_list)
+  if (is.null(local_names)) {
+    local_names <- as.character(idx)
+  }
+  missing_local_names <- !nzchar(local_names) | is.na(local_names)
+  local_names[missing_local_names] <- as.character(idx[missing_local_names])
   .local_atlas_log("building local atlases: locals=", length(data_list),
-                   " design_anchors=", nrow(theta_design),
+                   " design_anchors=", if (isTRUE(adaptive_scout)) "local_specific" else nrow(theta_design),
                    " refine_rounds=", max_refine_rounds, "\n", verbose = verbose)
   for (refine_round in seq_len(max_refine_rounds + 1L) - 1L) {
     round_start <- Sys.time()
@@ -4642,32 +6271,88 @@ fit_chart_atlas_population_model <- function(data_list,
       if (isTRUE(verbose)) {
         cat(sprintf(
           "Building chart atlas for local %s (%d/%d), design round %d\n",
-          names(data_list)[i] %||% i,
+          local_names[i],
           i,
           length(data_list),
           refine_round
         ))
       }
-      build_local_atlas(
-        local_id = names(data_list)[i] %||% as.character(i),
-        data_i = data_list[[i]],
-        loglik_fn = loglik_fn,
-        population_model = model,
-        theta_design = theta_design,
-        theta_root = theta_root,
-        local_control = local_control,
-        edge_control = edge_control,
-        n_cores = 1L,
-        seed = as.integer(seed) + 100003L * i + 10000019L * refine_round,
-        verbose = isTRUE(verbose)
-      )
+      if (isTRUE(adaptive_scout)) {
+        root_atlas <- chart_design_plan$root_atlases[[local_names[i]]]
+        local_design <- chart_design_plan$local_theta_designs[[local_names[i]]]
+        if (is.null(root_atlas) || is.null(local_design)) {
+          stop("chart_design_plan is missing root atlas or local theta design for local ", local_names[i])
+        }
+        build_local_atlas_from_root(
+          root_atlas = root_atlas,
+          data_i = data_list[[i]],
+          loglik_fn = loglik_fn,
+          population_model = model,
+          theta_design = local_design,
+          theta_root = theta_root,
+          local_control = local_control,
+          edge_control = edge_control,
+          n_cores = 1L,
+          seed = as.integer(seed) + 100003L * i + 10000019L * refine_round,
+          verbose = isTRUE(trace_verbose)
+        )
+      } else {
+        build_local_atlas(
+          local_id = local_names[i],
+          data_i = data_list[[i]],
+          loglik_fn = loglik_fn,
+          population_model = model,
+          theta_design = theta_design,
+          theta_root = theta_root,
+          local_control = local_control,
+          edge_control = edge_control,
+          n_cores = 1L,
+          seed = as.integer(seed) + 100003L * i + 10000019L * refine_round,
+          verbose = isTRUE(trace_verbose)
+        )
+      }
     }
-    atlases <- if (as.integer(n_cores) <= 1L || length(data_list) <= 1L) {
-      lapply(idx, build_one)
+    batch_size <- suppressWarnings(as.integer(design_control$checkpoint_local_batch_size))
+    if (!is.finite(batch_size) || batch_size <= 0L || is.null(checkpoint_file) || !nzchar(checkpoint_file)) {
+      batch_size <- length(idx)
+    }
+    if (!is.null(partial_atlases) && identical(as.integer(partial_refine_round), as.integer(refine_round))) {
+      atlases <- partial_atlases
+      length(atlases) <- length(data_list)
     } else {
-      parallel::mclapply(idx, build_one, mc.cores = as.integer(min(n_cores, length(data_list))))
+      atlases <- vector("list", length(data_list))
     }
-    names(atlases) <- names(data_list) %||% paste0("local_", idx)
+    names(atlases) <- local_names
+    missing_idx <- idx[vapply(atlases, is.null, logical(1))]
+    if (length(missing_idx)) {
+      batches <- split(missing_idx, ceiling(seq_along(missing_idx) / batch_size))
+      for (batch_id in seq_along(batches)) {
+        batch_idx <- batches[[batch_id]]
+        .local_atlas_log(
+          "atlas round ", refine_round,
+          " local batch ", batch_id, "/", length(batches),
+          ": locals ", min(batch_idx), "-", max(batch_idx),
+          " (", length(batch_idx), ")\n",
+          verbose = verbose
+        )
+        built <- if (as.integer(n_cores) <= 1L || length(batch_idx) <= 1L) {
+          lapply(batch_idx, build_one)
+        } else {
+          parallel::mclapply(batch_idx, build_one, mc.cores = as.integer(min(n_cores, length(batch_idx))))
+        }
+        atlases[batch_idx] <- built
+        checkpoint_state(
+          paste0("atlas_partial_round_", refine_round),
+          atlases = atlases,
+          atlas_build_history = atlas_build_history,
+          design_certification = design_certification,
+          proposal_certification = proposal_certification,
+          refine_round = refine_round
+        )
+      }
+    }
+    partial_atlases <- NULL
+    partial_refine_round <- NA_integer_
 
     factor_set <- build_local_atlas_factor_set(
       atlases = atlases,
@@ -4680,6 +6365,7 @@ fit_chart_atlas_population_model <- function(data_list,
       use_particle_mis = evaluator_control$use_particle_mis,
       require_particle_mis = evaluator_control$require_particle_mis,
       min_particle_mis_ess = evaluator_control$min_particle_mis_ess,
+      min_particle_mis_ess_abs = evaluator_control$min_particle_mis_ess_abs,
       max_particle_mis_psis_k = evaluator_control$max_particle_mis_psis_k,
       max_quadratic_particle_gap = evaluator_control$max_quadratic_particle_gap,
       sparse_chart_min_covering = evaluator_control$sparse_chart_min_covering,
@@ -4698,28 +6384,39 @@ fit_chart_atlas_population_model <- function(data_list,
       stop_on_uncertified = evaluator_control$stop_on_uncertified,
       use_uncertified_estimates = evaluator_control$use_uncertified_estimates
     )
-    design_certification <- local_atlas_certification_summary(
-      factor_set,
-      theta = theta_design,
-      n_cores = as.integer(n_cores)
-    )
+    design_certification <- if (isTRUE(adaptive_scout)) {
+      local_atlas_certification_summary_by_local_design(
+        factor_set,
+        local_theta_designs = chart_design_plan$local_theta_designs,
+        n_cores = as.integer(n_cores)
+      )
+    } else {
+      local_atlas_certification_summary(
+        factor_set,
+        theta = theta_design,
+        n_cores = as.integer(n_cores)
+      )
+    }
     if (isTRUE(design_control$strict_design_coverage) &&
         any(design_certification$uncertified_fraction > 0)) {
-      audit_parts <- .local_atlas_factor_set_by_local(factor_set, theta_design, n_cores = as.integer(n_cores))
-      bad_rows <- list()
-      for (local_name in names(audit_parts)) {
-        part <- audit_parts[[local_name]]
-        bad <- which(part$status != "certified")
-        if (!length(bad)) next
-        bad_rows[[length(bad_rows) + 1L]] <- data.frame(
-          local = local_name,
-          theta_row = bad,
-          reason = part$reason[bad],
-          nearest_charts = part$nearest_charts[bad],
-          check.names = FALSE
-        )
+      bad_table <- attr(design_certification, "bad_rows")
+      if (is.null(bad_table) || !is.data.frame(bad_table)) {
+        audit_parts <- .local_atlas_factor_set_by_local(factor_set, theta_design, n_cores = as.integer(n_cores))
+        bad_rows <- list()
+        for (local_name in names(audit_parts)) {
+          part <- audit_parts[[local_name]]
+          bad <- which(part$status != "certified")
+          if (!length(bad)) next
+          bad_rows[[length(bad_rows) + 1L]] <- data.frame(
+            local = local_name,
+            theta_row = bad,
+            reason = part$reason[bad],
+            nearest_charts = part$nearest_charts[bad],
+            check.names = FALSE
+          )
+        }
+        bad_table <- if (length(bad_rows)) do.call(rbind, bad_rows) else data.frame()
       }
-      bad_table <- if (length(bad_rows)) do.call(rbind, bad_rows) else data.frame()
       shown <- utils::head(bad_table, 8L)
       stop(
         "chart atlas failed to certify all design anchors:\n",
@@ -4845,174 +6542,124 @@ fit_chart_atlas_population_model <- function(data_list,
   } else {
     .local_atlas_log("using checkpointed atlas build stage\n", verbose = verbose)
   }
+  if (isTRUE(design_control$stop_after_atlas_build)) {
+    return(structure(
+      list(
+        fit = fit,
+        factor_set = factor_set,
+        atlases = atlases,
+        population_model = model,
+        initial_proposal = initial_proposal,
+        theta_root = theta_root,
+        theta_design = theta_design,
+        theta_cloud = theta_cloud,
+        chart_design_plan = chart_design_plan,
+        design_certification = design_certification,
+        proposal_certification = proposal_certification,
+        atlas_build_history = .local_atlas_rbind_fill(atlas_build_history),
+        calibration_history = .local_atlas_rbind_fill(calibration_history),
+        initial_certification = initial_certification,
+        graph_summary = if (is.null(factor_set)) data.frame() else local_atlas_graph_summary(factor_set),
+        compression_summary = if (is.null(factor_set)) data.frame() else factor_set$compression_summary %||% data.frame(),
+        settings = list(
+          local_control = local_control,
+          design_control = design_control,
+          edge_control = edge_control,
+          evaluator_control = evaluator_control,
+          calibration_control = calibration_control,
+          proposal_control = proposal_control,
+          outer_control = outer_control,
+          n_cores = as.integer(n_cores),
+          seed = as.integer(seed)
+        )
+      ),
+      class = c("chart_atlas_factor_set_fit", "chart_atlas_population_fit")
+    ))
+  }
 
   pre_outer_calibration_history <- calibration_history
   if (is.data.frame(pre_outer_calibration_history)) {
     pre_outer_calibration_history <- list(pre_outer_calibration_history)
   }
-  max_pre_outer_rounds <- as.integer(calibration_control$pre_outer_rounds %||% 0L)
-  if (resume_stage %in% c("post_pre_outer", "post_outer", "complete")) {
+  if (!is.list(pre_outer_calibration_history)) {
+    pre_outer_calibration_history <- list()
+  }
+  if (resume_stage %in% c("post_pre_outer", "post_compression", "post_outer", "complete")) {
     .local_atlas_log("using checkpointed pre-outer certification stage\n", verbose = verbose)
-  } else if (max_pre_outer_rounds > 0L) {
-    for (pre_round in seq_len(max_pre_outer_rounds)) {
-      pre_start <- Sys.time()
-      pre_audit_n <- as.integer(calibration_control$pre_outer_audit_n %||%
-        max(as.integer(outer_control$N), as.integer(design_control$refine_audit_n %||% outer_control$N)))
-      .local_atlas_log("pre-outer audit round ", pre_round, ": theta=", pre_audit_n, "\n", verbose = verbose)
-      audit_theta <- theta_proposal_sample(
-        initial_proposal,
-        n = pre_audit_n,
-        seed = as.integer(seed) + 39000017L * pre_round
-      )
-      outer_init_theta <- theta_proposal_sample(
-        initial_proposal,
-        n = as.integer(outer_control$N),
-        seed = as.integer(seed) + 900001L
-      )
-      audit_theta <- .local_atlas_unique_theta(rbind(outer_init_theta, audit_theta), model)
-      audit_parts <- .local_atlas_factor_set_by_local(factor_set, audit_theta, n_cores = as.integer(n_cores))
-      bad <- .local_atlas_factor_set_uncertified(audit_parts)
-      if (!nrow(bad)) {
-        .local_atlas_log("pre-outer audit round ", pre_round, ": no uncertified pairs\n", verbose = verbose)
-        break
+  } else if (as.integer(calibration_control$pre_outer_rounds %||% 0L) > 0L) {
+    pre_outer <- local_atlas_pre_outer_certify(
+      factor_set = factor_set,
+      data_list = data_list,
+      loglik_fn = loglik_fn,
+      initial_proposal = initial_proposal,
+      local_control = local_control,
+      edge_control = edge_control,
+      calibration_control = calibration_control,
+      outer_control = outer_control,
+      design_control = design_control,
+      calibration_history = pre_outer_calibration_history,
+      n_cores = as.integer(n_cores),
+      seed = as.integer(seed),
+      verbose = verbose,
+      trace_verbose = trace_verbose,
+      checkpoint_callback = function(stage, factor_set, atlases, calibration_history) {
+        checkpoint_state(
+          stage,
+          factor_set = factor_set,
+          atlases = atlases,
+          atlas_build_history = atlas_build_history,
+          design_certification = design_certification,
+          proposal_certification = proposal_certification,
+          calibration_history = calibration_history
+        )
       }
-      theta_counts <- sort(table(bad$theta_row), decreasing = TRUE)
-      local_counts <- table(bad$local)
-      bad$local_pos <- match(as.character(bad$local), names(factor_set$atlases))
-      bad$theta_bad_count <- as.numeric(theta_counts[match(as.character(bad$theta_row), names(theta_counts))])
-      bad$local_bad_count <- as.numeric(local_counts[match(as.character(bad$local), names(local_counts))])
-      bad$priority <- bad$theta_bad_count + 0.25 * bad$local_bad_count
-      bad <- bad[order(bad$priority, decreasing = TRUE), , drop = FALSE]
-      max_pre_theta <- as.integer(calibration_control$pre_outer_max_points)
-      max_pre_updates <- as.integer(calibration_control$pre_outer_max_updates)
-      keep_rows <- as.integer(names(theta_counts))
-      keep_rows <- keep_rows[seq_len(min(length(keep_rows), max_pre_theta))]
-      eligible_bad <- bad[bad$theta_row %in% keep_rows, , drop = FALSE]
-      if (!nrow(eligible_bad)) {
-        eligible_bad <- bad
-      }
-      selected_idx <- integer()
-      selected_key <- character()
-      add_selected <- function(idx) {
-        key <- paste(eligible_bad$local_pos[idx], eligible_bad$theta_row[idx], sep = ":")
-        take <- !key %in% selected_key
-        if (any(take)) {
-          selected_idx <<- c(selected_idx, idx[take])
-          selected_key <<- c(selected_key, key[take])
-        }
-      }
-      for (loc in names(sort(local_counts, decreasing = TRUE))) {
-        loc_idx <- which(eligible_bad$local == loc)
-        if (!length(loc_idx)) next
-        loc_idx <- loc_idx[order(
-          eligible_bad$theta_bad_count[loc_idx],
-          eligible_bad$priority[loc_idx],
-          decreasing = TRUE
-        )]
-        add_selected(loc_idx[1L])
-        if (length(selected_idx) >= max_pre_updates) break
-      }
-      if (length(selected_idx) < max_pre_updates) {
-        for (theta_row in keep_rows) {
-          theta_idx <- which(eligible_bad$theta_row == theta_row)
-          if (!length(theta_idx)) next
-          theta_idx <- theta_idx[order(
-            eligible_bad$local_bad_count[theta_idx],
-            eligible_bad$priority[theta_idx],
-            decreasing = TRUE
-          )]
-          for (idx_one in theta_idx) {
-            add_selected(idx_one)
-            if (length(selected_idx) >= max_pre_updates) break
-          }
-          if (length(selected_idx) >= max_pre_updates) break
-        }
-      }
-      if (length(selected_idx) < max_pre_updates) {
-        fill_idx <- seq_len(nrow(eligible_bad))
-        for (idx_one in fill_idx) {
-          add_selected(idx_one)
-          if (length(selected_idx) >= max_pre_updates) break
-        }
-      }
-      selected_bad <- eligible_bad[selected_idx[seq_len(min(length(selected_idx), max_pre_updates))], , drop = FALSE]
-      .local_atlas_log(
-        "pre-outer audit round ", pre_round,
-        ": uncertified_pairs=", nrow(bad),
-        " selected_pairs=", nrow(selected_bad),
-        " selected_theta=", length(unique(selected_bad$theta_row)),
-        " selected_locals=", length(unique(selected_bad$local_pos)), "\n",
-        verbose = verbose
+    )
+    factor_set <- pre_outer$factor_set
+    atlases <- pre_outer$atlases
+    pre_outer_calibration_history <- pre_outer$calibration_history
+    checkpoint_state(
+      "post_pre_outer",
+      factor_set = factor_set,
+      atlases = atlases,
+      atlas_build_history = atlas_build_history,
+      design_certification = design_certification,
+      proposal_certification = proposal_certification,
+      calibration_history = pre_outer_calibration_history,
+      initial_certification = initial_certification
+    )
+  }
+  if (!resume_stage %in% c("post_pre_outer", "post_compression", "post_outer", "complete") &&
+      as.integer(calibration_control$initial_certification_rounds %||% 0L) > 0L) {
+    initial_theta <- theta_proposal_sample(
+      initial_proposal,
+      n = as.integer(outer_control$N),
+      seed = as.integer(seed) + 900001L
+    )
+    initial_certification <- local_atlas_certify_theta_cloud(
+      factor_set = factor_set,
+      theta = initial_theta,
+      data_list = data_list,
+      loglik_fn = loglik_fn,
+      local_control = local_control,
+      edge_control = edge_control,
+      calibration_control = calibration_control,
+      theta_weights = rep(1 / as.integer(outer_control$N), as.integer(outer_control$N)),
+      max_rounds = as.integer(calibration_control$initial_certification_rounds),
+      max_updates = as.integer(calibration_control$initial_certification_max_updates),
+      max_fresh_probes = as.integer(calibration_control$initial_certification_max_fresh_probes %||%
+        calibration_control$max_fresh_probes %||% 64L),
+      n_cores = as.integer(n_cores),
+      seed = as.integer(seed) + 1900003L,
+      verbose = verbose,
+      trace_verbose = trace_verbose
+    )
+    factor_set <- initial_certification$factor_set
+    atlases <- initial_certification$atlases
+    if (length(initial_certification$calibration_history)) {
+      pre_outer_calibration_history <- c(
+        pre_outer_calibration_history %||% list(),
+        initial_certification$calibration_history
       )
-      repair_weights <- numeric(nrow(audit_theta))
-      repair_weights[as.integer(names(theta_counts))] <- as.numeric(theta_counts)
-      repair_weights <- .local_chart_normalize_weights(repair_weights, length(repair_weights))
-      repair_locals <- unique(selected_bad$local_pos)
-      calibration <- local_atlas_calibrate_posterior_regions(
-        factor_set = factor_set,
-        theta = audit_theta,
-        data_list = data_list,
-        loglik_fn = loglik_fn,
-        theta_weights = repair_weights,
-        candidate_pairs = selected_bad[, c("local_pos", "theta_row"), drop = FALSE],
-        local_ids = repair_locals,
-        M = as.integer(calibration_control$M),
-        target_cess = calibration_control$target_cess,
-        n_mcmc_moves = as.integer(calibration_control$n_mcmc_moves),
-        max_steps = as.integer(calibration_control$max_steps),
-        max_updates = as.integer(calibration_control$pre_outer_max_updates),
-        abs_delta_threshold = calibration_control$abs_delta_threshold,
-        z_threshold = calibration_control$z_threshold,
-        candidate_pool_multiplier = as.integer(calibration_control$candidate_pool_multiplier),
-        confirmation_reps = as.integer(calibration_control$confirmation_reps),
-        confirmation_M = as.integer(calibration_control$confirmation_M),
-        confirmation_abs_delta_threshold = calibration_control$confirmation_abs_delta_threshold,
-        confirmation_z_threshold = calibration_control$confirmation_z_threshold,
-        confirmation_max_sd = calibration_control$confirmation_max_sd,
-        adaptive_confirmation_reps = as.integer(calibration_control$adaptive_confirmation_reps),
-        replicate_bootstrap_B = as.integer(calibration_control$replicate_bootstrap_B),
-        max_direct_graph_z = calibration_control$max_direct_graph_z,
-        max_direct_graph_chart_shift = calibration_control$max_direct_graph_chart_shift,
-        max_direct_graph_existing_shift = calibration_control$max_direct_graph_existing_shift,
-        adaptive_replicate_weight_multiplier = calibration_control$adaptive_replicate_weight_multiplier,
-        adaptive_replicate_min_theta_weight = calibration_control$adaptive_replicate_min_theta_weight,
-        adaptive_replicate_max_graph_z = calibration_control$adaptive_replicate_max_graph_z,
-        adaptive_replicate_graph_shift = calibration_control$adaptive_replicate_graph_shift,
-        local_control = local_control,
-        edge_control = edge_control,
-        n_cores = as.integer(n_cores),
-        seed = as.integer(seed) + 49000019L * pre_round,
-        verbose = isTRUE(verbose)
-      )
-      pre_outer_calibration_history[[length(pre_outer_calibration_history) + 1L]] <- data.frame(
-        calibration_phase = "pre_outer",
-        calibration_round = pre_round,
-        n_audit_theta = nrow(audit_theta),
-        n_uncertified_pairs = nrow(bad),
-        calibration$probes,
-        check.names = FALSE
-      )
-      factor_set <- calibration$factor_set
-      atlases <- factor_set$atlases
-      .local_atlas_log(
-        "pre-outer repair round ", pre_round,
-        " finished in ", round(as.numeric(difftime(Sys.time(), pre_start, units = "mins")), 3),
-        " min | activated=", calibration$n_activated,
-        " selected=", calibration$n_selected, "\n",
-        verbose = verbose
-      )
-      checkpoint_state(
-        paste0("pre_outer_round_", pre_round),
-        factor_set = factor_set,
-        atlases = atlases,
-        atlas_build_history = atlas_build_history,
-        design_certification = design_certification,
-        proposal_certification = proposal_certification,
-        calibration_history = pre_outer_calibration_history
-      )
-      if (!isTRUE(calibration$n_activated > 0L)) {
-        break
-      }
     }
     checkpoint_state(
       "post_pre_outer",
@@ -5021,8 +6668,97 @@ fit_chart_atlas_population_model <- function(data_list,
       atlas_build_history = atlas_build_history,
       design_certification = design_certification,
       proposal_certification = proposal_certification,
-      calibration_history = pre_outer_calibration_history
+      calibration_history = pre_outer_calibration_history,
+      initial_certification = initial_certification
     )
+    if (!isTRUE(initial_certification$certified) &&
+        isTRUE(calibration_control$initial_certification_stop_on_uncertified)) {
+      shown <- utils::head(initial_certification$uncertified, 8L)
+      stop(
+        "Initial outer theta cloud remains uncertified after exact-cloud repair:\n",
+        paste(
+          sprintf(
+            "local=%s theta_row=%s status=%s reason=%s nearest=%s",
+            shown$local,
+            shown$theta_row,
+            shown$status,
+            shown$reason,
+            shown$nearest_charts
+          ),
+          collapse = "\n"
+        )
+      )
+    }
+  }
+
+  compress_factor_set_for_outer <- function(stage_label) {
+    if (!isTRUE(evaluator_control$compress_particle_mis)) {
+      factor_set$evaluator_control$use_compressed_particle_mis <- FALSE
+      factor_set$evaluator_control$require_compressed_particle_mis <- FALSE
+      return(factor_set)
+    }
+    compression_theta <- .local_atlas_compression_theta_design(
+      theta_design = theta_design,
+      theta_cloud = theta_cloud,
+      initial_proposal = initial_proposal,
+      population_model = model,
+      theta_root = theta_root,
+      n_theta = as.integer(evaluator_control$compressed_particle_mis_n_theta),
+      distance_metric = evaluator_control$distance_metric,
+      seed = as.integer(seed) + 7100003L
+    )
+    out <- compress_local_atlas_factor_set(
+      factor_set = factor_set,
+      theta = compression_theta,
+      K = as.integer(evaluator_control$compressed_particle_mis_K),
+      holdout_fraction = evaluator_control$compressed_particle_mis_holdout_fraction,
+      ridge = evaluator_control$compressed_particle_mis_ridge,
+      evidence_weight = evaluator_control$compressed_particle_mis_evidence_weight,
+      moment_weight = evaluator_control$compressed_particle_mis_moment_weight,
+      chart_weight = evaluator_control$compressed_particle_mis_chart_weight,
+      include_moments = evaluator_control$compressed_particle_mis_include_moments,
+      include_chart = evaluator_control$compressed_particle_mis_include_chart,
+      max_holdout_rmse = evaluator_control$compressed_particle_mis_max_holdout_rmse,
+      stop_on_failure = evaluator_control$compressed_particle_mis_stop_on_failure,
+      n_cores = as.integer(n_cores),
+      seed = as.integer(seed) + 7200003L,
+      verbose = verbose
+    )
+    summary <- local_atlas_compression_summary(out)
+    if (nrow(summary)) {
+      .local_atlas_log(
+        stage_label,
+        " compression: median raw=", stats::median(summary$raw_particles, na.rm = TRUE),
+        " median selected=", stats::median(summary$selected_particles, na.rm = TRUE),
+        " median ratio=", round(stats::median(summary$compression_ratio, na.rm = TRUE), 1),
+        " median holdout RMSE=", round(stats::median(summary$holdout_rmse, na.rm = TRUE), 4),
+        "\n",
+        verbose = verbose
+      )
+    }
+    out
+  }
+
+  if (isTRUE(evaluator_control$compress_particle_mis)) {
+    if (resume_stage %in% c("post_compression", "post_outer", "complete")) {
+      .local_atlas_log("using checkpointed local particle compression stage\n", verbose = verbose)
+      factor_set$evaluator_control$use_compressed_particle_mis <- TRUE
+      factor_set$evaluator_control$require_compressed_particle_mis <- TRUE
+      factor_set <- validate_local_atlas_factor_set(factor_set)
+    } else {
+      factor_set <- compress_factor_set_for_outer("pre-outer")
+      atlases <- factor_set$atlases
+      checkpoint_state(
+        "post_compression",
+        factor_set = factor_set,
+        atlases = atlases,
+        atlas_build_history = atlas_build_history,
+        design_certification = design_certification,
+        proposal_certification = proposal_certification,
+        calibration_history = pre_outer_calibration_history,
+        initial_certification = initial_certification
+      )
+    }
   }
 
   if (is.null(fit) || !resume_stage %in% c("post_outer", "complete")) {
@@ -5054,7 +6790,8 @@ fit_chart_atlas_population_model <- function(data_list,
     atlas_build_history = atlas_build_history,
     design_certification = design_certification,
     proposal_certification = proposal_certification,
-    calibration_history = pre_outer_calibration_history
+    calibration_history = pre_outer_calibration_history,
+    initial_certification = initial_certification
   )
   } else {
     .local_atlas_log("using checkpointed outer SMC stage\n", verbose = verbose)
@@ -5103,6 +6840,7 @@ fit_chart_atlas_population_model <- function(data_list,
         confirmation_max_sd = calibration_control$confirmation_max_sd,
         adaptive_confirmation_reps = as.integer(calibration_control$adaptive_confirmation_reps),
         replicate_bootstrap_B = as.integer(calibration_control$replicate_bootstrap_B),
+        max_fresh_probes = as.integer(calibration_control$max_fresh_probes %||% 64L),
         max_direct_graph_z = calibration_control$max_direct_graph_z,
         max_direct_graph_chart_shift = calibration_control$max_direct_graph_chart_shift,
         max_direct_graph_existing_shift = calibration_control$max_direct_graph_existing_shift,
@@ -5114,7 +6852,7 @@ fit_chart_atlas_population_model <- function(data_list,
         edge_control = edge_control,
         n_cores = as.integer(n_cores),
         seed = as.integer(seed) + 19000019L * calibration_round,
-        verbose = isTRUE(verbose)
+        verbose = isTRUE(trace_verbose)
       )
       calibration_history[[length(calibration_history) + 1L]] <- data.frame(
         calibration_phase = "posterior",
@@ -5124,6 +6862,10 @@ fit_chart_atlas_population_model <- function(data_list,
       )
       factor_set <- calibration$factor_set
       atlases <- factor_set$atlases
+      if (isTRUE(evaluator_control$compress_particle_mis)) {
+        factor_set <- compress_factor_set_for_outer(paste0("posterior calibration round ", calibration_round))
+        atlases <- factor_set$atlases
+      }
       .local_atlas_log(
         "posterior calibration round ", calibration_round,
         " finished in ", round(as.numeric(difftime(Sys.time(), posterior_calibration_start, units = "mins")), 3),
@@ -5141,40 +6883,13 @@ fit_chart_atlas_population_model <- function(data_list,
         proposal_certification = proposal_certification,
         calibration_history = calibration_history
       )
-      if (!isTRUE(calibration$n_activated > 0L) || !isTRUE(calibration_control$rerun_outer)) {
-        break
+      if (isTRUE(calibration$n_activated > 0L)) {
+        .local_atlas_log(
+          "posterior calibration updated local atlases; outer SMC rerun skipped. Run an explicit outer rerun from the saved checkpoint.\n",
+          verbose = verbose
+        )
       }
-      .local_atlas_log("rerunning outer SMC after posterior calibration round ", calibration_round, "\n", verbose = verbose)
-      outer_start <- Sys.time()
-      fit <- outer_population_smc(
-        factor_set = factor_set,
-        N = as.integer(outer_control$N),
-        initial_proposal = initial_proposal,
-        resample_threshold = outer_control$resample_threshold,
-        n_mcmc_moves = as.integer(outer_control$n_mcmc_moves),
-        min_mcmc_moves = as.integer(outer_control$min_mcmc_moves),
-        max_rounds = as.integer(outer_control$max_rounds),
-        rw_scale_init = outer_control$rw_scale_init,
-        n_cores = as.integer(n_cores),
-        seed = as.integer(seed) + 900001L + 19000019L * calibration_round,
-        verbose = isTRUE(outer_control$verbose)
-      )
-      .local_atlas_log(
-        "rerun outer SMC finished in ",
-        round(as.numeric(difftime(Sys.time(), outer_start, units = "mins")), 3),
-        " min\n",
-        verbose = verbose
-      )
-      checkpoint_state(
-        paste0("post_posterior_outer_", calibration_round),
-        factor_set = factor_set,
-        atlases = atlases,
-        fit = fit,
-        atlas_build_history = atlas_build_history,
-        design_certification = design_certification,
-        proposal_certification = proposal_certification,
-        calibration_history = calibration_history
-      )
+      break
     }
   }
 
@@ -5186,7 +6901,8 @@ fit_chart_atlas_population_model <- function(data_list,
     atlas_build_history = atlas_build_history,
     design_certification = design_certification,
     proposal_certification = proposal_certification,
-    calibration_history = calibration_history
+    calibration_history = calibration_history,
+    initial_certification = initial_certification
   )
 
   structure(
@@ -5199,11 +6915,14 @@ fit_chart_atlas_population_model <- function(data_list,
       theta_root = theta_root,
       theta_design = theta_design,
       theta_cloud = theta_cloud,
+      chart_design_plan = chart_design_plan,
       design_certification = design_certification,
       proposal_certification = proposal_certification,
       atlas_build_history = .local_atlas_rbind_fill(atlas_build_history),
       calibration_history = .local_atlas_rbind_fill(calibration_history),
+      initial_certification = initial_certification,
       graph_summary = local_atlas_graph_summary(factor_set),
+      compression_summary = factor_set$compression_summary %||% data.frame(),
       settings = list(
         local_control = local_control,
         design_control = design_control,
@@ -5487,6 +7206,101 @@ local_atlas_certification_summary <- function(factor_set,
   out <- do.call(rbind, rows)
   out$max_se[!is.finite(out$max_se)] <- Inf
   out$median_se[!is.finite(out$median_se)] <- Inf
+  out
+}
+
+local_atlas_certification_summary_by_local_design <- function(factor_set,
+                                                              local_theta_designs,
+                                                              n_cores = 1L) {
+  factor_set <- validate_local_atlas_factor_set(factor_set)
+  if (!is.list(local_theta_designs) || !length(local_theta_designs)) {
+    stop("local_theta_designs must be a non-empty list.")
+  }
+  atlas_names <- names(factor_set$atlases)
+  if (is.null(names(local_theta_designs)) || any(!nzchar(names(local_theta_designs)))) {
+    if (length(local_theta_designs) != length(atlas_names)) {
+      stop("unnamed local_theta_designs must have one entry per atlas.")
+    }
+    names(local_theta_designs) <- atlas_names
+  }
+  missing_design <- setdiff(atlas_names, names(local_theta_designs))
+  if (length(missing_design)) {
+    stop("local_theta_designs is missing locals: ", paste(missing_design, collapse = ", "))
+  }
+  control <- factor_set$evaluator_control
+  eval_one <- function(local_name) {
+    theta <- .as_hyper_matrix(
+      local_theta_designs[[local_name]],
+      hyper_names = factor_set$population_model$hyper_names,
+      hyper_dim = factor_set$population_model$hyper_dim
+    )
+    part <- evaluate_local_atlas_many(
+      atlas = factor_set$atlases[[local_name]],
+      theta = theta,
+      population_model = factor_set$population_model,
+      max_chart_distance = control$max_chart_distance,
+      min_covering_charts = control$min_covering_charts,
+      max_prediction_range = control$max_prediction_range,
+      distance_scale = control$distance_scale,
+      se_floor = control$se_floor,
+      use_particle_mis = control$use_particle_mis,
+      require_particle_mis = control$require_particle_mis,
+      min_particle_mis_ess = control$min_particle_mis_ess,
+      min_particle_mis_ess_abs = control$min_particle_mis_ess_abs,
+      max_particle_mis_psis_k = control$max_particle_mis_psis_k,
+      max_quadratic_particle_gap = control$max_quadratic_particle_gap,
+      sparse_chart_min_covering = control$sparse_chart_min_covering,
+      sparse_chart_max_distance = control$sparse_chart_max_distance,
+      max_leave_chart_out_gap = control$max_leave_chart_out_gap,
+      distance_metric = control$distance_metric,
+      surface_method = control$surface_method,
+      min_surface_charts = control$min_surface_charts,
+      max_surface_se = control$max_surface_se,
+      surface_value_nugget = control$surface_value_nugget,
+      surface_gradient_weight = control$surface_gradient_weight,
+      surface_curvature_weight = control$surface_curvature_weight,
+      surface_ridge = control$surface_ridge,
+      particle_mis_role = control$particle_mis_role
+    )
+    certified <- part$status == "certified"
+    summary <- data.frame(
+      local = local_name,
+      n_theta = nrow(part),
+      certified_fraction = mean(certified),
+      uncertified_fraction = mean(!certified),
+      certified_weight = mean(certified),
+      uncertified_weight = mean(!certified),
+      max_se = suppressWarnings(max(part$se[certified], na.rm = TRUE)),
+      median_se = suppressWarnings(stats::median(part$se[certified], na.rm = TRUE)),
+      uncertified_reasons = paste(sort(unique(part$reason[!certified])), collapse = ","),
+      check.names = FALSE
+    )
+    summary$max_se[!is.finite(summary$max_se)] <- Inf
+    summary$median_se[!is.finite(summary$median_se)] <- Inf
+    bad <- if (any(!certified)) {
+      data.frame(
+        local = local_name,
+        theta_row = which(!certified),
+        reason = part$reason[!certified],
+        nearest_charts = part$nearest_charts[!certified],
+        check.names = FALSE
+      )
+    } else {
+      data.frame()
+    }
+    list(summary = summary, bad = bad)
+  }
+  local_results <- if (as.integer(n_cores) <= 1L || length(atlas_names) <= 1L) {
+    lapply(atlas_names, eval_one)
+  } else {
+    parallel::mclapply(atlas_names, eval_one, mc.cores = as.integer(min(n_cores, length(atlas_names))))
+  }
+  out <- do.call(rbind, lapply(local_results, `[[`, "summary"))
+  bad <- do.call(rbind, lapply(local_results, `[[`, "bad"))
+  if (is.null(bad)) {
+    bad <- data.frame()
+  }
+  attr(out, "bad_rows") <- bad
   out
 }
 
@@ -5984,6 +7798,7 @@ build_local_evidence_calibration_design <- function(theta = NULL,
       max_chart_distance = control$max_chart_distance,
       min_covering_charts = control$min_covering_charts,
       min_ess_frac = control$min_particle_mis_ess,
+      min_ess = control$min_particle_mis_ess_abs,
       max_psis_k = control$max_particle_mis_psis_k,
       sparse_chart_min_covering = control$sparse_chart_min_covering,
       sparse_chart_max_distance = control$sparse_chart_max_distance,
@@ -6005,6 +7820,7 @@ build_local_evidence_calibration_design <- function(theta = NULL,
     use_particle_mis = control$use_particle_mis,
     require_particle_mis = control$require_particle_mis,
     min_particle_mis_ess = control$min_particle_mis_ess,
+    min_particle_mis_ess_abs = control$min_particle_mis_ess_abs,
     max_particle_mis_psis_k = control$max_particle_mis_psis_k,
     max_quadratic_particle_gap = control$max_quadratic_particle_gap,
     sparse_chart_min_covering = control$sparse_chart_min_covering,
@@ -8599,6 +10415,7 @@ local_atlas_fresh_endpoint_probe <- function(factor_set,
           max_chart_distance = factor_set$evaluator_control$max_chart_distance,
           min_covering_charts = factor_set$evaluator_control$min_covering_charts,
           min_ess_frac = factor_set$evaluator_control$min_particle_mis_ess,
+          min_ess = factor_set$evaluator_control$min_particle_mis_ess_abs,
           max_psis_k = factor_set$evaluator_control$max_particle_mis_psis_k,
           sparse_chart_min_covering = factor_set$evaluator_control$sparse_chart_min_covering,
           sparse_chart_max_distance = factor_set$evaluator_control$sparse_chart_max_distance,
@@ -8625,6 +10442,7 @@ local_atlas_fresh_endpoint_probe <- function(factor_set,
           use_particle_mis = factor_set$evaluator_control$use_particle_mis,
           require_particle_mis = factor_set$evaluator_control$require_particle_mis,
           min_particle_mis_ess = factor_set$evaluator_control$min_particle_mis_ess,
+          min_particle_mis_ess_abs = factor_set$evaluator_control$min_particle_mis_ess_abs,
           max_particle_mis_psis_k = factor_set$evaluator_control$max_particle_mis_psis_k,
           max_quadratic_particle_gap = factor_set$evaluator_control$max_quadratic_particle_gap,
           sparse_chart_min_covering = factor_set$evaluator_control$sparse_chart_min_covering,
@@ -8705,6 +10523,7 @@ local_atlas_calibrate_posterior_regions <- function(factor_set,
                                                     confirmation_max_sd = 1.5,
                                                     adaptive_confirmation_reps = 2L,
                                                     replicate_bootstrap_B = 200L,
+                                                    max_fresh_probes = min(as.integer(max_updates), 64L),
                                                     max_direct_graph_z = 3,
                                                     max_direct_graph_chart_shift = 0.35,
                                                     max_direct_graph_existing_shift = 0.15,
@@ -8770,12 +10589,21 @@ local_atlas_calibrate_posterior_regions <- function(factor_set,
       stop("candidate_pairs did not contain any valid local/theta pairs.")
     }
   }
-  run_one <- function(k) {
+  max_fresh_probes <- suppressWarnings(as.integer(max_fresh_probes))
+  if (!is.finite(max_fresh_probes)) {
+    max_fresh_probes <- min(as.integer(max_updates), 64L)
+  }
+  max_fresh_probes <- max(0L, max_fresh_probes)
+  fresh_pool_n <- min(nrow(pairs), max_fresh_probes)
+
+  cheap_eval_one <- function(k) {
     local_pos <- pairs$local_pos[k]
     theta_row <- pairs$theta_row[k]
     atlas <- factor_set$atlases[[local_pos]]
-    data_i <- data_list[[local_pos]]
     theta_one <- theta[theta_row, , drop = FALSE]
+    graph_diag <- atlas$diagnostics$normalizer_solution %||% list()
+    graph_edge_z <- as.numeric(graph_diag$max_abs_standardized_edge_residual %||% 0)
+    graph_direct_z <- as.numeric(graph_diag$max_abs_standardized_direct_residual %||% 0)
     can_batch <- isTRUE(factor_set$evaluator_control$use_particle_mis) &&
       isTRUE(factor_set$evaluator_control$particle_mis_batch) &&
       !is.finite(factor_set$evaluator_control$max_leave_chart_out_gap) &&
@@ -8788,6 +10616,7 @@ local_atlas_calibrate_posterior_regions <- function(factor_set,
         max_chart_distance = factor_set$evaluator_control$max_chart_distance,
         min_covering_charts = factor_set$evaluator_control$min_covering_charts,
         min_ess_frac = factor_set$evaluator_control$min_particle_mis_ess,
+        min_ess = factor_set$evaluator_control$min_particle_mis_ess_abs,
         max_psis_k = factor_set$evaluator_control$max_particle_mis_psis_k,
         sparse_chart_min_covering = factor_set$evaluator_control$sparse_chart_min_covering,
         sparse_chart_max_distance = factor_set$evaluator_control$sparse_chart_max_distance,
@@ -8799,7 +10628,11 @@ local_atlas_calibrate_posterior_regions <- function(factor_set,
         log_marginal = atlas_eval_row$log_marginal[1L],
         se = atlas_eval_row$se[1L],
         status = atlas_eval_row$status[1L],
-        reason = atlas_eval_row$reason[1L]
+        reason = atlas_eval_row$reason[1L],
+        particle_mis_ess_frac = atlas_eval_row$particle_mis_ess_frac[1L],
+        particle_mis_ess = atlas_eval_row$particle_mis_ess[1L],
+        particle_mis_psis_k = atlas_eval_row$particle_mis_psis_k[1L],
+        min_covering_distance = atlas_eval_row$min_covering_distance[1L]
       )
     } else {
       atlas_eval <- evaluate_local_atlas(
@@ -8814,6 +10647,7 @@ local_atlas_calibrate_posterior_regions <- function(factor_set,
         use_particle_mis = factor_set$evaluator_control$use_particle_mis,
         require_particle_mis = factor_set$evaluator_control$require_particle_mis,
         min_particle_mis_ess = factor_set$evaluator_control$min_particle_mis_ess,
+        min_particle_mis_ess_abs = factor_set$evaluator_control$min_particle_mis_ess_abs,
         max_particle_mis_psis_k = factor_set$evaluator_control$max_particle_mis_psis_k,
         max_quadratic_particle_gap = factor_set$evaluator_control$max_quadratic_particle_gap,
         sparse_chart_min_covering = factor_set$evaluator_control$sparse_chart_min_covering,
@@ -8829,38 +10663,14 @@ local_atlas_calibrate_posterior_regions <- function(factor_set,
         surface_ridge = factor_set$evaluator_control$surface_ridge,
         particle_mis_role = factor_set$evaluator_control$particle_mis_role
       )
+      particle <- atlas_eval$diagnostics$particle_mis %||% list()
+      atlas_eval$particle_mis_ess_frac <- as.numeric(particle$ess_frac %||% NA_real_)
+      atlas_eval$particle_mis_ess <- as.numeric(particle$ess %||% NA_real_)
+      atlas_eval$particle_mis_psis_k <- as.numeric(particle$psis_k %||% NA_real_)
+      atlas_eval$min_covering_distance <- as.numeric(atlas_eval$diagnostics$min_covering_distance %||% NA_real_)
     }
-    fresh <- .local_chart_run_smc(
-      local_id = atlas$local_id,
-      theta_anchor = theta_one,
-      data_i = data_i,
-      loglik_fn = loglik_fn,
-      population_model = model,
-      M = as.integer(M),
-      target_cess = target_cess,
-      resample_threshold = local_control$resample_threshold,
-      n_mcmc_moves = as.integer(n_mcmc_moves),
-      rw_scale = local_control$rw_scale,
-      G_mix = as.integer(local_control$G_mix),
-      da_enable = isTRUE(local_control$da_enable),
-      refit_every = as.integer(local_control$refit_every),
-      max_steps = as.integer(max_steps),
-      deterministic_resampling = isTRUE(local_control$deterministic_resampling),
-      n_cores = 1L,
-      seed = as.integer(seed) + 1009L * local_pos + 9176L * theta_row,
-      verbose = verbose,
-      source = "local_atlas_calibration_probe"
-    )
-    delta <- if (is.finite(atlas_eval$log_marginal)) fresh$logZ - atlas_eval$log_marginal else NA_real_
-    z <- if (is.finite(delta)) {
-      abs(delta) / pmax(
-        sqrt(pmax(fresh$logZ_se, 0)^2 + pmax(atlas_eval$se, 0)^2),
-        .Machine$double.eps
-      )
-    } else {
-      NA_real_
-    }
-    row <- data.frame(
+
+    data.frame(
       local = names(factor_set$atlases)[local_pos],
       local_pos = local_pos,
       theta_row = theta_row,
@@ -8869,10 +10679,18 @@ local_atlas_calibrate_posterior_regions <- function(factor_set,
       atlas_se = atlas_eval$se,
       atlas_status = atlas_eval$status,
       atlas_reason = atlas_eval$reason,
-      fresh_log_marginal = fresh$logZ,
-      fresh_se = fresh$logZ_se,
-      delta_fresh_minus_atlas = delta,
-      abs_standardized_delta = z,
+      atlas_particle_mis_ess_frac = atlas_eval$particle_mis_ess_frac,
+      atlas_particle_mis_ess = atlas_eval$particle_mis_ess,
+      atlas_particle_mis_psis_k = atlas_eval$particle_mis_psis_k,
+      atlas_min_covering_distance = atlas_eval$min_covering_distance,
+      graph_edge_z_before = graph_edge_z,
+      graph_direct_z_before = graph_direct_z,
+      fresh_probed = FALSE,
+      fresh_log_marginal = NA_real_,
+      fresh_se = NA_real_,
+      delta_fresh_minus_atlas = NA_real_,
+      abs_standardized_delta = NA_real_,
+      cheap_rank_score = NA_real_,
       selected = FALSE,
       confirmed = FALSE,
       confirmation_passed = NA,
@@ -8897,31 +10715,177 @@ local_atlas_calibrate_posterior_regions <- function(factor_set,
       chart_id = NA_character_,
       check.names = FALSE
     )
-    list(row = row, fresh = fresh)
   }
 
-  probes <- if (as.integer(n_cores) <= 1L || nrow(pairs) <= 1L) {
-    lapply(seq_len(nrow(pairs)), run_one)
+  cheap_rows <- if (as.integer(n_cores) <= 1L || nrow(pairs) <= 1L) {
+    lapply(seq_len(nrow(pairs)), cheap_eval_one)
   } else {
     parallel::mclapply(
       seq_len(nrow(pairs)),
-      run_one,
+      cheap_eval_one,
       mc.cores = as.integer(min(n_cores, nrow(pairs)))
     )
   }
-  probe_table <- do.call(rbind, lapply(probes, `[[`, "row"))
-  failed <- which(
-    probe_table$atlas_status != "certified" |
-      abs(probe_table$delta_fresh_minus_atlas) >= as.numeric(abs_delta_threshold) |
-      probe_table$abs_standardized_delta >= as.numeric(z_threshold)
+  probe_table <- do.call(rbind, cheap_rows)
+
+  uncertified <- is.na(probe_table$atlas_status) | probe_table$atlas_status != "certified"
+  psis_excess <- ifelse(
+    is.finite(probe_table$atlas_particle_mis_psis_k),
+    pmax(probe_table$atlas_particle_mis_psis_k - as.numeric(factor_set$evaluator_control$max_particle_mis_psis_k), 0),
+    ifelse(is.na(probe_table$atlas_particle_mis_psis_k), 0, 10)
   )
+  ess_frac_deficit <- ifelse(
+    is.finite(probe_table$atlas_particle_mis_ess_frac),
+    pmax(as.numeric(factor_set$evaluator_control$min_particle_mis_ess) - probe_table$atlas_particle_mis_ess_frac, 0),
+    as.numeric(factor_set$evaluator_control$min_particle_mis_ess)
+  )
+  ess_abs_deficit <- ifelse(
+    is.finite(probe_table$atlas_particle_mis_ess),
+    pmax(as.numeric(factor_set$evaluator_control$min_particle_mis_ess_abs) - probe_table$atlas_particle_mis_ess, 0) /
+      max(as.numeric(factor_set$evaluator_control$min_particle_mis_ess_abs), 1),
+    1
+  )
+  reason <- as.character(probe_table$atlas_reason)
+  reason_score <- ifelse(grepl("no_active_chart_coverage|exact_anchor_normalizer_uncertified", reason), 25,
+    ifelse(grepl("high_particle_mis_psis", reason), 20,
+      ifelse(grepl("low_particle_mis_ess", reason), 15,
+        ifelse(grepl("sparse_chart_extrapolation|chart_prediction_disagreement", reason), 10, 0)
+      )
+    )
+  )
+  graph_z <- pmax(probe_table$graph_edge_z_before, probe_table$graph_direct_z_before, na.rm = TRUE)
+  graph_z[!is.finite(graph_z)] <- 0
+  atlas_se_score <- ifelse(
+    is.finite(probe_table$atlas_se),
+    log1p(pmax(probe_table$atlas_se, 0)),
+    10
+  )
+  distance_score <- ifelse(
+    is.finite(probe_table$atlas_min_covering_distance),
+    log1p(pmax(probe_table$atlas_min_covering_distance, 0)),
+    10
+  )
+  theta_weight_score <- sqrt(pmax(probe_table$theta_weight, .Machine$double.eps))
+  raw_rank <- 100 * as.numeric(uncertified) +
+    reason_score +
+    10 * psis_excess +
+    10 * ess_frac_deficit +
+    5 * ess_abs_deficit +
+    atlas_se_score +
+    distance_score +
+    pmin(graph_z, 10)
+  probe_table$cheap_rank_score <- raw_rank * theta_weight_score
+
+  fresh_idx <- order(probe_table$cheap_rank_score, decreasing = TRUE)
+  fresh_idx <- fresh_idx[!is.na(probe_table$cheap_rank_score[fresh_idx]) & probe_table$cheap_rank_score[fresh_idx] > 0]
+  fresh_idx <- fresh_idx[seq_len(min(length(fresh_idx), fresh_pool_n))]
+
+  run_fresh_one <- function(idx) {
+    local_pos <- probe_table$local_pos[idx]
+    theta_row <- probe_table$theta_row[idx]
+    atlas <- factor_set$atlases[[local_pos]]
+    data_i <- data_list[[local_pos]]
+    theta_one <- theta[theta_row, , drop = FALSE]
+    fresh <- .local_chart_run_smc(
+      local_id = atlas$local_id,
+      theta_anchor = theta_one,
+      data_i = data_i,
+      loglik_fn = loglik_fn,
+      population_model = model,
+      M = as.integer(M),
+      target_cess = target_cess,
+      resample_threshold = local_control$resample_threshold,
+      n_mcmc_moves = as.integer(n_mcmc_moves),
+      rw_scale = local_control$rw_scale,
+      G_mix = as.integer(local_control$G_mix),
+      da_enable = isTRUE(local_control$da_enable),
+      refit_every = as.integer(local_control$refit_every),
+      max_steps = as.integer(max_steps),
+      deterministic_resampling = isTRUE(local_control$deterministic_resampling),
+      n_cores = 1L,
+      seed = as.integer(seed) + 1009L * local_pos + 9176L * theta_row,
+      verbose = verbose,
+      source = "local_atlas_calibration_probe"
+    )
+    atlas_log_marginal <- probe_table$atlas_log_marginal[idx]
+    atlas_se <- probe_table$atlas_se[idx]
+    delta <- if (is.finite(atlas_log_marginal)) fresh$logZ - atlas_log_marginal else NA_real_
+    z <- if (is.finite(delta)) {
+      abs(delta) / pmax(
+        sqrt(pmax(fresh$logZ_se, 0)^2 + pmax(atlas_se, 0)^2),
+        .Machine$double.eps
+      )
+    } else {
+      NA_real_
+    }
+    row <- probe_table[idx, , drop = FALSE]
+    row$fresh_probed <- TRUE
+    row$fresh_log_marginal <- fresh$logZ
+    row$fresh_se <- fresh$logZ_se
+    row$delta_fresh_minus_atlas <- delta
+    row$abs_standardized_delta <- z
+    fresh_path <- tempfile("local_atlas_calibration_probe_", fileext = ".rds")
+    saveRDS(fresh, fresh_path, compress = FALSE)
+    rm(fresh)
+    invisible(gc(FALSE))
+    list(row = row, fresh_path = fresh_path, idx = idx)
+  }
+
+  probe_runs <- vector("list", nrow(probe_table))
+  probe_run_paths <- character()
+  on.exit({
+    if (length(probe_run_paths)) {
+      unlink(probe_run_paths[file.exists(probe_run_paths)], force = TRUE)
+    }
+  }, add = TRUE)
+  load_probe_run <- function(idx) {
+    item <- probe_runs[[idx]]
+    if (is.null(item)) {
+      return(NULL)
+    }
+    if (is.character(item) && length(item) == 1L) {
+      return(readRDS(item))
+    }
+    item
+  }
+  if (length(fresh_idx)) {
+    fresh_cores <- max(1L, as.integer(min(n_cores, length(fresh_idx))))
+    fresh_chunk_size <- min(length(fresh_idx), max(fresh_cores * 8L, fresh_cores))
+    chunks <- split(fresh_idx, ceiling(seq_along(fresh_idx) / fresh_chunk_size))
+    for (chunk in chunks) {
+      fresh_results <- if (fresh_cores <= 1L || length(chunk) <= 1L) {
+        lapply(chunk, run_fresh_one)
+      } else {
+        parallel::mclapply(
+          chunk,
+          run_fresh_one,
+          mc.cores = as.integer(min(fresh_cores, length(chunk))),
+          mc.preschedule = FALSE
+        )
+      }
+      for (result in fresh_results) {
+        probe_table[result$idx, ] <- result$row
+        probe_runs[[result$idx]] <- result$fresh_path
+        probe_run_paths <- c(probe_run_paths, result$fresh_path)
+      }
+      rm(fresh_results)
+      invisible(gc(FALSE))
+    }
+  }
+
+  failed_mask <- is.na(probe_table$atlas_status[fresh_idx]) |
+    probe_table$atlas_status[fresh_idx] != "certified" |
+    abs(probe_table$delta_fresh_minus_atlas[fresh_idx]) >= as.numeric(abs_delta_threshold) |
+    probe_table$abs_standardized_delta[fresh_idx] >= as.numeric(z_threshold)
+  failed_mask[is.na(failed_mask)] <- FALSE
+  failed <- fresh_idx[failed_mask]
   if (length(failed)) {
-    uncertified <- probe_table$atlas_status[failed] != "certified"
+    probed_uncertified <- probe_table$atlas_status[failed] != "certified"
     finite_delta <- abs(probe_table$delta_fresh_minus_atlas[failed])
     finite_delta[!is.finite(finite_delta)] <- 0
     finite_z <- probe_table$abs_standardized_delta[failed]
     finite_z[!is.finite(finite_z)] <- 0
-    rank_score <- (10 * as.numeric(uncertified) + finite_delta + 0.1 * finite_z) *
+    rank_score <- (10 * as.numeric(probed_uncertified) + finite_delta + 0.1 * finite_z) *
       sqrt(pmax(probe_table$theta_weight[failed], .Machine$double.eps))
     failed <- failed[order(rank_score, decreasing = TRUE)]
     pool_n <- as.integer(max_updates) * max(1L, as.integer(candidate_pool_multiplier))
@@ -8958,7 +10922,7 @@ local_atlas_calibrate_posterior_regions <- function(factor_set,
       )
     })
     .local_chart_replicated_logz(
-      c(list(probes[[idx]]$fresh), confirmation_runs),
+      c(list(load_probe_run(idx)), confirmation_runs),
       bootstrap_B = replicate_bootstrap_B,
       seed = as.integer(seed) + 8000009L + 1009L * local_pos + 9176L * theta_row
     )
@@ -8971,7 +10935,10 @@ local_atlas_calibrate_posterior_regions <- function(factor_set,
     local_pos <- probe_table$local_pos[idx]
     theta_row <- probe_table$theta_row[idx]
     atlas <- atlases[[local_pos]]
-    promoted_run <- probes[[idx]]$fresh
+    promoted_run <- load_probe_run(idx)
+    if (is.null(promoted_run)) {
+      next
+    }
     promote_delta <- probe_table$delta_fresh_minus_atlas[idx]
     promote_z <- probe_table$abs_standardized_delta[idx]
     atlas_was_certified <- identical(as.character(probe_table$atlas_status[idx]), "certified")
@@ -9207,6 +11174,7 @@ local_atlas_calibrate_posterior_regions <- function(factor_set,
     use_particle_mis = factor_set$evaluator_control$use_particle_mis,
     require_particle_mis = factor_set$evaluator_control$require_particle_mis,
     min_particle_mis_ess = factor_set$evaluator_control$min_particle_mis_ess,
+    min_particle_mis_ess_abs = factor_set$evaluator_control$min_particle_mis_ess_abs,
     max_particle_mis_psis_k = factor_set$evaluator_control$max_particle_mis_psis_k,
     max_quadratic_particle_gap = factor_set$evaluator_control$max_quadratic_particle_gap,
     sparse_chart_min_covering = factor_set$evaluator_control$sparse_chart_min_covering,
@@ -9524,6 +11492,480 @@ local_atlas_benchmark_gate <- function(factor_set,
     ),
     class = "local_atlas_benchmark_gate"
   )
+}
+
+local_evidence_fit_kernel_residual_patch <- function(theta,
+                                                     base_log_m,
+                                                     probe_theta_row,
+                                                     probe_log_m,
+                                                     probe_sd = NULL,
+                                                     theta_weights = NULL,
+                                                     active_hyper_names = NULL,
+                                                     kernel_scale = 0.5,
+                                                     scale_floor = 0.25,
+                                                     shrink = 2,
+                                                     min_train = 4L,
+                                                     probe_sd_floor = 0.05) {
+  theta <- as.data.frame(theta, check.names = FALSE)
+  n_theta <- nrow(theta)
+  if (!n_theta) {
+    stop("theta must contain at least one row.")
+  }
+  if (length(base_log_m) != n_theta) {
+    stop("base_log_m must have one entry per theta row.")
+  }
+  if (is.null(active_hyper_names)) {
+    active_hyper_names <- names(theta)
+  }
+  active_hyper_names <- intersect(as.character(active_hyper_names), names(theta))
+  if (!length(active_hyper_names)) {
+    stop("active_hyper_names must select at least one theta column.")
+  }
+  probe_theta_row <- as.integer(probe_theta_row)
+  probe_log_m <- as.numeric(probe_log_m)
+  if (is.null(probe_sd)) {
+    probe_sd <- rep(as.numeric(probe_sd_floor), length(probe_log_m))
+  }
+  probe_sd <- as.numeric(probe_sd)
+  if (length(probe_theta_row) != length(probe_log_m) ||
+      length(probe_theta_row) != length(probe_sd)) {
+    stop("probe_theta_row, probe_log_m, and probe_sd must have the same length.")
+  }
+  if (is.null(theta_weights)) {
+    theta_weights <- rep(1 / n_theta, n_theta)
+  }
+  theta_weights <- .local_chart_normalize_weights(theta_weights, n_theta)
+
+  ok <- is.finite(probe_theta_row) &
+    probe_theta_row >= 1L &
+    probe_theta_row <= n_theta &
+    is.finite(probe_log_m) &
+    is.finite(base_log_m[probe_theta_row])
+  probe_theta_row <- probe_theta_row[ok]
+  probe_log_m <- probe_log_m[ok]
+  probe_sd <- probe_sd[ok]
+  if (length(probe_theta_row) < as.integer(min_train)) {
+    return(structure(
+      list(
+        estimate = as.numeric(base_log_m),
+        correction = rep(0, n_theta),
+        diagnostics = data.frame(
+          status = "too_few_patch_points_no_correction",
+          n_train = length(probe_theta_row),
+          offset = NA_real_,
+          signal_sd = NA_real_,
+          loo_rmse = NA_real_,
+          reliability = 0,
+          shape_scale = 0,
+          kernel_scale = as.numeric(kernel_scale),
+          scale_floor = as.numeric(scale_floor),
+          active_hyper_names = paste(active_hyper_names, collapse = ","),
+          check.names = FALSE
+        )
+      ),
+      class = "local_evidence_kernel_residual_patch"
+    ))
+  }
+
+  x <- as.matrix(theta[, active_hyper_names, drop = FALSE])
+  center <- colSums(x * theta_weights)
+  posterior_scale <- sqrt(colSums(sweep(x, 2L, center, "-")^2 * theta_weights))
+  grid_scale <- apply(x, 2L, stats::sd)
+  scale <- pmax(posterior_scale, as.numeric(scale_floor) * grid_scale, 1e-8)
+  scale[!is.finite(scale) | scale <= 0] <- 1
+  z_all <- sweep(sweep(x, 2L, center, "-"), 2L, scale, "/")
+  z_train <- z_all[probe_theta_row, , drop = FALSE]
+
+  delta <- probe_log_m - as.numeric(base_log_m[probe_theta_row])
+  local_weight <- theta_weights[probe_theta_row]
+  if (!any(is.finite(local_weight)) || sum(local_weight, na.rm = TRUE) <= 0) {
+    local_weight <- rep(1, length(delta))
+  }
+  noise_var <- pmax(probe_sd, as.numeric(probe_sd_floor))^2
+  smooth_weight <- local_weight / pmax(noise_var, .Machine$double.eps)
+  if (!any(is.finite(smooth_weight)) || sum(smooth_weight, na.rm = TRUE) <= 0) {
+    smooth_weight <- rep(1, length(delta))
+  }
+  smooth_weight <- smooth_weight / mean(smooth_weight[is.finite(smooth_weight)])
+
+  weighted_mean <- function(y, w) {
+    ok <- is.finite(y) & is.finite(w) & w >= 0
+    if (!any(ok)) return(NA_real_)
+    sum(y[ok] * w[ok]) / sum(w[ok])
+  }
+  offset <- weighted_mean(delta, local_weight)
+  if (!is.finite(offset)) {
+    offset <- mean(delta)
+  }
+  y_shape <- delta - offset
+  bandwidth <- max(as.numeric(kernel_scale), 1e-8)
+  smooth_at <- function(z_query, keep = seq_along(y_shape)) {
+    if (!length(keep)) {
+      return(0)
+    }
+    d2 <- rowSums(sweep(z_train[keep, , drop = FALSE], 2L, z_query, "-")^2)
+    kw <- exp(-0.5 * d2 / bandwidth^2) * smooth_weight[keep]
+    if (!any(is.finite(kw)) || sum(kw, na.rm = TRUE) <= 0) {
+      return(0)
+    }
+    sum(kw * y_shape[keep]) / sum(kw)
+  }
+  pred_train <- vapply(seq_along(y_shape), function(j) smooth_at(z_train[j, ]), numeric(1))
+  residual <- y_shape - pred_train
+  loo <- rep(NA_real_, length(y_shape))
+  if (length(y_shape) > 1L) {
+    for (j in seq_along(y_shape)) {
+      loo[j] <- y_shape[j] - smooth_at(z_train[j, ], keep = setdiff(seq_along(y_shape), j))
+    }
+  }
+  signal_sd <- sqrt(weighted_mean(y_shape^2, local_weight))
+  loo_rmse <- sqrt(mean(loo[is.finite(loo)]^2))
+  if (!is.finite(loo_rmse)) {
+    loo_rmse <- sqrt(mean(residual^2))
+  }
+  reliability <- if (is.finite(signal_sd) && is.finite(loo_rmse)) {
+    signal_sd^2 / (signal_sd^2 + loo_rmse^2 + 1e-8)
+  } else {
+    0
+  }
+  shape_scale <- max(0, min(1, as.numeric(shrink) * reliability))
+  pred_all <- vapply(seq_len(n_theta), function(j) smooth_at(z_all[j, ]), numeric(1))
+  pred_center <- weighted_mean(pred_all, theta_weights)
+  if (!is.finite(pred_center)) {
+    pred_center <- mean(pred_all[is.finite(pred_all)])
+  }
+  dist <- vapply(seq_len(n_theta), function(i) {
+    sqrt(min(rowSums(sweep(z_train, 2L, z_all[i, ], "-")^2)))
+  }, numeric(1))
+  coverage <- exp(-0.5 * dist^2 / bandwidth^2)
+  correction <- offset + shape_scale * (pred_all - pred_center)
+
+  structure(
+    list(
+      estimate = as.numeric(base_log_m) + correction,
+      correction = correction,
+      train = data.frame(
+        theta_row = probe_theta_row,
+        base_log_m = as.numeric(base_log_m[probe_theta_row]),
+        probe_log_m = probe_log_m,
+        probe_sd = probe_sd,
+        delta = delta,
+        fitted_shape_delta = pred_train,
+        loo_error = loo,
+        check.names = FALSE
+      ),
+      diagnostics = data.frame(
+        status = "fitted",
+        n_train = length(delta),
+        offset = offset,
+        signal_sd = signal_sd,
+        loo_rmse = loo_rmse,
+        training_rmse = sqrt(mean(residual^2)),
+        reliability = reliability,
+        shape_scale = shape_scale,
+        kernel_scale = bandwidth,
+        scale_floor = as.numeric(scale_floor),
+        mean_coverage = mean(coverage),
+        min_coverage = min(coverage),
+        max_coverage = max(coverage),
+        active_hyper_names = paste(active_hyper_names, collapse = ","),
+        check.names = FALSE
+      )
+    ),
+    class = "local_evidence_kernel_residual_patch"
+  )
+}
+
+.local_evidence_posterior_parameter_family <- function(parameter) {
+  parameter <- as.character(parameter)
+  ifelse(
+    grepl("^mu_", parameter),
+    sub("^mu_", "", parameter),
+    ifelse(
+      grepl("^sigma2_", parameter),
+      sub("^sigma2_", "", parameter),
+      ifelse(
+        grepl("^log_sigma2_", parameter),
+        sub("^log_sigma2_", "", parameter),
+        parameter
+      )
+    )
+  )
+}
+
+.local_evidence_family_hyper_group <- function(family, theta_names) {
+  family <- as.character(family)
+  theta_names <- as.character(theta_names)
+  group <- intersect(c(paste0("mu_", family), paste0("log_sigma2_", family)), theta_names)
+  if (!length(group) && family %in% theta_names) {
+    group <- family
+  }
+  group
+}
+
+local_evidence_detect_kernel_axis <- function(posterior_comparison,
+                                              theta_names,
+                                              mean_error_weight = 1,
+                                              wasserstein_weight = 0.25,
+                                              shape_weight = 0.1,
+                                              min_abs_standardized_mean_error = 0) {
+  if (!is.data.frame(posterior_comparison) || !nrow(posterior_comparison)) {
+    stop("posterior_comparison must be a non-empty data frame.")
+  }
+  if (!"parameter" %in% names(posterior_comparison)) {
+    stop("posterior_comparison must contain a parameter column.")
+  }
+  if (!"standardized_mean_error" %in% names(posterior_comparison)) {
+    stop("posterior_comparison must contain a standardized_mean_error column.")
+  }
+  theta_names <- as.character(theta_names)
+  comparison <- posterior_comparison
+  comparison$family <- .local_evidence_posterior_parameter_family(comparison$parameter)
+  comparison$abs_standardized_mean_error <- abs(as.numeric(comparison$standardized_mean_error))
+  comparison$scaled_q_wasserstein <- if ("scaled_q_wasserstein" %in% names(comparison)) {
+    as.numeric(comparison$scaled_q_wasserstein)
+  } else {
+    0
+  }
+  comparison$shape_error <- if ("shape_error" %in% names(comparison)) {
+    as.numeric(comparison$shape_error)
+  } else {
+    0
+  }
+
+  families <- unique(comparison$family)
+  rows <- lapply(families, function(family) {
+    idx <- comparison$family == family
+    group <- .local_evidence_family_hyper_group(family, theta_names)
+    if (!length(group)) return(NULL)
+    data.frame(
+      family = family,
+      active_hyper_names = paste(group, collapse = "+"),
+      dimension = length(group),
+      max_abs_standardized_mean_error = max(comparison$abs_standardized_mean_error[idx], na.rm = TRUE),
+      max_scaled_q_wasserstein = max(comparison$scaled_q_wasserstein[idx], na.rm = TRUE),
+      max_shape_error = max(comparison$shape_error[idx], na.rm = TRUE),
+      parameters = paste(comparison$parameter[idx], collapse = ","),
+      check.names = FALSE
+    )
+  })
+  table <- do.call(rbind, Filter(Negate(is.null), rows))
+  if (!is.data.frame(table) || !nrow(table)) {
+    stop("posterior_comparison did not map to any theta hyperparameter axis.")
+  }
+  table$max_abs_standardized_mean_error[!is.finite(table$max_abs_standardized_mean_error)] <- 0
+  table$max_scaled_q_wasserstein[!is.finite(table$max_scaled_q_wasserstein)] <- 0
+  table$max_shape_error[!is.finite(table$max_shape_error)] <- 0
+  table$posterior_axis_score <-
+    as.numeric(mean_error_weight) * table$max_abs_standardized_mean_error +
+    as.numeric(wasserstein_weight) * table$max_scaled_q_wasserstein +
+    as.numeric(shape_weight) * table$max_shape_error
+  table <- table[order(
+    -table$posterior_axis_score,
+    -table$max_abs_standardized_mean_error,
+    table$family
+  ), , drop = FALSE]
+  eligible <- table$max_abs_standardized_mean_error >=
+    as.numeric(min_abs_standardized_mean_error)
+  if (!any(eligible)) {
+    eligible[1L] <- TRUE
+  }
+  selected <- table[which(eligible)[1L], , drop = FALSE]
+  active_hyper_names <- strsplit(selected$active_hyper_names[1L], "+", fixed = TRUE)[[1L]]
+  structure(
+    list(
+      active_hyper_names = active_hyper_names,
+      family = selected$family[1L],
+      selected = selected,
+      table = table
+    ),
+    class = "local_evidence_posterior_kernel_axis"
+  )
+}
+
+local_evidence_summarize_probe_replicates <- function(probes,
+                                                      theta_row_col = "theta_row",
+                                                      log_m_col = "log_marginal",
+                                                      se_col = "path_se") {
+  if (!is.data.frame(probes) || !nrow(probes)) {
+    stop("probes must be a non-empty data frame.")
+  }
+  required <- c(theta_row_col, log_m_col)
+  missing <- setdiff(required, names(probes))
+  if (length(missing)) {
+    stop("probe data is missing columns: ", paste(missing, collapse = ", "))
+  }
+  parts <- split(probes, probes[[theta_row_col]], drop = TRUE)
+  do.call(rbind, lapply(parts, function(df) {
+    z <- as.numeric(df[[log_m_col]])
+    z <- z[is.finite(z)]
+    se <- if (se_col %in% names(df)) as.numeric(df[[se_col]]) else NA_real_
+    se <- se[is.finite(se)]
+    data.frame(
+      theta_row = as.integer(df[[theta_row_col]][1L]),
+      probe_log_m = if (length(z)) logsumexp(z) - log(length(z)) else NA_real_,
+      probe_sd = if (length(z) > 1L) stats::sd(z) else if (length(se)) mean(se) else NA_real_,
+      probe_reps = length(z),
+      probe_min = if (length(z)) min(z) else NA_real_,
+      probe_max = if (length(z)) max(z) else NA_real_,
+      check.names = FALSE
+    )
+  }))
+}
+
+local_evidence_tune_kernel_residual_patch <- function(theta,
+                                                      base_log_m,
+                                                      probe_theta_row,
+                                                      probe_log_m,
+                                                      probe_sd = NULL,
+                                                      theta_weights = NULL,
+                                                      active_hyper_names,
+                                                      kernel_scale_grid = c(0.35, 0.5, 0.75),
+                                                      scale_floor_grid = c(0.25, 1, 2),
+                                                      shrink_grid = c(4),
+                                                      min_train = 4L,
+                                                      probe_sd_floor = 0.05,
+                                                      selection_score = c("loo", "replicate_validation"),
+                                                      probe_replicates = NULL,
+                                                      replicate_col = "replicate",
+                                                      log_m_col = "log_marginal",
+                                                      se_col = "path_se") {
+  theta <- as.data.frame(theta, check.names = FALSE)
+  n_theta <- nrow(theta)
+  selection_score <- match.arg(selection_score)
+  if (is.null(theta_weights)) {
+    theta_weights <- rep(1 / n_theta, n_theta)
+  }
+  theta_weights <- .local_chart_normalize_weights(theta_weights, n_theta)
+  active_hyper_names <- intersect(as.character(active_hyper_names), names(theta))
+  if (!length(active_hyper_names)) {
+    stop("active_hyper_names must select at least one theta column.")
+  }
+  group <- active_hyper_names
+
+  replicate_validation_score <- function(group, kernel_scale, scale_floor, shrink) {
+    if (is.null(probe_replicates) ||
+        !is.data.frame(probe_replicates) ||
+        !nrow(probe_replicates) ||
+        !replicate_col %in% names(probe_replicates)) {
+      return(NA_real_)
+    }
+    reps <- sort(unique(probe_replicates[[replicate_col]]))
+    if (length(reps) < 2L) {
+      return(NA_real_)
+    }
+    err2 <- numeric()
+    err_w <- numeric()
+    for (rep_id in reps) {
+      train_raw <- probe_replicates[probe_replicates[[replicate_col]] != rep_id, , drop = FALSE]
+      valid_raw <- probe_replicates[probe_replicates[[replicate_col]] == rep_id, , drop = FALSE]
+      train <- local_evidence_summarize_probe_replicates(
+        train_raw,
+        theta_row_col = "theta_row",
+        log_m_col = log_m_col,
+        se_col = se_col
+      )
+      valid <- local_evidence_summarize_probe_replicates(
+        valid_raw,
+        theta_row_col = "theta_row",
+        log_m_col = log_m_col,
+        se_col = se_col
+      )
+      fit <- local_evidence_fit_kernel_residual_patch(
+        theta = theta,
+        base_log_m = base_log_m,
+        probe_theta_row = train$theta_row,
+        probe_log_m = train$probe_log_m,
+        probe_sd = train$probe_sd,
+        theta_weights = theta_weights,
+        active_hyper_names = group,
+        kernel_scale = kernel_scale,
+        scale_floor = scale_floor,
+        shrink = shrink,
+        min_train = min_train,
+        probe_sd_floor = probe_sd_floor
+      )
+      pred <- fit$correction[valid$theta_row]
+      truth <- valid$probe_log_m - as.numeric(base_log_m[valid$theta_row])
+      ok <- is.finite(pred) & is.finite(truth)
+      if (any(ok)) {
+        err2 <- c(err2, (pred[ok] - truth[ok])^2)
+        err_w <- c(err_w, theta_weights[valid$theta_row][ok])
+      }
+    }
+    if (!length(err2)) {
+      return(NA_real_)
+    }
+    sqrt(sum(err2 * pmax(err_w, .Machine$double.eps)) / sum(pmax(err_w, .Machine$double.eps)))
+  }
+
+  fits <- list()
+  rows <- list()
+  idx <- 0L
+  group_key <- paste(group, collapse = "+")
+  for (kernel_scale in as.numeric(kernel_scale_grid)) {
+    for (scale_floor in as.numeric(scale_floor_grid)) {
+      for (shrink in as.numeric(shrink_grid)) {
+        idx <- idx + 1L
+        fit <- local_evidence_fit_kernel_residual_patch(
+          theta = theta,
+          base_log_m = base_log_m,
+          probe_theta_row = probe_theta_row,
+          probe_log_m = probe_log_m,
+          probe_sd = probe_sd,
+          theta_weights = theta_weights,
+          active_hyper_names = group,
+          kernel_scale = kernel_scale,
+          scale_floor = scale_floor,
+          shrink = shrink,
+          min_train = min_train,
+          probe_sd_floor = probe_sd_floor
+        )
+        diag <- fit$diagnostics
+        validation <- replicate_validation_score(group, kernel_scale, scale_floor, shrink)
+        score <- if (identical(selection_score, "replicate_validation") &&
+                     is.finite(validation)) {
+          validation
+        } else {
+          as.numeric(diag$loo_rmse[1L])
+        }
+        fits[[idx]] <- fit
+        rows[[idx]] <- data.frame(
+          setting_id = idx,
+          active_hyper_names = group_key,
+          dimension = length(group),
+          kernel_scale = kernel_scale,
+          scale_floor = scale_floor,
+          shrink = shrink,
+          score = score,
+          score_source = if (identical(selection_score, "replicate_validation") &&
+                             is.finite(validation)) "replicate_validation" else "loo",
+          replicate_validation_rmse = validation,
+          loo_rmse = as.numeric(diag$loo_rmse[1L]),
+          training_rmse = as.numeric(diag$training_rmse[1L]),
+          signal_sd = as.numeric(diag$signal_sd[1L]),
+          reliability = as.numeric(diag$reliability[1L]),
+          shape_scale = as.numeric(diag$shape_scale[1L]),
+          offset = as.numeric(diag$offset[1L]),
+          status = as.character(diag$status[1L]),
+          check.names = FALSE
+        )
+      }
+    }
+  }
+  table <- do.call(rbind, rows)
+  selectable <- is.finite(table$score) & table$status == "fitted"
+  if (!any(selectable)) {
+    best <- which.min(seq_len(nrow(table)))
+  } else {
+    candidates <- which(selectable)
+    best <- candidates[which.min(table$score[candidates])]
+  }
+  out <- fits[[best]]
+  out$selection_table <- table
+  out$selected <- table[best, , drop = FALSE]
+  class(out) <- c("local_evidence_tuned_kernel_residual_patch", class(out))
+  out
 }
 
 local_chart_score <- function(theta, alpha, weights = NULL, population_model) {
