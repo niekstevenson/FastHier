@@ -5068,6 +5068,1450 @@ diagnose_shape_probe_residuals <- function(x,
   )
 }
 
+build_shape_residual_pool <- function(x,
+                                      labels = NULL,
+                                      population_model = NULL,
+                                      deduplicate = TRUE,
+                                      theta_digits = 14L,
+                                      uncertainty_floor = 1e-6) {
+  sources <- if (inherits(x, "local_evidence_shape_probe_result") ||
+                 (is.list(x) && !is.null(x$shape_probe)) ||
+                 is.data.frame(x)) {
+    list(x)
+  } else if (is.list(x)) {
+    x
+  } else {
+    stop("x must be a shape probe result, result bundle, residual data frame, or a list of those.")
+  }
+  if (!length(sources)) {
+    stop("shape residual pool requires at least one source.")
+  }
+  labels <- labels %||% names(sources)
+  if (is.null(labels) || length(labels) != length(sources)) {
+    labels <- sprintf("round_%02d", seq_along(sources))
+  }
+
+  extract_source <- function(obj, round_id, label) {
+    probe <- if (inherits(obj, "local_evidence_shape_probe_result")) {
+      obj
+    } else if (is.list(obj) && inherits(obj$shape_probe, "local_evidence_shape_probe_result")) {
+      obj$shape_probe
+    } else {
+      NULL
+    }
+    residuals <- if (!is.null(probe)) {
+      probe$residuals
+    } else if (is.data.frame(obj)) {
+      obj
+    } else if (is.list(obj) && is.data.frame(obj$residuals)) {
+      obj$residuals
+    } else {
+      stop("source ", label, " does not contain shape residual rows.")
+    }
+    residuals <- as.data.frame(residuals, stringsAsFactors = FALSE, check.names = FALSE)
+    if (!nrow(residuals)) {
+      stop("source ", label, " contains no shape residual rows.")
+    }
+    model <- population_model %||%
+      attr(probe, "population_model") %||%
+      attr(obj, "population_model") %||%
+      obj$population_model %||%
+      (if (!is.null(probe)) attr(probe$cloud, "population_model") else NULL)
+    if (is.null(model)) {
+      stop("population_model is required for source ", label, ".")
+    }
+    model <- normalize_population_model(model)
+    missing_theta <- setdiff(model$hyper_names, names(residuals))
+    if (length(missing_theta)) {
+      stop("source ", label, " residuals are missing theta columns: ", paste(missing_theta, collapse = ", "))
+    }
+
+    residuals$pool_round_id <- as.integer(round_id)
+    residuals$pool_round_label <- as.character(label)
+    residuals$pool_source_index <- seq_len(nrow(residuals))
+    residuals$pool_is_holdout <- as.character(residuals$probe_set %||% "") == "holdout"
+    residuals$pool_is_repair_probe <- as.character(residuals$probe_set %||% "") == "repair"
+
+    repair <- if (is.list(obj)) obj$shape_repair else NULL
+    repair_rows <- if (!is.null(repair) && is.data.frame(repair$selected_candidates)) {
+      repair$selected_candidates
+    } else {
+      data.frame()
+    }
+    residuals$pool_repair_selected <- FALSE
+    residuals$pool_repair_activated <- NA
+    residuals$pool_repair_normalizer_certified <- NA
+    residuals$pool_repair_method <- NA_character_
+    if (nrow(repair_rows) &&
+        all(c("local_pos", "base_theta_row") %in% names(repair_rows))) {
+      key <- paste(as.integer(repair_rows$local_pos), as.integer(repair_rows$base_theta_row), sep = "\r")
+      idx <- match(paste(as.integer(residuals$local_pos), as.integer(residuals$theta_row), sep = "\r"), key)
+      hit <- is.finite(idx)
+      residuals$pool_repair_selected[hit] <- TRUE
+      if ("repair_activation_success" %in% names(repair_rows)) {
+        residuals$pool_repair_activated[hit] <- repair_rows$repair_activation_success[idx[hit]]
+      }
+      if ("repair_normalizer_certified" %in% names(repair_rows)) {
+        residuals$pool_repair_normalizer_certified[hit] <- repair_rows$repair_normalizer_certified[idx[hit]]
+      }
+      if ("repair_normalizer_method" %in% names(repair_rows)) {
+        residuals$pool_repair_method[hit] <- as.character(repair_rows$repair_normalizer_method[idx[hit]])
+      }
+    }
+    list(residuals = residuals, population_model = model)
+  }
+
+  extracted <- Map(extract_source, sources, seq_along(sources), labels)
+  models <- lapply(extracted, `[[`, "population_model")
+  model <- population_model %||% models[[1L]]
+  model <- normalize_population_model(model)
+  model_key <- paste(model$hyper_names, collapse = "\r")
+  for (m in models) {
+    if (!identical(paste(normalize_population_model(m)$hyper_names, collapse = "\r"), model_key)) {
+      stop("all shape residual pool sources must use the same population model.")
+    }
+  }
+  residuals <- .local_atlas_rbind_fill(lapply(extracted, `[[`, "residuals"))
+  residuals$local_pos <- as.integer(residuals$local_pos)
+  residuals$theta_row <- as.integer(residuals$theta_row)
+  residuals$theta_weight <- as.numeric(residuals$theta_weight)
+  residuals$residual <- as.numeric(residuals$residual)
+  residuals$residual_se <- as.numeric(residuals$residual_se)
+  residuals$residual_se[!is.finite(residuals$residual_se) |
+                           residuals$residual_se < as.numeric(uncertainty_floor)] <-
+    as.numeric(uncertainty_floor)
+  residuals$probe_set <- as.character(residuals$probe_set %||% "probe")
+  residuals$probe_set[is.na(residuals$probe_set) | !nzchar(residuals$probe_set)] <- "probe"
+
+  theta_matrix <- as.matrix(residuals[, model$hyper_names, drop = FALSE])
+  storage.mode(theta_matrix) <- "double"
+  theta_key <- apply(signif(theta_matrix, as.integer(theta_digits)), 1L, paste, collapse = "\r")
+  residuals$pool_theta_key <- theta_key
+  local_theta_key <- paste(residuals$pool_round_id, residuals$local_pos, residuals$pool_theta_key, sep = "\r")
+  residuals$pool_local_theta_key <- local_theta_key
+
+  if (isTRUE(deduplicate) && anyDuplicated(local_theta_key)) {
+    order_key <- order(
+      residuals$pool_round_id,
+      residuals$local_pos,
+      residuals$pool_theta_key,
+      residuals$residual_se,
+      residuals$pool_source_index
+    )
+    residuals <- residuals[order_key, , drop = FALSE]
+    residuals <- residuals[!duplicated(residuals$pool_local_theta_key), , drop = FALSE]
+    theta_matrix <- as.matrix(residuals[, model$hyper_names, drop = FALSE])
+    storage.mode(theta_matrix) <- "double"
+    theta_key <- residuals$pool_theta_key
+  }
+
+  theta_groups <- split(seq_len(nrow(residuals)), residuals$pool_theta_key, drop = TRUE)
+  theta <- do.call(rbind, lapply(theta_groups, function(idx) theta_matrix[idx[1L], , drop = FALSE]))
+  colnames(theta) <- model$hyper_names
+  theta_weight <- vapply(theta_groups, function(idx) {
+    w <- residuals$theta_weight[idx]
+    w <- w[is.finite(w) & w >= 0]
+    if (length(w)) max(w) else 0
+  }, numeric(1L))
+  theta_weight <- .local_chart_normalize_weights(theta_weight, length(theta_weight))
+  theta_metadata <- data.frame(
+    pool_theta_row = seq_len(nrow(theta)),
+    pool_theta_key = names(theta_groups),
+    theta_weight = theta_weight,
+    n_observations = vapply(theta_groups, length, integer(1L)),
+    n_rounds = vapply(theta_groups, function(idx) length(unique(residuals$pool_round_id[idx])), integer(1L)),
+    check.names = FALSE
+  )
+  residuals$pool_theta_row <- match(residuals$pool_theta_key, theta_metadata$pool_theta_key)
+  residuals$pool_theta_weight <- theta_metadata$theta_weight[residuals$pool_theta_row]
+  residuals$pool_observation_ok <- is.finite(residuals$residual) &
+    is.finite(residuals$residual_se) &
+    residuals$residual_se > 0 &
+    is.finite(residuals$pool_theta_weight) &
+    residuals$pool_theta_weight >= 0 &
+    is.finite(residuals$local_pos)
+
+  round_summary <- stats::aggregate(
+    pool_source_index ~ pool_round_id + pool_round_label,
+    data = residuals,
+    FUN = length
+  )
+  names(round_summary)[names(round_summary) == "pool_source_index"] <- "n_residuals"
+  structure(
+    list(
+      residuals = residuals,
+      theta = theta,
+      theta_metadata = theta_metadata,
+      round_summary = round_summary,
+      population_model = model,
+      settings = list(
+        labels = as.character(labels),
+        deduplicate = isTRUE(deduplicate),
+        theta_digits = as.integer(theta_digits),
+        uncertainty_floor = as.numeric(uncertainty_floor)
+      )
+    ),
+    class = "local_evidence_shape_residual_pool",
+    population_model = model
+  )
+}
+
+score_shape_residual_loss <- function(pool,
+                                      round_ids = NULL,
+                                      probe_sets = NULL,
+                                      summary_matrix = NULL,
+                                      summary_names = NULL,
+                                      summary_weights = NULL,
+                                      uncertainty_floor = 1e-6) {
+  if (inherits(pool, "local_evidence_shape_probe_result") || is.data.frame(pool)) {
+    pool <- build_shape_residual_pool(
+      pool,
+      uncertainty_floor = as.numeric(uncertainty_floor)
+    )
+  }
+  if (!inherits(pool, "local_evidence_shape_residual_pool")) {
+    stop("pool must inherit from 'local_evidence_shape_residual_pool'.")
+  }
+  residuals <- as.data.frame(pool$residuals, stringsAsFactors = FALSE, check.names = FALSE)
+  if (!is.null(round_ids)) {
+    residuals <- residuals[residuals$pool_round_id %in% as.integer(round_ids), , drop = FALSE]
+  }
+  if (!is.null(probe_sets)) {
+    residuals <- residuals[residuals$probe_set %in% as.character(probe_sets), , drop = FALSE]
+  }
+  residuals <- residuals[residuals$pool_observation_ok %in% TRUE, , drop = FALSE]
+  if (!nrow(residuals)) {
+    stop("shape residual loss scoring has no finite residual observations.")
+  }
+  residuals$residual_se[!is.finite(residuals$residual_se) |
+                           residuals$residual_se < as.numeric(uncertainty_floor)] <-
+    as.numeric(uncertainty_floor)
+  theta_weights <- pool$theta_metadata$theta_weight
+  theta_weights <- .local_chart_normalize_weights(theta_weights, length(theta_weights))
+  residuals$loss_theta_weight <- theta_weights[residuals$pool_theta_row]
+
+  local_rows <- list()
+  pair_rows <- list()
+  for (local_pos in sort(unique(residuals$local_pos))) {
+    df <- residuals[residuals$local_pos == local_pos, , drop = FALSE]
+    row_weight <- df$loss_theta_weight
+    row_weight <- .local_chart_normalize_weights(row_weight, length(row_weight))
+    offset <- sum(row_weight * df$residual)
+    centered <- df$residual - offset
+    shape_loss <- sum(row_weight * centered^2)
+    rmse <- sqrt(shape_loss)
+    evidence_var <- sum((row_weight * df$residual_se)^2)
+    local_name <- if ("local" %in% names(df)) as.character(df$local[1L]) else as.character(local_pos)
+    local_rows[[length(local_rows) + 1L]] <- data.frame(
+      local = local_name,
+      local_pos = as.integer(local_pos),
+      n_observations = nrow(df),
+      n_theta = length(unique(df$pool_theta_row)),
+      posterior_weight_mass = sum(unique(df[, c("pool_theta_row", "loss_theta_weight")])$loss_theta_weight),
+      residual_offset = offset,
+      abs_residual_offset = abs(offset),
+      local_shape_loss = shape_loss,
+      local_shape_rmse = rmse,
+      evidence_variance = evidence_var,
+      evidence_se = sqrt(evidence_var),
+      n_uncertified_atlas = if ("atlas_status" %in% names(df)) sum(df$atlas_status != "certified", na.rm = TRUE) else NA_integer_,
+      n_repair_probes = sum(df$probe_set == "repair"),
+      n_holdout_probes = sum(df$probe_set == "holdout"),
+      n_repair_selected = sum(df$pool_repair_selected %in% TRUE),
+      median_residual_se = stats::median(df$residual_se, na.rm = TRUE),
+      median_particle_mis_ess_frac = if ("particle_mis_ess_frac" %in% names(df)) {
+        stats::median(as.numeric(df$particle_mis_ess_frac), na.rm = TRUE)
+      } else {
+        NA_real_
+      },
+      max_particle_mis_psis_k = if ("particle_mis_psis_k" %in% names(df)) {
+        max(as.numeric(df$particle_mis_psis_k), na.rm = TRUE)
+      } else {
+        NA_real_
+      },
+      check.names = FALSE
+    )
+    df$local_offset <- offset
+    df$local_centered_residual <- centered
+    df$local_centered_z <- centered / pmax(df$residual_se, .Machine$double.eps)
+    df$local_shape_loss_contribution <- row_weight * centered^2
+    df$local_shape_loss_weight <- row_weight
+    pair_rows[[length(pair_rows) + 1L]] <- df
+  }
+  local_contribution <- do.call(rbind, local_rows)
+  total_local_shape_loss <- sum(local_contribution$local_shape_loss, na.rm = TRUE)
+  local_contribution$local_shape_loss_share <- if (total_local_shape_loss > 0) {
+    local_contribution$local_shape_loss / total_local_shape_loss
+  } else {
+    NA_real_
+  }
+  local_contribution$offset_fraction <- local_contribution$abs_residual_offset^2 /
+    pmax(local_contribution$abs_residual_offset^2 + local_contribution$local_shape_loss, .Machine$double.eps)
+  local_contribution <- local_contribution[order(
+    -local_contribution$local_shape_loss,
+    -local_contribution$abs_residual_offset,
+    local_contribution$local_pos
+  ), , drop = FALSE]
+
+  pair_contribution <- do.call(rbind, pair_rows)
+  total_pair_shape_loss <- sum(pair_contribution$local_shape_loss_contribution, na.rm = TRUE)
+  pair_contribution$local_shape_loss_share <- if (total_pair_shape_loss > 0) {
+    pair_contribution$local_shape_loss_contribution / total_pair_shape_loss
+  } else {
+    NA_real_
+  }
+  pair_contribution <- pair_contribution[order(
+    -pair_contribution$local_shape_loss_contribution,
+    -abs(pair_contribution$local_centered_residual),
+    pair_contribution$local_pos
+  ), , drop = FALSE]
+
+  theta_parts <- split(residuals, residuals$pool_theta_row, drop = TRUE)
+  theta_rows <- lapply(theta_parts, function(df) {
+    theta_row <- as.integer(df$pool_theta_row[1L])
+    total_residual <- sum(df$residual)
+    total_se <- sqrt(sum(df$residual_se^2))
+    data.frame(
+      pool_theta_row = theta_row,
+      pool_theta_key = as.character(df$pool_theta_key[1L]),
+      theta_weight = theta_weights[theta_row],
+      n_observations = nrow(df),
+      n_locals = length(unique(df$local_pos)),
+      n_uncertified_atlas = if ("atlas_status" %in% names(df)) sum(df$atlas_status != "certified", na.rm = TRUE) else NA_integer_,
+      total_residual = total_residual,
+      total_se = total_se,
+      total_z = total_residual / pmax(total_se, .Machine$double.eps),
+      check.names = FALSE
+    )
+  })
+  theta_contribution <- do.call(rbind, theta_rows)
+  theta_weight <- .local_chart_normalize_weights(theta_contribution$theta_weight, nrow(theta_contribution))
+  delta_mean <- sum(theta_weight * theta_contribution$total_residual)
+  theta_contribution$centered_total_residual <- theta_contribution$total_residual - delta_mean
+  theta_contribution$theta_shape_loss_contribution <- theta_weight * theta_contribution$centered_total_residual^2
+  theta_contribution$theta_weight_normalized <- theta_weight
+  l_shape <- sum(theta_contribution$theta_shape_loss_contribution)
+  theta_contribution$theta_shape_loss_share <- if (l_shape > 0) {
+    theta_contribution$theta_shape_loss_contribution / l_shape
+  } else {
+    NA_real_
+  }
+  l_z <- sum((theta_contribution$theta_weight_normalized * theta_contribution$total_se)^2)
+  summary_contribution <- data.frame()
+  l_summary <- 0
+  if (!is.null(summary_matrix)) {
+    summary_matrix <- as.matrix(summary_matrix)
+    if (nrow(summary_matrix) != nrow(pool$theta)) {
+      stop("summary_matrix must have one row per theta row in the residual pool.")
+    }
+    if (is.null(summary_names)) {
+      summary_names <- colnames(summary_matrix)
+      if (is.null(summary_names)) {
+        summary_names <- sprintf("summary_%02d", seq_len(ncol(summary_matrix)))
+      }
+    }
+    summary_names <- rep(as.character(summary_names), length.out = ncol(summary_matrix))
+    colnames(summary_matrix) <- summary_names
+    summary_weights <- summary_weights %||% rep(1, ncol(summary_matrix))
+    summary_weights <- rep(as.numeric(summary_weights), length.out = ncol(summary_matrix))
+    summary_weights[!is.finite(summary_weights) | summary_weights < 0] <- 0
+    g <- summary_matrix[theta_contribution$pool_theta_row, , drop = FALSE]
+    rows <- lapply(seq_len(ncol(g)), function(j) {
+      gj <- as.numeric(g[, j])
+      ok <- is.finite(gj) & is.finite(theta_contribution$centered_total_residual)
+      if (!any(ok)) {
+        cov_delta <- NA_real_
+        mean_g <- NA_real_
+      } else {
+        wj <- .local_chart_normalize_weights(theta_contribution$theta_weight_normalized[ok], sum(ok))
+        mean_g <- sum(wj * gj[ok])
+        cov_delta <- sum(wj * (gj[ok] - mean_g) * theta_contribution$centered_total_residual[ok])
+      }
+      data.frame(
+        summary_name = summary_names[j],
+        summary_weight = summary_weights[j],
+        summary_mean = mean_g,
+        covariance_with_delta = cov_delta,
+        weighted_covariance_sq = summary_weights[j] * cov_delta^2,
+        check.names = FALSE
+      )
+    })
+    summary_contribution <- do.call(rbind, rows)
+    l_summary <- sum(summary_contribution$weighted_covariance_sq, na.rm = TRUE)
+  }
+  theta_contribution <- theta_contribution[order(
+    -theta_contribution$theta_shape_loss_contribution,
+    -abs(theta_contribution$centered_total_residual)
+  ), , drop = FALSE]
+  repair_loss_share <- sum(pair_contribution$local_shape_loss_contribution[pair_contribution$probe_set == "repair"], na.rm = TRUE) /
+    max(total_pair_shape_loss, .Machine$double.eps)
+  holdout_loss_share <- sum(pair_contribution$local_shape_loss_contribution[pair_contribution$probe_set == "holdout"], na.rm = TRUE) /
+    max(total_pair_shape_loss, .Machine$double.eps)
+  selected_loss_share <- sum(pair_contribution$local_shape_loss_contribution[pair_contribution$pool_repair_selected %in% TRUE], na.rm = TRUE) /
+    max(total_pair_shape_loss, .Machine$double.eps)
+  score_correlation <- NA_real_
+  score_rank_correlation <- NA_real_
+  if ("shape_probe_score" %in% names(pair_contribution)) {
+    ok <- is.finite(pair_contribution$shape_probe_score) &
+      is.finite(pair_contribution$local_shape_loss_contribution)
+    if (sum(ok) > 2L) {
+      score_correlation <- suppressWarnings(stats::cor(
+        pair_contribution$shape_probe_score[ok],
+        pair_contribution$local_shape_loss_contribution[ok]
+      ))
+      score_rank_correlation <- suppressWarnings(stats::cor(
+        pair_contribution$shape_probe_score[ok],
+        pair_contribution$local_shape_loss_contribution[ok],
+        method = "spearman"
+      ))
+    }
+  }
+  summary <- data.frame(
+    n_observations = nrow(residuals),
+    n_rounds = length(unique(residuals$pool_round_id)),
+    n_locals = length(unique(residuals$local_pos)),
+    n_theta = length(unique(residuals$pool_theta_row)),
+    delta_mean = delta_mean,
+    L_shape = l_shape,
+    L_shape_rmse = sqrt(l_shape),
+    L_Z = l_z,
+    evidence_se = sqrt(l_z),
+    L_summary = l_summary,
+    L_total = l_shape + l_z + l_summary,
+    total_local_shape_loss = total_local_shape_loss,
+    total_local_shape_rmse = sqrt(total_local_shape_loss),
+    repair_probe_loss_share = repair_loss_share,
+    holdout_probe_loss_share = holdout_loss_share,
+    repair_selected_loss_share = selected_loss_share,
+    heuristic_score_correlation = score_correlation,
+    heuristic_score_rank_correlation = score_rank_correlation,
+    mean_theta_coverage = mean(theta_contribution$n_locals, na.rm = TRUE) /
+      max(length(unique(residuals$local_pos)), 1L),
+    check.names = FALSE
+  )
+  structure(
+    list(
+      summary = summary,
+      local_contribution = local_contribution,
+      theta_contribution = theta_contribution,
+      pair_contribution = pair_contribution,
+      summary_contribution = summary_contribution,
+      pool = pool,
+      settings = list(
+      round_ids = round_ids,
+      probe_sets = probe_sets,
+      summary_names = summary_names,
+      uncertainty_floor = as.numeric(uncertainty_floor)
+    )
+  ),
+    class = "local_evidence_shape_residual_loss"
+  )
+}
+
+.local_shape_feature_filtered_rows <- function(pool,
+                                               round_ids = NULL,
+                                               probe_sets = NULL,
+                                               exclude_probe_sets = NULL,
+                                               uncertainty_floor = 1e-6) {
+  if (!inherits(pool, "local_evidence_shape_residual_pool")) {
+    stop("pool must inherit from 'local_evidence_shape_residual_pool'.")
+  }
+  rows <- as.data.frame(pool$residuals, stringsAsFactors = FALSE, check.names = FALSE)
+  if (!is.null(round_ids)) {
+    rows <- rows[rows$pool_round_id %in% as.integer(round_ids), , drop = FALSE]
+  }
+  if (!is.null(probe_sets)) {
+    rows <- rows[rows$probe_set %in% as.character(probe_sets), , drop = FALSE]
+  }
+  if (!is.null(exclude_probe_sets)) {
+    rows <- rows[!rows$probe_set %in% as.character(exclude_probe_sets), , drop = FALSE]
+  }
+  rows <- rows[rows$pool_observation_ok %in% TRUE, , drop = FALSE]
+  if (!nrow(rows)) {
+    stop("finite-feature residual model has no finite training rows.")
+  }
+  rows$residual <- as.numeric(rows$residual)
+  rows$residual_se <- as.numeric(rows$residual_se)
+  rows$residual_se[!is.finite(rows$residual_se) |
+                     rows$residual_se < as.numeric(uncertainty_floor)] <-
+    as.numeric(uncertainty_floor)
+  rows$loss_theta_weight <- pool$theta_metadata$theta_weight[rows$pool_theta_row]
+  rows$loss_theta_weight[!is.finite(rows$loss_theta_weight) | rows$loss_theta_weight < 0] <- 0
+  rows
+}
+
+.local_shape_feature_directions <- function(pool,
+                                            rows,
+                                            control) {
+  model <- pool$population_model
+  theta_weight <- .local_chart_normalize_weights(pool$theta_metadata$theta_weight, nrow(pool$theta))
+  whitened <- .local_evidence_weighted_center_cov(
+    pool$theta,
+    theta_weight,
+    ridge = as.numeric(control$whitening_ridge)
+  )
+  z <- sweep(pool$theta, 2L, whitened$center, "-") %*% whitened$whitening
+  colnames(z) <- model$hyper_names
+
+  local_offset <- rep(0, nrow(rows))
+  for (local_pos in unique(rows$local_pos)) {
+    idx <- rows$local_pos == local_pos
+    w <- rows$loss_theta_weight[idx] / (rows$residual_se[idx]^2 + as.numeric(control$overdispersion_tau)^2)
+    if (!any(is.finite(w)) || sum(w, na.rm = TRUE) <= 0) {
+      w <- rep(1, sum(idx))
+    }
+    local_offset[idx] <- sum(w * rows$residual[idx]) / sum(w)
+  }
+  shape_residual <- rows$residual - local_offset
+  zscore <- shape_residual / sqrt(rows$residual_se^2 + as.numeric(control$overdispersion_tau)^2)
+  df <- as.numeric(control$student_t_df)
+  robust <- (df + 1) / pmax(df + zscore^2, .Machine$double.eps)
+  robust <- pmin(pmax(robust, 0), 1)
+  energy <- rows$loss_theta_weight * robust * shape_residual^2 /
+    (rows$residual_se^2 + as.numeric(control$overdispersion_tau)^2)
+  energy[!is.finite(energy) | energy < 0] <- 0
+
+  d <- ncol(z)
+  energy_matrix <- .local_shape_residual_energy_matrix(
+    z = z,
+    row_index = rows$pool_theta_row,
+    energy = energy,
+    d = d
+  )
+  dimnames(energy_matrix) <- list(model$hyper_names, model$hyper_names)
+  total_energy <- sum(diag(energy_matrix))
+  if (!is.finite(total_energy) || total_energy <= 0) {
+    vectors_z <- matrix(numeric(), nrow = d, ncol = 0L)
+    rownames(vectors_z) <- model$hyper_names
+    return(list(
+      status = "zero_residual_energy",
+      center = whitened$center,
+      whitening = whitened$whitening,
+      unwhitening = whitened$unwhitening,
+      whitened_theta = z,
+      energy_matrix = energy_matrix,
+      direction_vectors_whitened = vectors_z,
+      direction_vectors_theta = vectors_z,
+      directions = data.frame(),
+      direction_loadings = data.frame()
+    ))
+  }
+  eig <- eigen((energy_matrix + t(energy_matrix)) / 2, symmetric = TRUE)
+  values <- pmax(as.numeric(eig$values), 0)
+  relative <- values / max(sum(values), .Machine$double.eps)
+  keep <- seq_len(min(as.integer(control$max_directions), length(values)))
+  keep <- keep[relative[keep] >= as.numeric(control$min_direction_relative_energy)]
+  if (!length(keep)) {
+    keep <- 1L
+  }
+  vectors_z <- eig$vectors[, keep, drop = FALSE]
+  rownames(vectors_z) <- model$hyper_names
+  colnames(vectors_z) <- sprintf("active_residual_%02d", seq_along(keep))
+  vectors_theta <- whitened$unwhitening %*% vectors_z
+  rownames(vectors_theta) <- model$hyper_names
+  colnames(vectors_theta) <- colnames(vectors_z)
+  direction_rows <- lapply(seq_along(keep), function(k) {
+    theta_direction <- as.numeric(vectors_theta[, k])
+    theta_unit <- theta_direction / max(sqrt(sum(theta_direction^2)), .Machine$double.eps)
+    top <- order(abs(theta_unit), decreasing = TRUE)
+    top <- top[seq_len(min(5L, length(top)))]
+    data.frame(
+      direction = k,
+      eigenvalue = values[keep[k]],
+      relative_energy = relative[keep[k]],
+      cumulative_relative_energy = sum(relative[keep[seq_len(k)]]),
+      top_loadings = paste(
+        sprintf("%+.3f %s", theta_unit[top], model$hyper_names[top]),
+        collapse = " "
+      ),
+      check.names = FALSE
+    )
+  })
+  list(
+    status = "learned",
+    center = whitened$center,
+    whitening = whitened$whitening,
+    unwhitening = whitened$unwhitening,
+    whitened_theta = z,
+    energy_matrix = energy_matrix,
+    direction_vectors_whitened = vectors_z,
+    direction_vectors_theta = vectors_theta,
+    directions = do.call(rbind, direction_rows),
+    direction_loadings = .local_shape_residual_direction_loadings(vectors_theta, model)
+  )
+}
+
+.local_shape_feature_basis <- function(u,
+                                       include_quadratic = TRUE,
+                                       include_radial = TRUE) {
+  u <- as.matrix(u)
+  n <- nrow(u)
+  r <- ncol(u)
+  X <- matrix(1, nrow = n, ncol = 1L)
+  terms <- data.frame(
+    term = "intercept",
+    kind = "intercept",
+    direction = NA_integer_,
+    penalty = 0.05,
+    check.names = FALSE
+  )
+  if (r) {
+    for (k in seq_len(r)) {
+      X <- cbind(X, u[, k])
+      terms <- rbind(
+        terms,
+        data.frame(term = paste0("linear:", k), kind = "linear",
+                   direction = k, penalty = 1, check.names = FALSE)
+      )
+    }
+    if (isTRUE(include_quadratic)) {
+      for (k in seq_len(r)) {
+        X <- cbind(X, 0.5 * u[, k]^2)
+        terms <- rbind(
+          terms,
+          data.frame(term = paste0("quadratic:", k), kind = "quadratic",
+                     direction = k, penalty = 2, check.names = FALSE)
+        )
+      }
+    }
+    if (isTRUE(include_radial)) {
+      X <- cbind(X, rowSums(u^2))
+      terms <- rbind(
+        terms,
+        data.frame(term = "radial", kind = "radial",
+                   direction = NA_integer_, penalty = 3, check.names = FALSE)
+      )
+    }
+  }
+  colnames(X) <- terms$term
+  list(X = X, terms = terms)
+}
+
+.local_shape_fit_feature_local <- function(X_all,
+                                           rows,
+                                           theta_row,
+                                           y,
+                                           se,
+                                           theta_weight,
+                                           ridge,
+                                           student_t_df,
+                                           max_irls,
+                                           uncertainty_floor) {
+  p <- ncol(X_all)
+  empty <- list(
+    status = "no_data",
+    coefficients = rep(0, p),
+    covariance = diag(1e6, p),
+    latent_mean = rep(0, nrow(X_all)),
+    latent_var = rep(1e6, nrow(X_all)),
+    predictive_var = rep(1e6, nrow(X_all)),
+    residual_scale = NA_real_,
+    n_train = 0L,
+    effective_n = 0,
+    weighted_rmse = NA_real_,
+    loo_rmse = NA_real_
+  )
+  ok <- is.finite(theta_row) &
+    theta_row >= 1L &
+    theta_row <= nrow(X_all) &
+    is.finite(y) &
+    is.finite(se) &
+    se > 0 &
+    is.finite(theta_weight) &
+    theta_weight >= 0
+  if (!any(ok)) {
+    return(empty)
+  }
+  theta_row <- as.integer(theta_row[ok])
+  y <- as.numeric(y[ok])
+  se <- pmax(as.numeric(se[ok]), as.numeric(uncertainty_floor))
+  theta_weight <- as.numeric(theta_weight[ok])
+  X <- X_all[theta_row, , drop = FALSE]
+  base_weight <- theta_weight / se^2
+  if (!any(is.finite(base_weight)) || sum(base_weight, na.rm = TRUE) <= 0) {
+    base_weight <- 1 / se^2
+  }
+  base_weight[!is.finite(base_weight) | base_weight <= 0] <- min(base_weight[is.finite(base_weight) & base_weight > 0])
+  penalty <- attr(X_all, "feature_penalty") %||% rep(1, p)
+  penalty <- rep(as.numeric(penalty), length.out = p)
+  penalty[!is.finite(penalty) | penalty < 0] <- 1
+  beta <- rep(0, p)
+  beta[1L] <- stats::weighted.mean(y, w = pmax(theta_weight, 1e-12))
+  robust <- rep(1, length(y))
+  for (iter in seq_len(as.integer(max_irls))) {
+    w <- base_weight * robust
+    finite_w <- w[is.finite(w) & w > 0]
+    w[!is.finite(w) | w <= 0] <- if (length(finite_w)) min(finite_w) else 1
+    A <- crossprod(X, X * w) + diag(as.numeric(ridge) * penalty, p)
+    b <- crossprod(X, y * w)
+    beta_new <- as.numeric(.local_evidence_solve(A, b))
+    resid <- y - as.numeric(X %*% beta_new)
+    z <- resid / se
+    df <- as.numeric(student_t_df)
+    robust_new <- (df + 1) / pmax(df + z^2, .Machine$double.eps)
+    robust_new <- pmin(pmax(robust_new, 0), 1)
+    if (max(abs(beta_new - beta), na.rm = TRUE) < 1e-8) {
+      beta <- beta_new
+      robust <- robust_new
+      break
+    }
+    beta <- beta_new
+    robust <- robust_new
+  }
+  w <- base_weight * robust
+  finite_w <- w[is.finite(w) & w > 0]
+  w[!is.finite(w) | w <= 0] <- if (length(finite_w)) min(finite_w) else 1
+  A <- crossprod(X, X * w) + diag(as.numeric(ridge) * penalty, p)
+  V <- .local_evidence_solve(A, diag(1, p))
+  V <- (V + t(V)) / 2
+  fitted <- as.numeric(X %*% beta)
+  resid <- y - fitted
+  effective_n <- sum(w)^2 / max(sum(w^2), .Machine$double.eps)
+  weighted_rmse <- sqrt(sum(w * resid^2) / max(sum(w), .Machine$double.eps))
+  dof <- max(1, length(y) - min(p, length(y)))
+  chisq <- sum(w * resid^2) / max(dof, 1)
+  residual_scale <- max(1, chisq)
+  V <- V * residual_scale
+  loo <- rep(NA_real_, length(y))
+  if (length(y) > 1L && length(y) <= 50L) {
+    for (j in seq_along(y)) {
+      keep <- setdiff(seq_along(y), j)
+      Xj <- X[keep, , drop = FALSE]
+      yj <- y[keep]
+      wj <- w[keep]
+      Aj <- crossprod(Xj, Xj * wj) + diag(as.numeric(ridge) * penalty, p)
+      bj <- crossprod(Xj, yj * wj)
+      betaj <- as.numeric(.local_evidence_solve(Aj, bj))
+      loo[j] <- y[j] - as.numeric(X[j, , drop = FALSE] %*% betaj)
+    }
+  }
+  latent_mean <- as.numeric(X_all %*% beta)
+  latent_var <- rowSums((X_all %*% V) * X_all)
+  latent_var[!is.finite(latent_var) | latent_var < 0] <- max(latent_var[is.finite(latent_var)], 1, na.rm = TRUE)
+  predictive_var <- latent_var + weighted_rmse^2
+  list(
+    status = if (length(y) < p) "fitted_sparse" else "fitted",
+    coefficients = beta,
+    covariance = V,
+    latent_mean = latent_mean,
+    latent_var = latent_var,
+    predictive_var = predictive_var,
+    residual_scale = residual_scale,
+    n_train = length(y),
+    effective_n = effective_n,
+    weighted_rmse = weighted_rmse,
+    loo_rmse = if (any(is.finite(loo))) sqrt(mean(loo[is.finite(loo)]^2)) else NA_real_,
+    robust_weight_min = min(robust, na.rm = TRUE),
+    robust_weight_median = stats::median(robust, na.rm = TRUE)
+  )
+}
+
+fit_shape_residual_feature_model <- function(pool,
+                                             round_ids = NULL,
+                                             probe_sets = NULL,
+                                             exclude_probe_sets = "holdout",
+                                             control = list()) {
+  if (inherits(pool, "local_evidence_shape_probe_result") || is.data.frame(pool)) {
+    pool <- build_shape_residual_pool(pool)
+  }
+  if (!inherits(pool, "local_evidence_shape_residual_pool")) {
+    stop("pool must inherit from 'local_evidence_shape_residual_pool'.")
+  }
+  control <- modifyList(
+    list(
+      max_directions = 3L,
+      min_direction_relative_energy = 0.03,
+      include_quadratic = TRUE,
+      include_radial = TRUE,
+      ridge = 1,
+      whitening_ridge = 1e-8,
+      student_t_df = 4,
+      overdispersion_tau = 0.25,
+      uncertainty_floor = 1e-6,
+      max_irls = 8L
+    ),
+    control
+  )
+  rows <- .local_shape_feature_filtered_rows(
+    pool = pool,
+    round_ids = round_ids,
+    probe_sets = probe_sets,
+    exclude_probe_sets = exclude_probe_sets,
+    uncertainty_floor = as.numeric(control$uncertainty_floor)
+  )
+  directions <- .local_shape_feature_directions(pool, rows, control)
+  u <- if (ncol(directions$direction_vectors_whitened)) {
+    directions$whitened_theta %*% directions$direction_vectors_whitened
+  } else {
+    matrix(numeric(), nrow = nrow(pool$theta), ncol = 0L)
+  }
+  basis <- .local_shape_feature_basis(
+    u,
+    include_quadratic = isTRUE(control$include_quadratic),
+    include_radial = isTRUE(control$include_radial)
+  )
+  X_all <- basis$X
+  attr(X_all, "feature_penalty") <- basis$terms$penalty
+  local_ids <- sort(unique(rows$local_pos))
+  local_models <- vector("list", length(local_ids))
+  names(local_models) <- as.character(local_ids)
+  prediction_mean <- matrix(0, nrow = nrow(pool$theta), ncol = length(local_ids))
+  prediction_var <- matrix(0, nrow = nrow(pool$theta), ncol = length(local_ids))
+  colnames(prediction_mean) <- colnames(prediction_var) <- as.character(local_ids)
+  local_summary <- vector("list", length(local_ids))
+  for (k in seq_along(local_ids)) {
+    local_pos <- local_ids[k]
+    df <- rows[rows$local_pos == local_pos, , drop = FALSE]
+    fit <- .local_shape_fit_feature_local(
+      X_all = X_all,
+      rows = df,
+      theta_row = df$pool_theta_row,
+      y = df$residual,
+      se = sqrt(df$residual_se^2 + as.numeric(control$overdispersion_tau)^2),
+      theta_weight = df$loss_theta_weight,
+      ridge = as.numeric(control$ridge),
+      student_t_df = as.numeric(control$student_t_df),
+      max_irls = as.integer(control$max_irls),
+      uncertainty_floor = as.numeric(control$uncertainty_floor)
+    )
+    local_models[[k]] <- fit
+    prediction_mean[, k] <- fit$latent_mean
+    prediction_var[, k] <- fit$latent_var
+    local_name <- if ("local" %in% names(df)) as.character(df$local[1L]) else as.character(local_pos)
+    local_summary[[k]] <- data.frame(
+      local = local_name,
+      local_pos = as.integer(local_pos),
+      status = fit$status,
+      n_train = as.integer(fit$n_train),
+      effective_n = as.numeric(fit$effective_n),
+      weighted_rmse = as.numeric(fit$weighted_rmse),
+      loo_rmse = as.numeric(fit$loo_rmse),
+      residual_scale = as.numeric(fit$residual_scale),
+      robust_weight_min = as.numeric(fit$robust_weight_min %||% NA_real_),
+      robust_weight_median = as.numeric(fit$robust_weight_median %||% NA_real_),
+      mean_latent_sd = mean(sqrt(pmax(fit$latent_var, 0)), na.rm = TRUE),
+      max_latent_sd = max(sqrt(pmax(fit$latent_var, 0)), na.rm = TRUE),
+      check.names = FALSE
+    )
+  }
+  total_mean <- rowSums(prediction_mean)
+  total_var <- rowSums(prediction_var)
+  theta_weight <- .local_chart_normalize_weights(pool$theta_metadata$theta_weight, nrow(pool$theta))
+  total_mean_offset <- sum(theta_weight * total_mean)
+  total_centered_mean <- total_mean - total_mean_offset
+  predicted_shape_loss <- sum(theta_weight * total_centered_mean^2)
+  predicted_uncertainty_loss <- sum(theta_weight * total_var)
+  structure(
+    list(
+      pool = pool,
+      population_model = pool$population_model,
+      training_rows = rows,
+      directions = directions$directions,
+      direction_loadings = directions$direction_loadings,
+      direction_vectors_whitened = directions$direction_vectors_whitened,
+      direction_vectors_theta = directions$direction_vectors_theta,
+      center = directions$center,
+      whitening = directions$whitening,
+      unwhitening = directions$unwhitening,
+      whitened_theta = directions$whitened_theta,
+      feature_terms = basis$terms,
+      feature_matrix = X_all,
+      local_models = local_models,
+      local_summary = do.call(rbind, local_summary),
+      prediction_mean = prediction_mean,
+      prediction_var = prediction_var,
+      total_mean = total_mean,
+      total_var = total_var,
+      total_centered_mean = total_centered_mean,
+      summary = data.frame(
+        n_train = nrow(rows),
+        n_locals = length(local_ids),
+        n_theta = nrow(pool$theta),
+        n_directions = ncol(directions$direction_vectors_whitened),
+        n_features = ncol(X_all),
+        predicted_shape_loss = predicted_shape_loss,
+        predicted_shape_rmse = sqrt(predicted_shape_loss),
+        predicted_uncertainty_loss = predicted_uncertainty_loss,
+        predicted_uncertainty_rmse = sqrt(predicted_uncertainty_loss),
+        direction_status = directions$status,
+        check.names = FALSE
+      ),
+      settings = list(
+        round_ids = round_ids,
+        probe_sets = probe_sets,
+        exclude_probe_sets = exclude_probe_sets,
+        control = control
+      )
+    ),
+    class = "local_evidence_shape_feature_model"
+  )
+}
+
+predict_shape_residual_feature_model <- function(model,
+                                                 theta = NULL) {
+  if (!inherits(model, "local_evidence_shape_feature_model")) {
+    stop("model must inherit from 'local_evidence_shape_feature_model'.")
+  }
+  if (is.null(theta)) {
+    return(list(
+      mean = model$prediction_mean,
+      variance = model$prediction_var,
+      total_mean = model$total_mean,
+      total_variance = model$total_var,
+      total_centered_mean = model$total_centered_mean
+    ))
+  }
+  pop <- model$population_model
+  theta <- .as_hyper_matrix(theta, pop$hyper_names, pop$hyper_dim)
+  z <- sweep(theta, 2L, model$center, "-") %*% model$whitening
+  u <- if (ncol(model$direction_vectors_whitened)) {
+    z %*% model$direction_vectors_whitened
+  } else {
+    matrix(numeric(), nrow = nrow(theta), ncol = 0L)
+  }
+  basis <- .local_shape_feature_basis(
+    u,
+    include_quadratic = any(model$feature_terms$kind == "quadratic"),
+    include_radial = any(model$feature_terms$kind == "radial")
+  )
+  X <- basis$X
+  if (!identical(colnames(X), model$feature_terms$term)) {
+    stop("feature basis mismatch in shape residual prediction.")
+  }
+  mean_mat <- matrix(0, nrow = nrow(theta), ncol = length(model$local_models))
+  var_mat <- matrix(0, nrow = nrow(theta), ncol = length(model$local_models))
+  colnames(mean_mat) <- colnames(var_mat) <- names(model$local_models)
+  for (k in seq_along(model$local_models)) {
+    fit <- model$local_models[[k]]
+    mean_mat[, k] <- as.numeric(X %*% fit$coefficients)
+    var_mat[, k] <- rowSums((X %*% fit$covariance) * X)
+  }
+  var_mat[!is.finite(var_mat) | var_mat < 0] <- 0
+  total <- rowSums(mean_mat)
+  list(
+    mean = mean_mat,
+    variance = var_mat,
+    total_mean = total,
+    total_variance = rowSums(var_mat),
+    total_centered_mean = total - mean(total)
+  )
+}
+
+.local_shape_feature_matrix_for_model <- function(model,
+                                                  theta = NULL) {
+  if (!inherits(model, "local_evidence_shape_feature_model")) {
+    stop("model must inherit from 'local_evidence_shape_feature_model'.")
+  }
+  if (is.null(theta)) {
+    return(model$feature_matrix)
+  }
+  pop <- model$population_model
+  theta <- .as_hyper_matrix(theta, pop$hyper_names, pop$hyper_dim)
+  z <- sweep(theta, 2L, model$center, "-") %*% model$whitening
+  u <- if (ncol(model$direction_vectors_whitened)) {
+    z %*% model$direction_vectors_whitened
+  } else {
+    matrix(numeric(), nrow = nrow(theta), ncol = 0L)
+  }
+  basis <- .local_shape_feature_basis(
+    u,
+    include_quadratic = any(model$feature_terms$kind == "quadratic"),
+    include_radial = any(model$feature_terms$kind == "radial")
+  )
+  X <- basis$X
+  if (!identical(colnames(X), model$feature_terms$term)) {
+    stop("feature basis mismatch in shape residual model.")
+  }
+  X
+}
+
+.local_shape_active_observation_variance <- function(table,
+                                                     expected_probe_se,
+                                                     observation_tau,
+                                                     uncertainty_floor) {
+  raw_se <- if ("raw_se" %in% names(table)) as.numeric(table$raw_se) else rep(0, nrow(table))
+  raw_se[!is.finite(raw_se) | raw_se < 0] <- 0
+  expected_probe_se <- rep(as.numeric(expected_probe_se), length.out = nrow(table))
+  expected_probe_se[!is.finite(expected_probe_se) | expected_probe_se < uncertainty_floor] <-
+    as.numeric(uncertainty_floor)
+  observation_tau <- rep(as.numeric(observation_tau), length.out = nrow(table))
+  observation_tau[!is.finite(observation_tau) | observation_tau < 0] <- 0
+  pmax(raw_se^2 + expected_probe_se^2 + observation_tau^2, as.numeric(uncertainty_floor)^2)
+}
+
+.local_shape_active_support_risk <- function(table,
+                                             factor_set,
+                                             control) {
+  certified <- !is.na(table$status) & table$status == "certified"
+  ess_frac <- .local_shape_probe_numeric(table$particle_mis_ess_frac, default = 0)
+  ess_abs <- .local_shape_probe_numeric(table$particle_mis_ess, default = 0)
+  psis <- as.numeric(table$particle_mis_psis_k)
+  raw_se <- .local_shape_probe_numeric(table$raw_se, default = 0)
+  distance <- .local_shape_probe_numeric(table$min_covering_distance, default = 0)
+
+  min_ess_frac <- as.numeric(factor_set$evaluator_control$min_particle_mis_ess %||% 0.05)
+  min_ess_abs <- as.numeric(factor_set$evaluator_control$min_particle_mis_ess_abs %||% 50)
+  max_psis <- as.numeric(factor_set$evaluator_control$max_particle_mis_psis_k %||% 0.7)
+  ess_frac_deficit <- if (is.finite(min_ess_frac) && min_ess_frac > 0) {
+    pmax(min_ess_frac - ess_frac, 0) / min_ess_frac
+  } else {
+    rep(0, nrow(table))
+  }
+  ess_abs_deficit <- if (is.finite(min_ess_abs) && min_ess_abs > 0) {
+    pmax(min_ess_abs - ess_abs, 0) / min_ess_abs
+  } else {
+    rep(0, nrow(table))
+  }
+  psis_excess <- if (is.finite(max_psis)) {
+    ifelse(is.finite(psis), pmax(psis - max_psis, 0), ifelse(certified, 0, 1))
+  } else {
+    rep(0, nrow(table))
+  }
+  risk <- as.numeric(!certified) +
+    as.numeric(control$ess_frac_weight) * ess_frac_deficit +
+    as.numeric(control$ess_abs_weight) * ess_abs_deficit +
+    as.numeric(control$psis_weight) * psis_excess +
+    as.numeric(control$se_weight) * log1p(pmax(raw_se, 0)) +
+    as.numeric(control$distance_weight) * log1p(pmax(distance, 0))
+  risk[!is.finite(risk) | risk < 0] <- 0
+  risk
+}
+
+.local_shape_active_covariance <- function(fit,
+                                           X,
+                                           control) {
+  V <- as.matrix(fit$covariance)
+  V <- (V + t(V)) / 2
+  effective_n <- as.numeric(fit$effective_n %||% fit$n_train %||% 0)
+  min_effective <- as.numeric(control$min_effective_n_for_full_uncertainty %||% 4)
+  scale <- if (is.finite(min_effective) && min_effective > 0) {
+    min(1, max(effective_n, 0) / min_effective)
+  } else {
+    1
+  }
+  if (!is.finite(scale) || scale < 0) scale <- 0
+  V <- V * scale
+  max_latent_sd <- as.numeric(control$max_latent_sd %||% Inf)
+  if (is.finite(max_latent_sd) && max_latent_sd > 0) {
+    latent_var <- rowSums((X %*% V) * X)
+    max_sd <- sqrt(max(latent_var[is.finite(latent_var)], 0, na.rm = TRUE))
+    if (is.finite(max_sd) && max_sd > max_latent_sd) {
+      shrink <- max_latent_sd / max_sd
+      V <- V * shrink^2
+      scale <- scale * shrink^2
+    }
+  }
+  attr(V, "active_covariance_scale") <- scale
+  V
+}
+
+build_shape_active_acquisition_table <- function(feature_model,
+                                                 factor_set,
+                                                 raw_certification_table = NULL,
+                                                 theta = NULL,
+                                                 theta_weights = NULL,
+                                                 control = list(),
+                                                 n_cores = 1L) {
+  if (!inherits(feature_model, "local_evidence_shape_feature_model")) {
+    stop("feature_model must inherit from 'local_evidence_shape_feature_model'.")
+  }
+  factor_set <- validate_local_atlas_factor_set(factor_set)
+  model <- factor_set$population_model
+  if (!identical(model$hyper_names, feature_model$population_model$hyper_names)) {
+    stop("feature_model and factor_set use different population hyperparameters.")
+  }
+  control <- modifyList(
+    list(
+      expected_probe_se = NA_real_,
+      observation_tau = NA_real_,
+      uncertainty_floor = 1e-6,
+      lambda_shape = 1,
+      lambda_evidence = 0.10,
+      lambda_mean_shape = 0.10,
+      lambda_support = 0.10,
+      min_effective_n_for_full_uncertainty = 4,
+      min_effective_n_for_full_mean = 4,
+      max_latent_sd = NA_real_,
+      max_predicted_abs_residual = NA_real_,
+      ess_frac_weight = 1,
+      ess_abs_weight = 0.25,
+      psis_weight = 1,
+      se_weight = 0.25,
+      distance_weight = 0.25,
+      estimated_cost = 1
+    ),
+    control
+  )
+  if (is.null(raw_certification_table)) {
+    if (is.null(theta)) {
+      stop("theta or raw_certification_table is required.")
+    }
+    raw_certification_table <- evaluate_raw_local_evidence_certification(
+      factor_set = factor_set,
+      theta = theta,
+      theta_weights = theta_weights,
+      theta_source = "active_shape_acquisition",
+      include_theta = TRUE,
+      n_cores = as.integer(n_cores)
+    )
+  }
+  table <- as.data.frame(raw_certification_table, stringsAsFactors = FALSE, check.names = FALSE)
+  .local_shape_probe_required_columns(table)
+  cloud <- .local_shape_probe_cloud_from_table(
+    table = table,
+    theta = theta,
+    theta_weights = theta_weights,
+    factor_set = factor_set
+  )
+  cloud <- validate_local_evidence_certification_cloud(cloud, model)
+  table$local_pos <- as.integer(table$local_pos)
+  table$theta_row <- as.integer(table$theta_row)
+  table$theta_weight <- as.numeric(table$theta_weight)
+  if (max(table$theta_row, na.rm = TRUE) > nrow(cloud$theta)) {
+    stop("raw_certification_table theta_row values exceed the theta cloud size.")
+  }
+
+  X <- .local_shape_feature_matrix_for_model(feature_model, cloud$theta)
+  theta_weight <- .local_chart_normalize_weights(cloud$metadata$theta_weight, nrow(cloud$theta))
+  expected_probe_se <- as.numeric(control$expected_probe_se)
+  if (!is.finite(expected_probe_se) || expected_probe_se <= 0) {
+    expected_probe_se <- stats::median(feature_model$training_rows$residual_se, na.rm = TRUE)
+  }
+  if (!is.finite(expected_probe_se) || expected_probe_se <= 0) {
+    expected_probe_se <- 0.25
+  }
+  observation_tau <- as.numeric(control$observation_tau)
+  if (!is.finite(observation_tau) || observation_tau < 0) {
+    observation_tau <- as.numeric(feature_model$settings$control$overdispersion_tau %||% 0.25)
+  }
+  max_latent_sd <- as.numeric(control$max_latent_sd)
+  if (!is.finite(max_latent_sd) || max_latent_sd <= 0) {
+    observed_abs <- abs(as.numeric(feature_model$training_rows$residual))
+    observed_abs <- observed_abs[is.finite(observed_abs)]
+    max_latent_sd <- if (length(observed_abs)) {
+      max(1, as.numeric(stats::quantile(observed_abs, probs = 0.90, names = FALSE, type = 8)))
+    } else {
+      2
+    }
+    control$max_latent_sd <- max_latent_sd
+  }
+  max_predicted_abs_residual <- as.numeric(control$max_predicted_abs_residual)
+  if (!is.finite(max_predicted_abs_residual) || max_predicted_abs_residual <= 0) {
+    max_predicted_abs_residual <- max_latent_sd
+    control$max_predicted_abs_residual <- max_predicted_abs_residual
+  }
+  obs_var <- .local_shape_active_observation_variance(
+    table,
+    expected_probe_se = expected_probe_se,
+    observation_tau = observation_tau,
+    uncertainty_floor = as.numeric(control$uncertainty_floor)
+  )
+
+  model_locals <- names(feature_model$local_models)
+  support_risk <- .local_shape_active_support_risk(table, factor_set, control)
+  table$shape_pair_key <- paste(table$local_pos, table$theta_row, sep = "\r")
+  table$active_predicted_residual <- 0
+  table$active_residual_sd <- NA_real_
+  table$active_shape_reduction <- 0
+  table$active_evidence_reduction <- 0
+  table$active_local_mean_shape <- 0
+  table$active_support_risk <- support_risk
+  table$active_observation_var <- obs_var
+  table$active_estimated_cost <- as.numeric(control$estimated_cost)
+  table$active_model_status <- "unmodelled_local"
+  table$active_covariance_scale <- 0
+  table$active_mean_scale <- 0
+
+  for (local_key in unique(as.character(table$local_pos))) {
+    idx <- which(as.character(table$local_pos) == local_key)
+    model_idx <- match(local_key, model_locals)
+    if (!is.finite(model_idx)) {
+      table$active_local_mean_shape[idx] <- table$theta_weight[idx] *
+        (as.numeric(control$lambda_support) * (1 + support_risk[idx]))^2
+      next
+    }
+    fit <- feature_model$local_models[[model_idx]]
+    V <- .local_shape_active_covariance(fit, X, control)
+    phiV <- X %*% V
+    K <- phiV %*% t(X)
+    K <- (K + t(K)) / 2
+    latent_mean <- as.numeric(X %*% fit$coefficients)
+    min_effective_mean <- as.numeric(control$min_effective_n_for_full_mean)
+    effective_n <- as.numeric(fit$effective_n %||% fit$n_train %||% 0)
+    mean_scale <- if (is.finite(min_effective_mean) && min_effective_mean > 0) {
+      min(1, max(effective_n, 0) / min_effective_mean)
+    } else {
+      1
+    }
+    if (!is.finite(mean_scale) || mean_scale < 0) mean_scale <- 0
+    latent_mean <- latent_mean * mean_scale
+    latent_mean <- pmax(pmin(latent_mean, max_predicted_abs_residual), -max_predicted_abs_residual)
+    latent_var <- pmax(diag(K), 0)
+    mean_offset <- sum(theta_weight * latent_mean)
+    centered_mean <- latent_mean - mean_offset
+    covariance_offset <- as.numeric(crossprod(theta_weight, K))
+    for (row_index in idx) {
+      theta_row <- table$theta_row[row_index]
+      cov_col <- K[, theta_row]
+      centered_cov <- cov_col - covariance_offset[theta_row]
+      denom <- pmax(K[theta_row, theta_row] + obs_var[row_index], .Machine$double.eps)
+      table$active_shape_reduction[row_index] <- sum(theta_weight * centered_cov^2) / denom
+      table$active_evidence_reduction[row_index] <- (sum(theta_weight * cov_col)^2) / denom
+      table$active_predicted_residual[row_index] <- latent_mean[theta_row]
+      table$active_residual_sd[row_index] <- sqrt(latent_var[theta_row])
+      table$active_local_mean_shape[row_index] <- theta_weight[theta_row] * centered_mean[theta_row]^2
+    }
+    table$active_model_status[idx] <- fit$status %||% "fitted"
+    table$active_covariance_scale[idx] <- as.numeric(attr(V, "active_covariance_scale") %||% 1)
+    table$active_mean_scale[idx] <- mean_scale
+  }
+
+  table$active_static_score <- (
+    as.numeric(control$lambda_mean_shape) * table$active_local_mean_shape +
+      as.numeric(control$lambda_support) * table$theta_weight * table$active_support_risk
+  ) / pmax(table$active_estimated_cost, .Machine$double.eps)
+  table$active_probe_score <- table$active_static_score + (
+    as.numeric(control$lambda_shape) * table$active_shape_reduction +
+      as.numeric(control$lambda_evidence) * table$active_evidence_reduction
+  ) / pmax(table$active_estimated_cost, .Machine$double.eps)
+  table$active_lambda_shape <- as.numeric(control$lambda_shape)
+  table$active_lambda_evidence <- as.numeric(control$lambda_evidence)
+  table$active_probe_score[!is.finite(table$active_probe_score) | table$active_probe_score < 0] <- 0
+  table$active_rank <- rank(-table$active_probe_score, ties.method = "first")
+  table <- table[order(
+    -table$active_probe_score,
+    -table$active_shape_reduction,
+    -table$theta_weight,
+    table$local_pos,
+    table$theta_row
+  ), , drop = FALSE]
+  attr(table, "cloud") <- cloud
+  class(table) <- c("local_evidence_shape_active_acquisition_table", class(table))
+  table
+}
+
+.local_shape_active_select_greedy <- function(acquisition_table,
+                                             feature_model,
+                                             cloud,
+                                             max_pairs,
+                                             max_pairs_per_local,
+                                             max_pairs_per_theta,
+                                             excluded_pair_keys = character(),
+                                             score_col = "active_probe_score",
+                                             reason = "active_expected_shape_loss",
+                                             virtual_update = TRUE,
+                                             min_effective_n_for_full_uncertainty = 4,
+                                             max_latent_sd = Inf) {
+  table <- as.data.frame(acquisition_table, stringsAsFactors = FALSE, check.names = FALSE)
+  max_pairs <- as.integer(max_pairs)
+  if (!is.finite(max_pairs) || max_pairs < 0L) stop("max_pairs must be a non-negative integer.")
+  if (!max_pairs || !nrow(table)) return(table[FALSE, , drop = FALSE])
+  clean_limit <- function(x, default) {
+    if (is.null(x)) return(default)
+    if (is.infinite(x)) return(Inf)
+    x <- as.integer(x)
+    if (!is.finite(x) || x < 1L) stop("selection caps must be positive integers or Inf.")
+    x
+  }
+  max_pairs_per_local <- clean_limit(max_pairs_per_local, max_pairs)
+  max_pairs_per_theta <- clean_limit(max_pairs_per_theta, max_pairs)
+  X <- .local_shape_feature_matrix_for_model(feature_model, cloud$theta)
+  theta_weight <- .local_chart_normalize_weights(cloud$metadata$theta_weight, nrow(cloud$theta))
+  model_locals <- names(feature_model$local_models)
+  local_cov <- lapply(feature_model$local_models, function(fit) {
+    .local_shape_active_covariance(
+      fit,
+      X,
+      list(
+        min_effective_n_for_full_uncertainty = min_effective_n_for_full_uncertainty,
+        max_latent_sd = max_latent_sd
+      )
+    )
+  })
+  selected <- integer()
+  selected_keys <- as.character(excluded_pair_keys)
+  local_counts <- integer()
+  theta_counts <- integer()
+  current_score <- as.numeric(table[[score_col]])
+  current_score[!is.finite(current_score)] <- 0
+  local_counts[] <- integer()
+  theta_counts[] <- integer()
+  get_count <- function(counts, key) if (as.character(key) %in% names(counts)) counts[[as.character(key)]] else 0L
+  set_count <- function(counts, key, value) {
+    counts[[as.character(key)]] <- as.integer(value)
+    counts
+  }
+  eligible <- function(row_index) {
+    if (row_index %in% selected) return(FALSE)
+    key <- table$shape_pair_key[row_index]
+    if (key %in% selected_keys) return(FALSE)
+    local_key <- as.character(table$local_pos[row_index])
+    theta_key <- as.character(table$theta_row[row_index])
+    if (!is.infinite(max_pairs_per_local) &&
+        get_count(local_counts, local_key) >= as.integer(max_pairs_per_local)) return(FALSE)
+    if (!is.infinite(max_pairs_per_theta) &&
+        get_count(theta_counts, theta_key) >= as.integer(max_pairs_per_theta)) return(FALSE)
+    is.finite(current_score[row_index]) && current_score[row_index] > 0
+  }
+  recompute_local_scores <- function(local_key) {
+    rows <- which(as.character(table$local_pos) == local_key)
+    model_idx <- match(local_key, model_locals)
+    if (!is.finite(model_idx)) return(invisible(NULL))
+    V <- local_cov[[model_idx]]
+    K <- X %*% V %*% t(X)
+    K <- (K + t(K)) / 2
+    cov_offset <- as.numeric(crossprod(theta_weight, K))
+    for (row_index in rows) {
+      theta_row <- table$theta_row[row_index]
+      cov_col <- K[, theta_row]
+      centered_cov <- cov_col - cov_offset[theta_row]
+      denom <- pmax(K[theta_row, theta_row] + table$active_observation_var[row_index], .Machine$double.eps)
+      current_score[row_index] <<- table$active_static_score[row_index] + (
+        table$active_lambda_shape[row_index] * sum(theta_weight * centered_cov^2) +
+          table$active_lambda_evidence[row_index] * (sum(theta_weight * cov_col)^2)
+      ) / (denom * pmax(table$active_estimated_cost[row_index], .Machine$double.eps))
+      if (!is.finite(current_score[row_index]) || current_score[row_index] < 0) {
+        current_score[row_index] <<- 0
+      }
+    }
+    invisible(NULL)
+  }
+  while (length(selected) < max_pairs) {
+    candidates <- which(vapply(seq_len(nrow(table)), eligible, logical(1L)))
+    if (!length(candidates)) break
+    best <- candidates[which.max(current_score[candidates])]
+    selected <- c(selected, best)
+    selected_keys <- c(selected_keys, table$shape_pair_key[best])
+    local_key <- as.character(table$local_pos[best])
+    theta_key <- as.character(table$theta_row[best])
+    local_counts <- set_count(local_counts, local_key, get_count(local_counts, local_key) + 1L)
+    theta_counts <- set_count(theta_counts, theta_key, get_count(theta_counts, theta_key) + 1L)
+    if (isTRUE(virtual_update)) {
+      model_idx <- match(local_key, model_locals)
+      if (is.finite(model_idx)) {
+        phi <- X[table$theta_row[best], , drop = FALSE]
+        V <- local_cov[[model_idx]]
+        vphi <- V %*% t(phi)
+        denom <- as.numeric(phi %*% vphi) + table$active_observation_var[best]
+        if (is.finite(denom) && denom > .Machine$double.eps) {
+          local_cov[[model_idx]] <- (V - tcrossprod(vphi) / denom)
+          local_cov[[model_idx]] <- (local_cov[[model_idx]] + t(local_cov[[model_idx]])) / 2
+          recompute_local_scores(local_key)
+        }
+      }
+    }
+  }
+  out <- table[selected, , drop = FALSE]
+  if (nrow(out)) {
+    out$shape_selection_order <- seq_len(nrow(out))
+    out$shape_selection_reason <- reason
+    out$shape_selection_tags <- reason
+    out$active_selected_score <- current_score[selected]
+  }
+  out
+}
+
+select_shape_active_probe_pairs <- function(feature_model,
+                                            factor_set,
+                                            raw_certification_table = NULL,
+                                            theta = NULL,
+                                            theta_weights = NULL,
+                                            control = list(),
+                                            n_cores = 1L) {
+  factor_set <- validate_local_atlas_factor_set(factor_set)
+  control <- modifyList(
+    list(
+      max_repair_pairs = 24L,
+      max_holdout_pairs = 12L,
+      max_repair_pairs_per_local = 3L,
+      max_repair_pairs_per_theta = 3L,
+      max_holdout_pairs_per_local = 2L,
+      max_holdout_pairs_per_theta = 2L,
+      virtual_update = TRUE,
+      min_effective_n_for_full_uncertainty = 4,
+      min_effective_n_for_full_mean = 4,
+      max_latent_sd = NA_real_
+    ),
+    control
+  )
+  table <- build_shape_active_acquisition_table(
+    feature_model = feature_model,
+    factor_set = factor_set,
+    raw_certification_table = raw_certification_table,
+    theta = theta,
+    theta_weights = theta_weights,
+    control = control,
+    n_cores = as.integer(n_cores)
+  )
+  cloud <- attr(table, "cloud")
+  greedy_max_latent_sd <- as.numeric(control$max_latent_sd)
+  if (!is.finite(greedy_max_latent_sd) || greedy_max_latent_sd <= 0) {
+    finite_sd <- table$active_residual_sd[is.finite(table$active_residual_sd)]
+    greedy_max_latent_sd <- if (length(finite_sd)) max(finite_sd) else Inf
+  }
+  repair_pairs <- .local_shape_active_select_greedy(
+    acquisition_table = table,
+    feature_model = feature_model,
+    cloud = cloud,
+    max_pairs = as.integer(control$max_repair_pairs),
+    max_pairs_per_local = control$max_repair_pairs_per_local,
+    max_pairs_per_theta = control$max_repair_pairs_per_theta,
+    score_col = "active_probe_score",
+    reason = "active_expected_shape_loss",
+    virtual_update = isTRUE(control$virtual_update),
+    min_effective_n_for_full_uncertainty = as.numeric(control$min_effective_n_for_full_uncertainty),
+    max_latent_sd = greedy_max_latent_sd
+  )
+  repair_keys <- repair_pairs$shape_pair_key %||% character()
+  holdout_pairs <- .local_shape_active_select_greedy(
+    acquisition_table = table,
+    feature_model = feature_model,
+    cloud = cloud,
+    max_pairs = as.integer(control$max_holdout_pairs),
+    max_pairs_per_local = control$max_holdout_pairs_per_local,
+    max_pairs_per_theta = control$max_holdout_pairs_per_theta,
+    excluded_pair_keys = repair_keys,
+    score_col = "active_probe_score",
+    reason = "active_expected_shape_loss_holdout",
+    virtual_update = isTRUE(control$virtual_update),
+    min_effective_n_for_full_uncertainty = as.numeric(control$min_effective_n_for_full_uncertainty),
+    max_latent_sd = greedy_max_latent_sd
+  )
+  total_score <- sum(table$active_probe_score, na.rm = TRUE)
+  summary <- data.frame(
+    selector = "active_feature_residual",
+    n_theta = nrow(cloud$theta),
+    n_scored_pairs = nrow(table),
+    n_repair_pairs = nrow(repair_pairs),
+    n_holdout_pairs = nrow(holdout_pairs),
+    n_repair_locals = length(unique(repair_pairs$local_pos)),
+    n_holdout_locals = length(unique(holdout_pairs$local_pos)),
+    n_repair_theta = length(unique(repair_pairs$theta_row)),
+    n_holdout_theta = length(unique(holdout_pairs$theta_row)),
+    repair_score = sum(repair_pairs$active_probe_score, na.rm = TRUE),
+    holdout_score = sum(holdout_pairs$active_probe_score, na.rm = TRUE),
+    total_score = total_score,
+    repair_score_fraction = if (total_score > 0) sum(repair_pairs$active_probe_score, na.rm = TRUE) / total_score else NA_real_,
+    holdout_score_fraction = if (total_score > 0) sum(holdout_pairs$active_probe_score, na.rm = TRUE) / total_score else NA_real_,
+    mean_repair_shape_reduction = mean(repair_pairs$active_shape_reduction, na.rm = TRUE),
+    mean_holdout_shape_reduction = mean(holdout_pairs$active_shape_reduction, na.rm = TRUE),
+    check.names = FALSE
+  )
+  structure(
+    list(
+      repair_pairs = repair_pairs,
+      holdout_pairs = holdout_pairs,
+      scored_table = table[order(as.integer(table$local_pos), as.integer(table$theta_row)), , drop = FALSE],
+      selection_summary = summary,
+      cloud = cloud,
+      control = control,
+      feature_model = feature_model
+    ),
+    class = "local_evidence_shape_probe_selection",
+    population_model = factor_set$population_model
+  )
+}
+
 .local_shape_residual_geometry_inputs <- function(x,
                                                   cloud = NULL,
                                                   theta = NULL,
@@ -7126,6 +8570,259 @@ repair_shape_residual_geometry <- function(factor_set,
       cloud = cloud,
       augmented_cloud = augmented_cloud,
       candidate_table = candidates,
+      selected_candidates = selected_out,
+      candidate_pairs = candidate_pairs,
+      repair = repair,
+      pre_certification = if (is.null(pre_table)) NULL else list(table = pre_table, summary = pre_summary),
+      post_certification = if (is.null(post_table)) NULL else list(table = post_table, summary = post_summary),
+      certification_delta = delta,
+      summary = summary,
+      settings = list(
+        control = control,
+        local_control = repair_local_control,
+        edge_control = edge_control,
+        certification_thresholds = certification_thresholds,
+        scoring_control = scoring_control,
+        seed = as.integer(seed)
+      )
+    ),
+    class = "local_evidence_shape_repair_result",
+    population_model = model
+  )
+}
+
+repair_shape_selected_probe_pairs <- function(factor_set,
+                                              shape_probe,
+                                              data_list,
+                                              loglik_fn,
+                                              control = list(),
+                                              local_control = list(),
+                                              edge_control = list(),
+                                              certification_thresholds = list(),
+                                              scoring_control = list(),
+                                              n_cores = 1L,
+                                              seed = 123L,
+                                              verbose = FALSE) {
+  factor_set <- validate_local_atlas_factor_set(factor_set)
+  model <- factor_set$population_model
+  if (!inherits(shape_probe, "local_evidence_shape_probe_result")) {
+    stop("shape_probe must inherit from 'local_evidence_shape_probe_result'.")
+  }
+  if (!is.list(data_list) || length(data_list) < length(factor_set$atlases)) {
+    stop("data_list must contain every local atlas selected for shape repair.")
+  }
+  if (!is.function(loglik_fn)) {
+    stop("loglik_fn must be a function.")
+  }
+  control <- modifyList(
+    list(
+      max_repairs = 24L,
+      min_abs_standardized_residual = 1.0,
+      min_abs_residual = 0.05,
+      M = 500L,
+      target_cess = 0.9,
+      n_mcmc_moves = 2L,
+      max_steps = 128L,
+      max_updates = NULL,
+      direct_confirmation_reps = 0L,
+      direct_confirmation_M = NULL,
+      direct_confirmation_max_sd = 1.5,
+      replicate_bootstrap_B = 200L,
+      max_direct_graph_z = 3,
+      max_direct_graph_chart_shift = 0.35,
+      max_direct_graph_existing_shift = 0.15,
+      audit_pre_repair = TRUE,
+      audit_post_repair = TRUE,
+      audit_scope = "repaired",
+      stop_on_empty = FALSE
+    ),
+    control
+  )
+  cloud <- validate_local_evidence_certification_cloud(shape_probe$cloud, model)
+  residuals <- as.data.frame(shape_probe$residuals, stringsAsFactors = FALSE, check.names = FALSE)
+  if (!nrow(residuals)) {
+    if (isTRUE(control$stop_on_empty)) stop("shape_probe contains no residual rows.")
+    return(.local_shape_repair_empty(
+      factor_set = factor_set,
+      geometry = shape_probe$geometry,
+      cloud = cloud,
+      control = control,
+      reason = "no_shape_probe_residuals"
+    ))
+  }
+  residuals <- residuals[as.character(residuals$probe_set) == "repair", , drop = FALSE]
+  if (!nrow(residuals)) {
+    if (isTRUE(control$stop_on_empty)) stop("shape_probe contains no repair residual rows.")
+    return(.local_shape_repair_empty(
+      factor_set = factor_set,
+      geometry = shape_probe$geometry,
+      cloud = cloud,
+      control = control,
+      reason = "no_repair_probe_residuals"
+    ))
+  }
+  residuals$abs_residual <- abs(as.numeric(residuals$residual))
+  residuals$abs_standardized_residual <- abs(as.numeric(residuals$standardized_residual))
+  residuals$repair_pair_score <- pmax(as.numeric(residuals$theta_weight), 0) *
+    pmax(residuals$abs_residual, 0) *
+    (1 + pmax(residuals$abs_standardized_residual, 0))
+  if ("active_probe_score" %in% names(residuals)) {
+    residuals$repair_pair_score <- residuals$repair_pair_score *
+      (1 + pmax(as.numeric(residuals$active_probe_score), 0))
+  }
+  residuals$shape_repair_eligible <- is.finite(residuals$repair_pair_score) &
+    residuals$abs_standardized_residual >= as.numeric(control$min_abs_standardized_residual) &
+    residuals$abs_residual >= as.numeric(control$min_abs_residual)
+  selected <- residuals[residuals$shape_repair_eligible, , drop = FALSE]
+  selected <- selected[order(
+    -selected$repair_pair_score,
+    -selected$abs_standardized_residual,
+    -selected$theta_weight,
+    selected$local_pos,
+    selected$theta_row
+  ), , drop = FALSE]
+  max_repairs <- as.integer(control$max_repairs)
+  if (!is.finite(max_repairs) || max_repairs < 0L) stop("max_repairs must be a non-negative integer.")
+  selected <- head(selected, max_repairs)
+  if (!nrow(selected)) {
+    if (isTRUE(control$stop_on_empty)) stop("no selected shape probes passed the exact-repair residual threshold.")
+    return(.local_shape_repair_empty(
+      factor_set = factor_set,
+      geometry = shape_probe$geometry,
+      cloud = cloud,
+      control = control,
+      reason = "no_selected_probe_pair_passed_repair_threshold"
+    ))
+  }
+  selected$candidate_kind <- "selected_exact_probe"
+  selected$base_theta_row <- as.integer(selected$theta_row)
+  selected$repair_theta_row <- as.integer(selected$theta_row)
+  selected$shape_repair_order <- seq_len(nrow(selected))
+  selected$shape_repair_reason <- "active_selected_exact_probe"
+  candidate_pairs <- unique(data.frame(
+    local_pos = as.integer(selected$local_pos),
+    theta_row = as.integer(selected$theta_row),
+    check.names = FALSE
+  ))
+  rownames(candidate_pairs) <- NULL
+
+  audit_local_ids <- .local_shape_repair_audit_local_ids(
+    control$audit_scope,
+    selected,
+    factor_set
+  )
+  pre_table <- if (isTRUE(control$audit_pre_repair) && length(audit_local_ids)) {
+    .local_shape_repair_pre_certification(
+      factor_set = factor_set,
+      shape_probe = shape_probe,
+      cloud = cloud,
+      local_ids = audit_local_ids,
+      scoring_control = scoring_control,
+      n_cores = n_cores
+    )
+  } else {
+    NULL
+  }
+  pre_summary <- if (!is.null(pre_table) && nrow(pre_table)) {
+    summarize_raw_local_evidence_certification(pre_table, thresholds = certification_thresholds)
+  } else {
+    NULL
+  }
+
+  repair_local_control <- .local_atlas_merge_control(local_control, .local_atlas_default_local_control())
+  M <- as.integer(control$M %||% repair_local_control$candidate_M %||% 500L)
+  max_updates <- as.integer(control$max_updates %||% nrow(candidate_pairs))
+  direct_confirmation_M <- as.integer(control$direct_confirmation_M %||% M)
+  repair <- local_atlas_repair_certification_pairs(
+    factor_set = factor_set,
+    theta = cloud$theta,
+    theta_weights = cloud$metadata$theta_weight,
+    data_list = data_list,
+    loglik_fn = loglik_fn,
+    candidate_pairs = candidate_pairs,
+    local_ids = unique(candidate_pairs$local_pos),
+    M = M,
+    target_cess = as.numeric(control$target_cess),
+    n_mcmc_moves = as.integer(control$n_mcmc_moves),
+    max_steps = as.integer(control$max_steps),
+    max_updates = max_updates,
+    direct_confirmation_reps = as.integer(control$direct_confirmation_reps),
+    direct_confirmation_M = direct_confirmation_M,
+    direct_confirmation_max_sd = as.numeric(control$direct_confirmation_max_sd),
+    replicate_bootstrap_B = as.integer(control$replicate_bootstrap_B),
+    max_direct_graph_z = as.numeric(control$max_direct_graph_z),
+    max_direct_graph_chart_shift = as.numeric(control$max_direct_graph_chart_shift),
+    max_direct_graph_existing_shift = as.numeric(control$max_direct_graph_existing_shift),
+    local_control = repair_local_control,
+    edge_control = edge_control,
+    seed = as.integer(seed),
+    verbose = verbose
+  )
+
+  post_table <- if (isTRUE(control$audit_post_repair) && length(audit_local_ids)) {
+    evaluate_raw_local_evidence_certification(
+      factor_set = repair$factor_set,
+      cloud = cloud,
+      local_ids = audit_local_ids,
+      scoring_control = scoring_control,
+      include_theta = FALSE,
+      n_cores = as.integer(n_cores)
+    )
+  } else {
+    NULL
+  }
+  post_summary <- if (!is.null(post_table) && nrow(post_table)) {
+    summarize_raw_local_evidence_certification(post_table, thresholds = certification_thresholds)
+  } else {
+    NULL
+  }
+  delta <- .local_shape_repair_certification_delta(pre_summary, post_summary)
+  repair_probes <- repair$probes
+  selected_out <- selected
+  if (is.data.frame(repair_probes) && nrow(repair_probes)) {
+    repair_key <- paste(repair_probes$local_pos, repair_probes$theta_row, sep = "\r")
+    selected_key <- paste(selected_out$local_pos, selected_out$theta_row, sep = "\r")
+    idx <- match(selected_key, repair_key)
+    selected_out$repair_probe_row <- idx
+    for (name in setdiff(names(repair_probes), names(selected_out))) {
+      selected_out[[paste0("repair_", name)]] <- repair_probes[[name]][idx]
+    }
+  }
+
+  summary <- data.frame(
+    status = "selected_probe_exact_repair_executed",
+    n_candidates = nrow(residuals),
+    n_eligible_candidates = sum(residuals$shape_repair_eligible %in% TRUE),
+    n_selected_candidates = nrow(selected),
+    n_candidate_pairs = nrow(candidate_pairs),
+    n_repair_probes = if (is.data.frame(repair$probes)) nrow(repair$probes) else 0L,
+    n_activated = as.integer(repair$n_activated %||% 0L),
+    n_normalizer_certified = if (is.data.frame(repair$probes) && "normalizer_certified" %in% names(repair$probes)) {
+      sum(repair$probes$normalizer_certified %in% TRUE)
+    } else {
+      0L
+    },
+    audit_scope = as.character(control$audit_scope),
+    audit_locals = paste(names(factor_set$atlases)[audit_local_ids], collapse = ","),
+    check.names = FALSE
+  )
+  if (nrow(delta)) {
+    summary$certified_fraction_before <- delta$certified_fraction_before
+    summary$certified_fraction_after <- delta$certified_fraction_after
+    summary$weighted_any_uncertified_before <- delta$weighted_any_uncertified_before
+    summary$weighted_any_uncertified_after <- delta$weighted_any_uncertified_after
+    summary$uncertified_impact_score_before <- delta$uncertified_impact_score_before
+    summary$uncertified_impact_score_after <- delta$uncertified_impact_score_after
+  }
+
+  structure(
+    list(
+      factor_set = repair$factor_set,
+      geometry = shape_probe$geometry,
+      shape_probe = shape_probe,
+      cloud = cloud,
+      augmented_cloud = cloud,
+      candidate_table = residuals,
       selected_candidates = selected_out,
       candidate_pairs = candidate_pairs,
       repair = repair,
