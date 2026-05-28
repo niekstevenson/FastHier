@@ -75,6 +75,7 @@ save_stage <- function(object, file) {
   saveRDS(object, file)
   cat(sprintf("Saved: %s\n", file))
   flush.console()
+  invisible(file)
 }
 
 write_stage_csv <- function(object, file) {
@@ -86,9 +87,7 @@ write_stage_csv <- function(object, file) {
   invisible(TRUE)
 }
 
-source("local_charts.R")
-source("outer_population_smc.R")
-source("utilities.R")
+source("hierarchical_framework.R")
 
 cli_args <- parse_cli_args(commandArgs(trailingOnly = TRUE))
 detected_cores <- suppressWarnings(parallel::detectCores(logical = TRUE))
@@ -101,11 +100,6 @@ checkpoint_file <- arg_chr(
   file.path("benchmarks", "results", "population_emc_strict_repair_realistic_v1_fixed3_compressed_k256_checkpoint_post_outer.rds")
 )
 data_file <- arg_chr(cli_args, "data_file", file.path("benchmarks", "samples", "full_EMC2.RData"))
-baseline_file <- arg_chr(
-  cli_args,
-  "baseline_file",
-  file.path("benchmarks", "results", "population_emc_strict_repair_realistic_v1_fixed3_compressed_k256_results.rds")
-)
 out_dir <- arg_chr(cli_args, "out_dir", file.path("benchmarks", "results"))
 seed <- arg_int(cli_args, "seed", 20260527L)
 cores <- arg_int(cli_args, "cores", min(4L, detected_cores))
@@ -131,7 +125,8 @@ outer_mcmc_moves <- arg_int(cli_args, "outer_mcmc_moves", 3L)
 outer_max_rounds <- arg_int(cli_args, "outer_max_rounds", 90L)
 n_draws <- arg_int(cli_args, "n_draws", 3000L)
 smc_verbose <- arg_lgl(cli_args, "smc_verbose", FALSE)
-selector <- tolower(arg_chr(cli_args, "selector", "risk"))
+selector_raw <- tolower(arg_chr(cli_args, "selector", "risk"))
+selector <- if (selector_raw %in% c("active", "active_feature", "active_feature_residual")) "active" else "risk"
 residual_source_files <- arg_chr_list(cli_args, "residual_source_files", character())
 active_round_ids <- arg_int_list(cli_args, "active_round_ids", integer())
 active_exclude_probe_sets <- arg_chr_list(cli_args, "active_exclude_probe_sets", "holdout")
@@ -140,11 +135,16 @@ active_lambda_evidence <- arg_num(cli_args, "active_lambda_evidence", 0.10)
 active_lambda_mean_shape <- arg_num(cli_args, "active_lambda_mean_shape", 0.10)
 active_lambda_support <- arg_num(cli_args, "active_lambda_support", 0.10)
 stop_after_probe <- arg_lgl(cli_args, "stop_after_probe", FALSE)
-repair_executor <- tolower(arg_chr(
+repair_executor_raw <- tolower(arg_chr(
   cli_args,
   "repair_executor",
-  if (selector %in% c("active", "active_feature", "active_feature_residual")) "selected_exact" else "geometry"
+  if (identical(selector, "active")) "selected_exact" else "geometry"
 ))
+repair_executor <- if (repair_executor_raw %in% c("selected_exact", "active_exact", "probe_exact")) {
+  "selected_exact"
+} else {
+  "geometry"
+}
 
 prefix <- file.path(out_dir, paste0("population_emc_", label))
 config_file <- paste0(prefix, "_shape_config.rds")
@@ -154,6 +154,7 @@ selection_file <- paste0(prefix, "_shape_selection.rds")
 active_pool_file <- paste0(prefix, "_shape_active_residual_pool.rds")
 active_feature_file <- paste0(prefix, "_shape_active_feature_model.rds")
 active_feature_csv <- paste0(prefix, "_shape_active_feature_summary.csv")
+active_acquisition_csv <- paste0(prefix, "_shape_active_acquisition.csv")
 probe_file <- paste0(prefix, "_shape_probe.rds")
 repair_file <- paste0(prefix, "_shape_repair.rds")
 holdout_file <- paste0(prefix, "_shape_holdout.rds")
@@ -164,62 +165,11 @@ results_file <- paste0(prefix, "_results.rds")
 comparison_csv <- paste0(prefix, "_posterior_comparison.csv")
 raw_csv <- paste0(prefix, "_shape_raw_certification.csv")
 selection_csv <- paste0(prefix, "_shape_selection.csv")
-active_acquisition_csv <- paste0(prefix, "_shape_active_acquisition.csv")
 probe_csv <- paste0(prefix, "_shape_probe_residuals.csv")
 repair_csv <- paste0(prefix, "_shape_repair_selected.csv")
 holdout_csv <- paste0(prefix, "_shape_holdout_summary.csv")
 gate_csv <- paste0(prefix, "_shape_gate_summary.csv")
 plot_file <- paste0(prefix, "_posteriors.png")
-
-select_outer_theta_cloud <- function(theta, w, max_theta, population_model, seed, tail_points_per_axis = 2L) {
-  theta <- .as_hyper_matrix(theta, population_model$hyper_names, population_model$hyper_dim)
-  w <- .local_chart_normalize_weights(w, nrow(theta))
-  max_theta <- min(as.integer(max_theta), nrow(theta))
-  if (max_theta < 1L) stop("max_theta must select at least one theta row.")
-
-  set.seed(as.integer(seed))
-  top_n <- min(nrow(theta), max(4L, floor(max_theta * 0.25)))
-  rows <- head(order(w, decreasing = TRUE), top_n)
-
-  if (tail_points_per_axis > 0L) {
-    mu_idx <- grep("^mu_", colnames(theta))
-    log_sigma_idx <- grep("^log_sigma2_", colnames(theta))
-    focus_idx <- unique(c(mu_idx, log_sigma_idx))
-    z_info <- .local_evidence_weighted_center_cov(theta, w, ridge = 1e-8)
-    z <- sweep(theta, 2L, z_info$center, "-") %*% z_info$whitening
-    axis_risk <- colSums(sweep(abs(z), 1L, w, "*"), na.rm = TRUE)
-    axis_order <- focus_idx[order(axis_risk[focus_idx], decreasing = TRUE)]
-    axis_order <- head(axis_order, max(1L, floor(max_theta * 0.15)))
-    probs <- if (tail_points_per_axis <= 1L) 0.5 else seq(0.05, 0.95, length.out = tail_points_per_axis)
-    for (j in axis_order) {
-      qj <- as.numeric(.local_atlas_weighted_quantile(theta[, j], w, probs = probs))
-      for (target in qj) {
-        rows <- c(rows, which.min(abs(theta[, j] - target)))
-      }
-    }
-  }
-
-  remaining <- setdiff(seq_len(nrow(theta)), unique(rows))
-  need <- max_theta - length(unique(rows))
-  if (need > 0L && length(remaining)) {
-    sampled <- sample(remaining, size = min(need, length(remaining)), replace = FALSE, prob = w[remaining])
-    rows <- c(rows, sampled)
-  }
-  rows <- unique(rows)
-  if (length(rows) > max_theta) {
-    keep_top <- head(order(w[rows], decreasing = TRUE), max_theta)
-    rows <- rows[keep_top]
-  }
-  rows <- rows[order(rows)]
-  theta_selected <- theta[rows, , drop = FALSE]
-  weights <- .local_chart_normalize_weights(w[rows], length(rows))
-  build_local_evidence_certification_cloud(
-    theta = theta_selected,
-    population_model = population_model,
-    theta_weights = weights,
-    theta_source = "outer_post_shape"
-  )
-}
 
 if (!file.exists(checkpoint_file)) stop("Missing checkpoint: ", checkpoint_file)
 if (!file.exists(data_file)) stop("Missing EMC2 data: ", data_file)
@@ -227,7 +177,6 @@ if (!file.exists(data_file)) stop("Missing EMC2 data: ", data_file)
 announce_step("0/8", "Load Inputs", checkpoint_file)
 checkpoint <- readRDS(checkpoint_file)
 factor_set <- validate_local_atlas_factor_set(checkpoint$factor_set)
-old_factor_set <- factor_set
 fit <- checkpoint$fit
 population_model <- factor_set$population_model
 initial_proposal <- checkpoint$initial_proposal
@@ -251,46 +200,54 @@ loglik_emc2 <- function(Theta, data_i) {
   out
 }
 
+model <- define_hierarchical_model(
+  data_list = data_list,
+  loglik_fn = loglik_emc2,
+  alpha_names = alpha_names,
+  population_model = population_model,
+  label = "emc_elpd_ddm"
+)
+
 emc_mu <- as.data.frame(parameters(ELP_DDM, selection = "mu"), check.names = FALSE)
 emc_sigma2 <- as.data.frame(parameters(ELP_DDM, selection = "sigma2"), check.names = FALSE)
 colnames(emc_mu) <- paste0("mu_", alpha_names)
 colnames(emc_sigma2) <- paste0("sigma2_", alpha_names)
 emc_draws <- data.frame(emc_mu, emc_sigma2, check.names = FALSE)
 
-baseline_draws <- NULL
-if (file.exists(baseline_file)) {
-  baseline <- readRDS(baseline_file)
-  baseline_draws <- baseline$workflow_draws
-}
-
+settings <- list(
+  label = label,
+  checkpoint_file = checkpoint_file,
+  data_file = data_file,
+  seed = seed,
+  cores = cores,
+  max_theta = max_theta,
+  tail_points_per_axis = tail_points_per_axis,
+  max_repair_pairs = max_repair_pairs,
+  max_holdout_pairs = max_holdout_pairs,
+  probe_M = probe_M,
+  probe_replicates = probe_replicates,
+  repair_M = repair_M,
+  repair_replicates = repair_replicates,
+  holdout_M = holdout_M,
+  holdout_replicates = holdout_replicates,
+  run_outer_if_required = run_outer_if_required,
+  force_outer_rerun = force_outer_rerun,
+  outer_particles = outer_particles,
+  selector = selector,
+  selector_raw = selector_raw,
+  residual_source_files = residual_source_files,
+  active_round_ids = active_round_ids,
+  active_exclude_probe_sets = active_exclude_probe_sets,
+  repair_executor = repair_executor,
+  repair_executor_raw = repair_executor_raw,
+  smc_verbose = smc_verbose
+)
 save_stage(
   list(
     label = label,
-    checkpoint_file = checkpoint_file,
-    data_file = data_file,
-    baseline_file = baseline_file,
     started_at = Sys.time(),
     settings = as.list(cli_args),
-    resolved = list(
-      seed = seed,
-      cores = cores,
-      max_theta = max_theta,
-      max_repair_pairs = max_repair_pairs,
-      max_holdout_pairs = max_holdout_pairs,
-      probe_M = probe_M,
-      repair_M = repair_M,
-      holdout_M = holdout_M,
-      outer_particles = outer_particles,
-      run_outer_if_required = run_outer_if_required,
-      force_outer_rerun = force_outer_rerun,
-      selector = selector,
-      residual_source_files = residual_source_files,
-      active_round_ids = active_round_ids,
-      active_exclude_probe_sets = active_exclude_probe_sets,
-      stop_after_probe = stop_after_probe,
-      repair_executor = repair_executor,
-      smc_verbose = smc_verbose
-    )
+    resolved = settings
   ),
   config_file
 )
@@ -300,113 +257,27 @@ local_control <- list(
   n_mcmc_moves = local_mcmc_moves,
   max_steps = local_max_steps
 )
-
-announce_step("1/8", "Posterior Theta Audit Cloud")
-theta_cloud <- select_outer_theta_cloud(
-  theta = fit$theta,
-  w = fit$w,
-  max_theta = max_theta,
-  population_model = population_model,
-  seed = seed,
-  tail_points_per_axis = tail_points_per_axis
+selection_control <- list(
+  max_repair_pairs = max_repair_pairs,
+  max_holdout_pairs = max_holdout_pairs,
+  max_repair_pairs_per_local = 2L,
+  max_repair_pairs_per_theta = 3L,
+  max_holdout_pairs_per_local = 2L,
+  max_holdout_pairs_per_theta = 3L,
+  lambda_shape = active_lambda_shape,
+  lambda_evidence = active_lambda_evidence,
+  lambda_mean_shape = active_lambda_mean_shape,
+  lambda_support = active_lambda_support,
+  certified_repair_fraction = 0.45,
+  uncertified_repair_fraction = 0.30,
+  tail_repair_fraction = 0.25,
+  certified_holdout_fraction = 0.60,
+  tail_holdout_fraction = 0.25
 )
-save_stage(theta_cloud, theta_cloud_file)
-cat(sprintf("Theta audit rows: %d\n", nrow(theta_cloud$theta)))
-
-announce_step("2/8", "Raw PMIS Certification")
-raw_certification <- evaluate_raw_local_evidence_certification(
-  factor_set = factor_set,
-  cloud = theta_cloud,
-  include_theta = TRUE,
-  n_cores = cores
-)
-save_stage(raw_certification, raw_file)
-write_stage_csv(raw_certification, raw_csv)
-raw_summary <- summarize_raw_local_evidence_certification(raw_certification)
-print(raw_summary$global, row.names = FALSE)
-
-announce_step("3/8", "Shape Probe Selection")
-active_residual_pool <- NULL
-active_feature_model <- NULL
-if (selector %in% c("active", "active_feature", "active_feature_residual")) {
-  if (!length(residual_source_files)) {
-    stop("selector=active requires --residual_source_files=file1.rds,file2.rds,...")
-  }
-  missing_sources <- residual_source_files[!file.exists(residual_source_files)]
-  if (length(missing_sources)) {
-    stop("Missing residual source files: ", paste(missing_sources, collapse = ", "))
-  }
-  residual_sources <- lapply(residual_source_files, readRDS)
-  source_labels <- tools::file_path_sans_ext(basename(residual_source_files))
-  active_residual_pool <- build_shape_residual_pool(residual_sources, labels = source_labels)
-  save_stage(active_residual_pool, active_pool_file)
-  active_feature_model <- fit_shape_residual_feature_model(
-    active_residual_pool,
-    round_ids = if (length(active_round_ids)) active_round_ids else NULL,
-    exclude_probe_sets = active_exclude_probe_sets
-  )
-  save_stage(active_feature_model, active_feature_file)
-  write_stage_csv(active_feature_model$summary, active_feature_csv)
-  print(active_feature_model$summary, row.names = FALSE)
-  selection <- select_shape_active_probe_pairs(
-    feature_model = active_feature_model,
-    factor_set = factor_set,
-    raw_certification_table = raw_certification,
-    control = list(
-      max_repair_pairs = max_repair_pairs,
-      max_holdout_pairs = max_holdout_pairs,
-      max_repair_pairs_per_local = 2L,
-      max_repair_pairs_per_theta = 3L,
-      max_holdout_pairs_per_local = 2L,
-      max_holdout_pairs_per_theta = 3L,
-      lambda_shape = active_lambda_shape,
-      lambda_evidence = active_lambda_evidence,
-      lambda_mean_shape = active_lambda_mean_shape,
-      lambda_support = active_lambda_support
-    ),
-    n_cores = cores
-  )
-  write_stage_csv(selection$scored_table, active_acquisition_csv)
-} else if (selector %in% c("risk", "heuristic")) {
-  selection <- select_shape_probe_pairs(
-    factor_set = factor_set,
-    raw_certification_table = raw_certification,
-    graph_summary = checkpoint$graph_summary %||% local_atlas_graph_summary(factor_set),
-    compression_summary = checkpoint$compression_summary %||% factor_set$compression_summary,
-    control = list(
-      max_repair_pairs = max_repair_pairs,
-      max_holdout_pairs = max_holdout_pairs,
-      max_repair_pairs_per_local = 2L,
-      max_repair_pairs_per_theta = 3L,
-      max_holdout_pairs_per_local = 2L,
-      max_holdout_pairs_per_theta = 3L,
-      certified_repair_fraction = 0.45,
-      uncertified_repair_fraction = 0.30,
-      tail_repair_fraction = 0.25,
-      certified_holdout_fraction = 0.60,
-      tail_holdout_fraction = 0.25
-    )
-  )
-} else {
-  stop("Unknown selector: ", selector)
-}
-save_stage(selection, selection_file)
-write_stage_csv(selection$scored_table, selection_csv)
-print(selection$selection_summary, row.names = FALSE)
-
-announce_step("4/8", "Direct Shape Probes")
-shape_probe <- run_shape_probe_pairs(
-  factor_set = factor_set,
-  selection = selection,
-  data_list = data_list,
-  loglik_fn = loglik_emc2,
+probe_control <- list(
   M = probe_M,
   n_replicates = probe_replicates,
-  local_control = local_control,
   bootstrap_B = bootstrap_B,
-  n_cores = cores,
-  seed = seed + 10L,
-  verbose = smc_verbose,
   geometry_control = list(
     max_directions = 3L,
     max_local_stencils = max(2L * max_repair_pairs, 8L),
@@ -417,39 +288,6 @@ shape_probe <- run_shape_probe_pairs(
     max_stencils_per_local = 2L
   )
 )
-save_stage(shape_probe, probe_file)
-write_stage_csv(shape_probe$residuals, probe_csv)
-print(shape_probe$summary, row.names = FALSE)
-
-if (isTRUE(stop_after_probe)) {
-  result <- list(
-    source_checkpoint = checkpoint_file,
-    final_source = "stopped_after_direct_shape_probe",
-    theta_cloud = theta_cloud,
-    raw_certification_summary = raw_summary,
-    selection = selection,
-    active_residual_pool = active_residual_pool,
-    active_feature_model = active_feature_model,
-    shape_probe = shape_probe,
-    population_model = population_model,
-    settings = list(
-      label = label,
-      seed = seed,
-      cores = cores,
-      selector = selector,
-      max_theta = max_theta,
-      max_repair_pairs = max_repair_pairs,
-      max_holdout_pairs = max_holdout_pairs,
-      probe_M = probe_M,
-      probe_replicates = probe_replicates
-    )
-  )
-  save_stage(result, results_file)
-  cat(sprintf("\nStopped after direct shape probes because --stop_after_probe=true.\nResults: %s\n", results_file))
-  quit(save = "no", status = 0L)
-}
-
-announce_step("5/8", "Strict Shape Repair")
 repair_control <- list(
   max_repairs = max_repair_pairs,
   M = repair_M,
@@ -475,121 +313,142 @@ repair_edge_control <- list(
   max_taylor_gap = 3.0,
   require_bar_converged = TRUE
 )
-if (repair_executor %in% c("selected_exact", "active_exact", "probe_exact")) {
-  shape_repair <- repair_shape_selected_probe_pairs(
-    factor_set = factor_set,
-    shape_probe = shape_probe,
-    data_list = data_list,
-    loglik_fn = loglik_emc2,
-    control = repair_control,
-    local_control = local_control,
-    edge_control = repair_edge_control,
-    n_cores = cores,
-    seed = seed + 20L,
-    verbose = smc_verbose
+holdout_control <- list(
+  M = holdout_M,
+  n_replicates = holdout_replicates,
+  bootstrap_B = bootstrap_B,
+  require_holdout_improvement = FALSE,
+  max_pair_centered_rmse_ratio = 1.10,
+  max_local_centered_rmse_ratio = 1.10,
+  max_total_centered_rmse_ratio = 1.10,
+  max_abs_total_increase = 0.25,
+  max_graph_edge_z_increase = 1.0
+)
+gate_control <- list(
+  min_reweight_ess_fraction = 0.50,
+  low_ess_rerun_fraction = 0.25,
+  max_psis_k = 0.70,
+  n_draws = min(n_draws, nrow(emc_draws)),
+  require_holdout_acceptance = TRUE,
+  run_outer_if_required = run_outer_if_required,
+  force_outer_rerun = force_outer_rerun,
+  outer_particles = outer_particles,
+  outer_mcmc_moves = outer_mcmc_moves,
+  outer_max_rounds = outer_max_rounds
+)
+
+stage_callback <- function(stage, object) {
+  switch(
+    stage,
+    theta_support = {
+      announce_step("1/8", "Posterior Theta Audit Cloud")
+      save_stage(object, theta_cloud_file)
+      cat(sprintf("Theta audit rows: %d\n", nrow(object$theta)))
+    },
+    local_certification = {
+      announce_step("2/8", "Raw PMIS Certification")
+      save_stage(object, raw_file)
+      write_stage_csv(object$table, raw_csv)
+      print(object$summary$global, row.names = FALSE)
+    },
+    probe_selection = {
+      announce_step("3/8", "Shape Probe Selection")
+      save_stage(object, selection_file)
+      write_stage_csv(object$selection$scored_table, selection_csv)
+      if (!is.null(object$residual_pool)) save_stage(object$residual_pool, active_pool_file)
+      if (!is.null(object$feature_model)) {
+        save_stage(object$feature_model, active_feature_file)
+        write_stage_csv(object$feature_model$summary, active_feature_csv)
+        print(object$feature_model$summary, row.names = FALSE)
+      }
+      write_stage_csv(object$acquisition_table, active_acquisition_csv)
+      print(object$selection$selection_summary, row.names = FALSE)
+    },
+    direct_probes = {
+      announce_step("4/8", "Direct Shape Probes")
+      save_stage(object, probe_file)
+      write_stage_csv(object$residuals, probe_csv)
+      print(object$summary, row.names = FALSE)
+    },
+    repair = {
+      announce_step("5/8", "Strict Shape Repair")
+      save_stage(object, repair_file)
+      write_stage_csv(object$selected_candidates, repair_csv)
+      print(object$summary, row.names = FALSE)
+    },
+    holdout = {
+      announce_step("6/8", "Holdout Validation")
+      save_stage(object, holdout_file)
+      write_stage_csv(object$summary, holdout_csv)
+      print(object$summary, row.names = FALSE)
+    },
+    outer_update = {
+      announce_step("7/8", "Outer Reweight Gate")
+      save_stage(object$gate, gate_file)
+      write_stage_csv(object$gate$summary, gate_csv)
+      print(object$gate$summary, row.names = FALSE)
+      if (!is.null(object$outer_rerun)) {
+        announce_step("8/8", "Frozen Outer Rerun")
+        save_stage(object$outer_rerun, outer_file)
+      } else if (startsWith(object$final_source, "reweighted_fit:")) {
+        announce_step("8/8", "Use Reweighted Fit", object$final_source)
+      } else {
+        announce_step("8/8", "Keep Original Fit", object$final_source)
+      }
+    }
   )
-} else if (repair_executor %in% c("geometry", "stencil")) {
-  shape_repair <- repair_shape_residual_geometry(
-    factor_set = factor_set,
-    shape_probe = shape_probe,
-    data_list = data_list,
-    loglik_fn = loglik_emc2,
-    control = repair_control,
-    local_control = local_control,
-    edge_control = repair_edge_control,
-    n_cores = cores,
-    seed = seed + 20L,
-    verbose = smc_verbose
-  )
-} else {
-  stop("Unknown repair_executor: ", repair_executor)
+  invisible(NULL)
 }
-save_stage(shape_repair, repair_file)
-write_stage_csv(shape_repair$selected_candidates, repair_csv)
-print(shape_repair$summary, row.names = FALSE)
 
-announce_step("6/8", "Holdout Validation")
-holdout_validation <- validate_shape_repair_holdout(
-  shape_repair = shape_repair,
-  shape_probe = shape_probe,
-  data_list = data_list,
-  loglik_fn = loglik_emc2,
-  control = list(
-    M = holdout_M,
-    n_replicates = holdout_replicates,
-    bootstrap_B = bootstrap_B,
-    require_holdout_improvement = FALSE,
-    max_pair_centered_rmse_ratio = 1.10,
-    max_local_centered_rmse_ratio = 1.10,
-    max_total_centered_rmse_ratio = 1.10,
-    max_abs_total_increase = 0.25,
-    max_graph_edge_z_increase = 1.0
-  ),
-  local_control = local_control,
-  n_cores = cores,
-  seed = seed + 30L,
-  verbose = smc_verbose
-)
-save_stage(holdout_validation, holdout_file)
-write_stage_csv(holdout_validation$summary, holdout_csv)
-print(holdout_validation$summary, row.names = FALSE)
-
-announce_step("7/8", "Outer Reweight Gate")
-gate <- shape_repair_outer_reweight_gate(
-  shape_repair = shape_repair,
+calibration <- run_hierarchy_shape_calibration(
+  model = model,
+  factor_set = factor_set,
   fit = fit,
-  old_factor_set = old_factor_set,
-  holdout_validation = holdout_validation,
-  reference_draws = NULL,
-  baseline_draws = NULL,
-  control = list(
-    min_reweight_ess_fraction = 0.50,
-    low_ess_rerun_fraction = 0.25,
-    max_psis_k = 0.70,
-    n_draws = min(n_draws, nrow(emc_draws)),
-    require_holdout_acceptance = TRUE
-  ),
+  initial_proposal = initial_proposal,
+  max_theta = max_theta,
+  tail_points_per_axis = tail_points_per_axis,
+  selector = selector,
+  residual_sources = residual_source_files,
+  active_round_ids = active_round_ids,
+  active_exclude_probe_sets = active_exclude_probe_sets,
+  stop_after_probe = stop_after_probe,
+  repair_executor = repair_executor,
+  local_control = local_control,
+  probe_control = probe_control,
+  selection_control = selection_control,
+  repair_control = repair_control,
+  repair_edge_control = repair_edge_control,
+  holdout_control = holdout_control,
+  gate_control = gate_control,
+  graph_summary = checkpoint$graph_summary,
+  compression_summary = checkpoint$compression_summary %||% factor_set$compression_summary,
   n_cores = cores,
-  seed = seed + 40L
+  seed = seed,
+  verbose = smc_verbose,
+  stage_callback = stage_callback
 )
-save_stage(gate, gate_file)
-write_stage_csv(gate$summary, gate_csv)
-print(gate$summary, row.names = FALSE)
 
-final_fit <- fit
-final_factor_set <- old_factor_set
-final_source <- "original_post_outer"
-outer_rerun <- NULL
-if (isTRUE(force_outer_rerun) ||
-    (isTRUE(run_outer_if_required) && isTRUE(gate$accepted) &&
-       identical(gate$decision, "rerun_outer_required_low_reweight_quality"))) {
-  announce_step("8/8", "Frozen Outer Rerun", "Gate says reweighting is not enough; running outer SMC against the repaired factor set.")
-  outer_rerun <- local_atlas_frozen_outer_rerun(
-    factor_set = shape_repair$factor_set,
-    N = outer_particles,
-    initial_proposal = initial_proposal,
-    n_mcmc_moves = outer_mcmc_moves,
-    max_rounds = outer_max_rounds,
-    n_cores = cores,
-    seed = seed + 50L,
-    verbose = smc_verbose
+if (isTRUE(stop_after_probe)) {
+  result <- list(
+    source_checkpoint = checkpoint_file,
+    final_source = calibration$final_source,
+    theta_cloud = calibration$theta_support,
+    raw_certification_summary = calibration$certification$summary,
+    selection = calibration$probe_selection$selection,
+    active_residual_pool = calibration$probe_selection$residual_pool,
+    active_feature_model = calibration$probe_selection$feature_model,
+    shape_probe = calibration$probes,
+    population_model = population_model,
+    settings = settings
   )
-  final_fit <- outer_rerun
-  final_factor_set <- shape_repair$factor_set
-  final_source <- "frozen_outer_rerun_after_shape_repair"
-  save_stage(outer_rerun, outer_file)
-} else if (isTRUE(gate$accepted) && !is.null(gate$reweighted_fit)) {
-  announce_step("8/8", "Use Reweighted Fit", gate$decision)
-  final_fit <- gate$reweighted_fit
-  final_factor_set <- shape_repair$factor_set
-  final_source <- paste0("reweighted_fit:", gate$decision)
-} else {
-  announce_step("8/8", "Keep Original Fit", gate$decision)
+  save_stage(result, results_file)
+  cat(sprintf("\nStopped after direct shape probes because --stop_after_probe=true.\nResults: %s\n", results_file))
+  quit(save = "no", status = 0L)
 }
 
 draw_n <- min(as.integer(n_draws), nrow(emc_draws))
 workflow_draws <- local_atlas_draws_from_fit(
-  final_fit,
+  calibration$fit,
   population_model = population_model,
   n_draws = draw_n,
   seed = seed + 60L
@@ -597,12 +456,13 @@ workflow_draws <- local_atlas_draws_from_fit(
 posterior_comparison <- local_atlas_compare_posterior_draws(emc_draws, workflow_draws)
 posterior_summary <- .local_atlas_metric_summary(posterior_comparison)
 write_stage_csv(posterior_comparison, comparison_csv)
+
 dir.create(dirname(plot_file), recursive = TRUE, showWarnings = FALSE)
 grDevices::png(plot_file, width = 1800, height = 1400)
 plot_posteriors(
   emc_draws,
   workflow_draws,
-  labels = c("EMC2", final_source),
+  labels = c("EMC2", calibration$final_source),
   cols = c("black", "firebrick3"),
   n_cols = 4L
 )
@@ -611,36 +471,40 @@ cat(sprintf("Saved: %s\n", plot_file))
 
 post_shape_checkpoint <- checkpoint
 post_shape_checkpoint$stage <- "post_shape_calibration"
-post_shape_checkpoint$factor_set <- final_factor_set
-post_shape_checkpoint$fit <- final_fit
-post_shape_checkpoint$shape_theta_cloud <- theta_cloud
-post_shape_checkpoint$shape_raw_certification_summary <- raw_summary
-post_shape_checkpoint$shape_selection_summary <- selection$selection_summary
+post_shape_checkpoint$factor_set <- calibration$factor_set
+post_shape_checkpoint$fit <- calibration$fit
+post_shape_checkpoint$shape_theta_cloud <- calibration$theta_support
+post_shape_checkpoint$shape_raw_certification_summary <- calibration$certification$summary
+post_shape_checkpoint$shape_selection_summary <- calibration$probe_selection$selection$selection_summary
 post_shape_checkpoint$shape_selector <- selector
-post_shape_checkpoint$shape_active_feature_summary <- if (is.null(active_feature_model)) NULL else active_feature_model$summary
-post_shape_checkpoint$shape_probe_summary <- shape_probe$summary
-post_shape_checkpoint$shape_repair_summary <- shape_repair$summary
-post_shape_checkpoint$shape_holdout_summary <- holdout_validation$summary
-post_shape_checkpoint$shape_gate_summary <- gate$summary
-post_shape_checkpoint$shape_final_source <- final_source
-post_shape_checkpoint$checkpoint_time <- Sys.time()
-save_stage(post_shape_checkpoint, checkpoint_out_file)
+post_shape_checkpoint$shape_active_feature_summary <- if (is.null(calibration$probe_selection$feature_model)) {
+  NULL
+} else {
+  calibration$probe_selection$feature_model$summary
+}
+post_shape_checkpoint$shape_probe_summary <- calibration$probes$summary
+post_shape_checkpoint$shape_repair_summary <- calibration$repair$summary
+post_shape_checkpoint$shape_holdout_summary <- calibration$holdout$summary
+post_shape_checkpoint$shape_gate_summary <- calibration$outer_update$gate$summary
+post_shape_checkpoint$shape_final_source <- calibration$final_source
+save_hierarchy_checkpoint(post_shape_checkpoint, checkpoint_out_file, stage = "post_shape_calibration")
+cat(sprintf("Saved: %s\n", checkpoint_out_file))
 
 result <- list(
   source_checkpoint = checkpoint_file,
-  final_source = final_source,
-  theta_cloud = theta_cloud,
-  raw_certification_summary = raw_summary,
-  selection = selection,
-  active_residual_pool = active_residual_pool,
-  active_feature_model = active_feature_model,
-  shape_probe = shape_probe,
-  shape_repair = shape_repair,
-  holdout_validation = holdout_validation,
-  gate = gate,
-  outer_rerun = outer_rerun,
-  fit = final_fit,
-  factor_set = final_factor_set,
+  final_source = calibration$final_source,
+  theta_cloud = calibration$theta_support,
+  raw_certification_summary = calibration$certification$summary,
+  selection = calibration$probe_selection$selection,
+  active_residual_pool = calibration$probe_selection$residual_pool,
+  active_feature_model = calibration$probe_selection$feature_model,
+  shape_probe = calibration$probes,
+  shape_repair = calibration$repair,
+  holdout_validation = calibration$holdout,
+  gate = calibration$outer_update$gate,
+  outer_rerun = calibration$outer_update$outer_rerun,
+  fit = calibration$fit,
+  factor_set = calibration$factor_set,
   population_model = population_model,
   emc_draws = emc_draws,
   workflow_draws = workflow_draws,
@@ -649,30 +513,12 @@ result <- list(
   plot_file = plot_file,
   comparison_csv = comparison_csv,
   checkpoint_file = checkpoint_out_file,
-  settings = list(
-    label = label,
-    seed = seed,
-    cores = cores,
-    max_theta = max_theta,
-    max_repair_pairs = max_repair_pairs,
-    max_holdout_pairs = max_holdout_pairs,
-    probe_M = probe_M,
-    probe_replicates = probe_replicates,
-    repair_M = repair_M,
-    repair_replicates = repair_replicates,
-    holdout_M = holdout_M,
-    holdout_replicates = holdout_replicates,
-    run_outer_if_required = run_outer_if_required,
-    force_outer_rerun = force_outer_rerun,
-    outer_particles = outer_particles,
-    selector = selector,
-    repair_executor = repair_executor
-  )
+  settings = settings
 )
 save_stage(result, results_file)
 
 cat("\nPosterior summary:\n")
 print(posterior_summary, row.names = FALSE)
-cat(sprintf("\nFinal source: %s\n", final_source))
+cat(sprintf("\nFinal source: %s\n", calibration$final_source))
 cat(sprintf("Results: %s\n", results_file))
 cat(sprintf("Checkpoint: %s\n", checkpoint_out_file))

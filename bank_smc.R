@@ -2417,138 +2417,6 @@ bank_smc_anchor_design_fit <- function(anchor_candidates,
   )
 }
 
-bank_smc_rho_sketch_anchor_candidates <- function(data_list,
-                                                  loglik_fn,
-                                                  population_model,
-                                                  theta_reference,
-                                                  rho_ladder = c(0.001, 0.01, 0.05, 0.15, 0.35, 0.75),
-                                                  outer_particles = 500L,
-                                                  sketch_starts = 8L,
-                                                  start_scale = 4,
-                                                  reference_scale = 25,
-                                                  support_weight_floor = 0.50,
-                                                  n_mcmc_moves = 2L,
-                                                  max_rounds = 80L,
-                                                  cess_target = 0.60,
-                                                  resample_threshold = 0.5,
-                                                  rw_scale = 0.8,
-                                                  n_jobs = 1L,
-                                                  seed = 123L,
-                                                  verbose = FALSE) {
-  if (!exists("fit_local_likelihood_sketches", mode = "function") ||
-      !exists("build_local_likelihood_sketch_factor_set", mode = "function")) {
-    if (file.exists("local_likelihood_sketches.R")) {
-      source("local_likelihood_sketches.R")
-    } else {
-      stop("rho sketch anchors require local_likelihood_sketches.R.")
-    }
-  }
-  model <- normalize_population_model(population_model)
-  theta_reference <- .bank_align_theta(theta_reference, model)
-  rho_ladder <- sort(unique(as.numeric(rho_ladder)))
-  rho_ladder <- rho_ladder[is.finite(rho_ladder) & rho_ladder > 0]
-  if (!length(rho_ladder)) stop("rho_ladder must contain positive finite values.")
-  support_weight_floor <- min(max(as.numeric(support_weight_floor), 0), 1)
-
-  sketch_set <- fit_local_likelihood_sketches(
-    data_list = data_list,
-    loglik_fn = loglik_fn,
-    alpha_names = model$alpha_names,
-    population_model = model,
-    theta_reference = theta_reference,
-    n_starts = as.integer(sketch_starts),
-    start_scale = as.numeric(start_scale),
-    reference_scale = as.numeric(reference_scale),
-    n_jobs = n_jobs,
-    seed = seed
-  )
-  factor_sets <- lapply(rho_ladder, function(rho) {
-    build_local_likelihood_sketch_factor_set(
-      sketch_set = sketch_set,
-      population_model = model,
-      rho = rho
-    )
-  })
-
-  fits <- vector("list", length(rho_ladder))
-  timing <- data.frame(
-    rho = rho_ladder,
-    elapsed_sec = NA_real_,
-    rounds = NA_integer_,
-    update_ess = NA_real_,
-    accept_rate = NA_real_,
-    check.names = FALSE
-  )
-  if (isTRUE(verbose)) cat("Bank SMC: rho sketch support ladder\n")
-  t0 <- system.time({
-    fits[[1L]] <- outer_population_smc(
-      factor_sets[[1L]],
-      N = as.integer(outer_particles),
-      resample_threshold = resample_threshold,
-      n_mcmc_moves = as.integer(n_mcmc_moves),
-      min_mcmc_moves = 1L,
-      max_rounds = as.integer(max_rounds),
-      rw_scale_init = rw_scale,
-      cess_target = cess_target,
-      n_cores = n_jobs,
-      seed = seed + 1000L,
-      verbose = FALSE
-    )
-  })
-  timing$elapsed_sec[1L] <- t0[["elapsed"]]
-  timing$rounds[1L] <- fits[[1L]]$meta$rounds %||% NA_integer_
-  timing$accept_rate[1L] <- tail(fits[[1L]]$meta$accept_hist %||% NA_real_, 1L)
-
-  if (length(rho_ladder) > 1L) {
-    for (j in seq_along(rho_ladder)[-1L]) {
-      tj <- system.time({
-        fits[[j]] <- update_outer_population_fit(
-          fit = fits[[j - 1L]],
-          old_factor_set = factor_sets[[j - 1L]],
-          new_factor_set = factor_sets[[j]],
-          n_mcmc_moves = as.integer(n_mcmc_moves),
-          min_mcmc_moves = 1L,
-          resample_threshold = resample_threshold,
-          n_cores = n_jobs,
-          seed = seed + 1000L + j,
-          verbose = FALSE
-        )
-      })
-      update_info <- tail(fits[[j]]$meta$factor_update, 1L)[[1L]]
-      timing$elapsed_sec[j] <- tj[["elapsed"]]
-      timing$rounds[j] <- 0L
-      timing$update_ess[j] <- update_info$ess
-      timing$accept_rate[j] <- update_info$accept_rate
-    }
-  }
-
-  theta <- do.call(rbind, lapply(fits, `[[`, "theta"))
-  weights <- unlist(lapply(fits, function(fit) {
-    wi <- .bank_normalize_weights(fit$w)
-    uniform <- rep(1 / length(wi), length(wi))
-    ((1 - support_weight_floor) * wi + support_weight_floor * uniform) / length(fits)
-  }), use.names = FALSE)
-  weights <- .bank_normalize_weights(weights)
-
-  structure(
-    list(
-      theta = theta,
-      w = weights,
-      population_model = model,
-      meta = list(
-        source = "rho_sketch_anchor_candidates",
-        rho_ladder = rho_ladder,
-        outer_particles = as.integer(outer_particles),
-        sketch_starts = as.integer(sketch_starts),
-        support_weight_floor = support_weight_floor,
-        timing = timing,
-        sketch_settings = sketch_set$settings
-      )
-    ),
-    class = "bank_smc_anchor_candidates"
-  )
-}
-
 .bank_smc_theta_feature_matrix <- function(theta, population_model) {
   model <- normalize_population_model(population_model)
   theta <- .as_hyper_matrix(theta, hyper_names = model$hyper_names, hyper_dim = model$hyper_dim)
@@ -3451,7 +3319,6 @@ fit_bank_smc_population_model <- function(data_list,
                                           initial_theta,
                                           local_control = list(),
                                           anchor_control = list(),
-                                          rho_anchor_control = list(),
                                           shape_control = list(),
                                           outer_control = list(),
                                           design_control = list(),
@@ -3493,25 +3360,6 @@ fit_bank_smc_population_model <- function(data_list,
     resample_threshold = 0.6,
     G_mix = 8L,
     rw_scale = 0.9
-  )
-  rho_anchor_defaults <- list(
-    enabled = FALSE,
-    max_challengers = 1L,
-    min_base_points = 4L,
-    candidate_pool = 96L,
-    min_distance = 0.25,
-    relevance_temperature = 10,
-    rho_ladder = c(0.001, 0.01, 0.05, 0.15, 0.35, 0.75),
-    outer_particles = 500L,
-    sketch_starts = 8L,
-    start_scale = 4,
-    reference_scale = 25,
-    support_weight_floor = 0.50,
-    n_mcmc_moves = 2L,
-    max_rounds = 80L,
-    cess_target = 0.60,
-    resample_threshold = 0.5,
-    rw_scale = 0.8
   )
   design_defaults <- list(
     support_points = 6L,
@@ -3567,7 +3415,6 @@ fit_bank_smc_population_model <- function(data_list,
   local_control <- modifyList(local_defaults, local_control)
   anchor_control <- modifyList(anchor_defaults, anchor_control)
   anchor_control$M <- as.integer(anchor_control$M %||% min(400L, local_control$M))
-  rho_anchor_control <- modifyList(rho_anchor_defaults, rho_anchor_control)
   shape_control <- modifyList(shape_defaults, shape_control)
   calibration_control <- modifyList(calibration_defaults, calibration_control)
   graph_control <- modifyList(graph_defaults, graph_control)
@@ -3640,31 +3487,6 @@ fit_bank_smc_population_model <- function(data_list,
     )
   }
 
-  rho_anchor_candidates <- NULL
-  if (isTRUE(rho_anchor_control$enabled)) {
-    if (isTRUE(verbose)) cat("Bank SMC: rho-sketch anchor candidates\n")
-    rho_anchor_candidates <- bank_smc_rho_sketch_anchor_candidates(
-      data_list = data_list,
-      loglik_fn = loglik_fn,
-      population_model = model,
-      theta_reference = initial_theta,
-      rho_ladder = rho_anchor_control$rho_ladder,
-      outer_particles = rho_anchor_control$outer_particles,
-      sketch_starts = rho_anchor_control$sketch_starts,
-      start_scale = rho_anchor_control$start_scale,
-      reference_scale = rho_anchor_control$reference_scale,
-      support_weight_floor = rho_anchor_control$support_weight_floor,
-      n_mcmc_moves = rho_anchor_control$n_mcmc_moves,
-      max_rounds = rho_anchor_control$max_rounds,
-      cess_target = rho_anchor_control$cess_target,
-      resample_threshold = rho_anchor_control$resample_threshold,
-      rw_scale = rho_anchor_control$rw_scale,
-      n_jobs = n_cores,
-      seed = seed + 75000L,
-      verbose = FALSE
-    )
-  }
-
   if (isTRUE(verbose)) cat("Bank SMC: bank-imputed population shape\n")
   shape_fit <- bank_smc_build_analytic_shape(
     banks = banks,
@@ -3685,15 +3507,6 @@ fit_bank_smc_population_model <- function(data_list,
   initial_design_control <- design_control
   initial_design_control$tail_probs <- initial_design_control$initial_tail_probs
   initial_design_control$initial_tail_probs <- NULL
-  rho_challenger_slots <- if (isTRUE(rho_anchor_control$enabled)) {
-    min(
-      as.integer(rho_anchor_control$max_challengers),
-      max(0L, initial_design_control$max_points - as.integer(rho_anchor_control$min_base_points))
-    )
-  } else {
-    0L
-  }
-  initial_design_control$max_points <- max(1L, initial_design_control$max_points - rho_challenger_slots)
   theta_design <- do.call(
     bank_smc_select_theta_design,
     c(
@@ -3707,24 +3520,6 @@ fit_bank_smc_population_model <- function(data_list,
       initial_design_control
     )
   )
-  rho_theta_design <- NULL
-  if (rho_challenger_slots > 0L) {
-    rho_theta_design <- bank_smc_select_challenger_theta(
-      anchor_candidates = rho_anchor_candidates,
-      population_model = model,
-      banks = banks,
-      reference_theta = theta_design,
-      max_points = rho_challenger_slots,
-      candidate_pool = rho_anchor_control$candidate_pool,
-      min_distance = rho_anchor_control$min_distance,
-      relevance_temperature = rho_anchor_control$relevance_temperature,
-      target_ess_frac = local_control$target_ess_frac
-    )
-    if (!is.null(rho_theta_design) && nrow(rho_theta_design)) {
-      theta_design <- .bank_unique_theta_rows(rbind(theta_design, rho_theta_design), model)
-      theta_design <- theta_design[seq_len(min(nrow(theta_design), design_control$max_points)), , drop = FALSE]
-    }
-  }
 
   if (isTRUE(verbose)) cat(sprintf("Bank SMC: initial design expansion (%d theta points)\n", nrow(theta_design)))
   design_refinement <- bank_smc_refine_banks_to_design(
@@ -4011,8 +3806,6 @@ fit_bank_smc_population_model <- function(data_list,
     factor_set = factor_set,
     shape_fit = shape_fit,
     anchor_candidates = anchor_candidates,
-    rho_anchor_candidates = rho_anchor_candidates,
-    rho_theta_design = rho_theta_design,
     fit = fit,
     theta_design = theta_design,
     design_refinement = design_refinement$refinements,
@@ -4027,7 +3820,6 @@ fit_bank_smc_population_model <- function(data_list,
       local_control = local_control,
       shape_control = shape_control,
       anchor_control = anchor_control,
-      rho_anchor_control = rho_anchor_control,
       design_control = design_control,
       calibration_control = calibration_control,
       graph_control = graph_control,

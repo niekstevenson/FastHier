@@ -89,7 +89,7 @@ if (!is.finite(detected_cores) || detected_cores < 1L) detected_cores <- 1L
 
 cli_args <- parse_cli_args(commandArgs(trailingOnly = TRUE))
 
-run_label <- arg_chr(cli_args, "label", "bank_smc_rho_anchor")
+run_label <- arg_chr(cli_args, "label", "bank_smc_anchor")
 base_seed <- arg_int(cli_args, "base_seed", 20260519L)
 cores <- arg_int(cli_args, "mc_cores", arg_int(cli_args, "cores", min(4L, detected_cores)))
 
@@ -109,8 +109,6 @@ audit_refine_rounds <- arg_int(cli_args, "audit_refine_rounds", 3L)
 force_refine_points <- arg_int(cli_args, "force_refine_points", 0L)
 force_profile_dims <- arg_int(cli_args, "force_profile_dims", 1L)
 force_tail_probs <- arg_num_vec(cli_args, "force_tail_probs", c(0.01, 0.05, 0.95, 0.99))
-rho_anchor_ladder <- arg_num_vec(cli_args, "rho_anchor_ladder", c(0.001, 0.01, 0.05, 0.15, 0.35, 0.75))
-rho_anchor_enabled <- arg_lgl(cli_args, "rho_anchor_enabled", TRUE)
 outer_particles <- arg_int(cli_args, "outer_particles", 1200L)
 outer_mcmc_moves <- arg_int(cli_args, "outer_mcmc_moves", 3L)
 outer_max_rounds <- arg_int(cli_args, "outer_max_rounds", 80L)
@@ -206,7 +204,6 @@ cat(sprintf("Design/audit: %d design points | %d audit points | audit ESS %.3f |
 cat(sprintf("Paired effect profiles: %s\n", if (isTRUE(paired_effect_profiles)) "enabled" else "disabled"))
 cat(sprintf("Forced posterior-boundary anchors: %d points | %d dims\n",
             force_refine_points, force_profile_dims))
-cat("Rho-sketch anchor ladder:", if (isTRUE(rho_anchor_enabled)) paste(rho_anchor_ladder, collapse = ", ") else "disabled", "\n")
 
 start_time <- Sys.time()
 
@@ -229,14 +226,6 @@ bank_result <- fit_bank_smc_population_model(
   design_control = list(
     max_points = design_max_points,
     paired_effect_profiles = paired_effect_profiles
-  ),
-  rho_anchor_control = list(
-    enabled = rho_anchor_enabled,
-    rho_ladder = rho_anchor_ladder,
-    outer_particles = 500L,
-    sketch_starts = 8L,
-    support_weight_floor = 0.50,
-    max_challengers = 1L
   ),
   outer_control = list(
     N = outer_particles,
@@ -347,8 +336,6 @@ saveRDS(
       force_refine_points = force_refine_points,
       force_profile_dims = force_profile_dims,
       force_tail_probs = force_tail_probs,
-      rho_anchor_enabled = rho_anchor_enabled,
-      rho_anchor_ladder = rho_anchor_ladder,
       outer_particles = outer_particles,
       outer_mcmc_moves = outer_mcmc_moves,
       outer_max_rounds = outer_max_rounds,
