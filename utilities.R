@@ -36,19 +36,6 @@ smc_posteriors <- function(smc, n_draws = NULL, seed = NULL, population_model = 
   lapply(parts, function(x) as.data.frame(as.matrix(x), check.names = FALSE))
 }
 
-posterior_intervals <- function(x) {
-  x <- as.matrix(x)
-  q <- t(apply(x, 2L, stats::quantile, probs = c(0.025, 0.5, 0.975), na.rm = TRUE))
-  data.frame(
-    parameter = colnames(x),
-    q025 = q[, 1L],
-    q500 = q[, 2L],
-    q975 = q[, 3L],
-    row.names = NULL,
-    check.names = FALSE
-  )
-}
-
 plot_posteriors <- function(x,
                             y = NULL,
                             labels = c("Posterior 1", "Posterior 2"),

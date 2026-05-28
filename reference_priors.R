@@ -129,32 +129,6 @@ make_reference_prior_gaussian <- function(mu, Sigma, scale = 1, param_names = NU
   .build_reference_prior(list(component), family = "gaussian", label = label)
 }
 
-make_reference_prior_gaussian_mixture <- function(component_means,
-                                                  component_covs,
-                                                  weights = NULL,
-                                                  param_names = NULL,
-                                                  label = "gaussian_mixture") {
-  if (length(component_means) != length(component_covs)) {
-    stop("component_means and component_covs must have the same length.")
-  }
-  if (!length(component_means)) {
-    stop("At least one component is required.")
-  }
-  weights <- as.numeric(weights %||% rep(1 / length(component_means), length(component_means)))
-  components <- lapply(
-    seq_along(component_means),
-    function(k) {
-      .normalize_reference_component(
-        mu = component_means[[k]],
-        Sigma = component_covs[[k]],
-        weight = weights[k],
-        param_names = param_names
-      )
-    }
-  )
-  .build_reference_prior(components, family = "gaussian_mixture", label = label)
-}
-
 combine_reference_priors <- function(priors, weights = NULL, label = "gaussian_mixture") {
   if (!length(priors)) stop("At least one reference prior is required.")
   weights <- as.numeric(weights %||% rep(1 / length(priors), length(priors)))
@@ -176,26 +150,6 @@ combine_reference_priors <- function(priors, weights = NULL, label = "gaussian_m
     }
   }
   .build_reference_prior(flat_components, family = "gaussian_mixture", label = label)
-}
-
-inflate_reference_prior <- function(reference_prior, scale = 1.5, label = NULL) {
-  prior <- normalize_reference_prior(reference_prior = reference_prior)
-  components <- lapply(
-    prior$components,
-    function(comp) {
-      .normalize_reference_component(
-        mu = comp$mean,
-        Sigma = as.numeric(scale) * comp$cov,
-        weight = comp$weight,
-        param_names = prior$param_names
-      )
-    }
-  )
-  .build_reference_prior(
-    components,
-    family = if (length(components) == 1L && identical(prior$family, "gaussian")) "gaussian" else "gaussian_mixture",
-    label = label %||% prior$label
-  )
 }
 
 make_broad_reference_prior <- function(mu,
@@ -243,11 +197,6 @@ normalize_reference_prior <- function(reference_prior = NULL, mu = NULL, Sigma =
   make_reference_prior_gaussian(mu = mu, Sigma = Sigma)
 }
 
-reference_prior_is_gaussian <- function(reference_prior) {
-  prior <- normalize_reference_prior(reference_prior = reference_prior)
-  identical(prior$family, "gaussian") && identical(prior$n_components, 1L)
-}
-
 reference_prior_geometry <- function(reference_prior) {
   prior <- normalize_reference_prior(reference_prior = reference_prior)
   list(
@@ -291,18 +240,4 @@ reference_prior_sample <- function(reference_prior, n, seed = NULL) {
   }
   colnames(out) <- prior$param_names
   out
-}
-
-reference_prior_summary <- function(reference_prior) {
-  prior <- normalize_reference_prior(reference_prior = reference_prior)
-  list(
-    family = prior$family,
-    label = prior$label,
-    d = prior$d,
-    n_components = prior$n_components,
-    param_names = prior$param_names,
-    mean = prior$mean,
-    cov = prior$cov,
-    weights = vapply(prior$components, `[[`, numeric(1), "weight")
-  )
 }

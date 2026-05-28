@@ -459,30 +459,6 @@ build_population_local_factor <- function(local_object,
   )
 }
 
-.gaussian_log_alpha_given_prepared_theta_many <- function(alpha, theta_prepared) {
-  alpha <- as.matrix(alpha)
-  if (!identical(theta_prepared$quadratic_kind, "diag")) {
-    stop("Only diagonal Gaussian population models are supported.")
-  }
-  linear <- theta_prepared$eta %*% t(alpha)
-  quad_t <- t(alpha * alpha)
-  quad <- theta_prepared$quadratic_coef %*% quad_t
-  sweep(linear - 0.5 * quad, 1L, theta_prepared$log_kernel_constant, "+")
-}
-
-.population_log_alpha_given_theta_many <- function(model,
-                                                   alpha,
-                                                   theta = NULL,
-                                                   theta_prepared = NULL) {
-  if (is.null(theta_prepared)) {
-    theta_prepared <- population_model_prepare_theta(model, theta)
-  }
-  if (identical(theta_prepared$family, "gaussian")) {
-    return(.gaussian_log_alpha_given_prepared_theta_many(alpha, theta_prepared))
-  }
-  population_model_log_alpha_given_prepared_theta_many(model, alpha = alpha, theta_prepared = theta_prepared)
-}
-
 .local_log_marginal_blocked <- function(model,
                                         sufficient_stats,
                                         log_base,
@@ -529,83 +505,6 @@ population_local_factor_log_marginal_many <- function(factor,
 
 population_local_factor_log_marginal <- function(factor, theta, include_constant = TRUE) {
   population_local_factor_log_marginal_many(factor, theta = theta, include_constant = include_constant)[1L]
-}
-
-population_local_factor_ess <- function(factor, theta) {
-  stopifnot(inherits(factor, "population_local_factor"))
-  theta_prepared <- population_model_prepare_theta(factor$population_model, theta)
-  logp <- population_log_alpha_given_sufficient_stats_many(
-    model = factor$population_model,
-    sufficient_stats = factor$sufficient_stats,
-    theta_prepared = theta_prepared
-  )[1L, ]
-  lw <- factor$log_base + logp
-  lse <- logsumexp(lw)
-  if (!is.finite(lse)) return(0)
-  w <- exp(lw - lse)
-  as.numeric(1 / sum(w * w))
-}
-
-population_local_factor_reweighted_particles <- function(factor, theta) {
-  stopifnot(inherits(factor, "population_local_factor"))
-  if (is.null(factor$particles)) {
-    stop("Raw factor particles are not stored for this sufficient-statistic factor.")
-  }
-  theta_prepared <- population_model_prepare_theta(factor$population_model, theta)
-  logp <- population_log_alpha_given_sufficient_stats_many(
-    model = factor$population_model,
-    sufficient_stats = factor$sufficient_stats,
-    theta_prepared = theta_prepared
-  )[1L, ]
-  lw <- factor$log_base + logp
-  lse <- logsumexp(lw)
-  weights <- if (is.finite(lse)) {
-    exp(lw - lse)
-  } else {
-    rep(1 / nrow(factor$particles), nrow(factor$particles))
-  }
-  list(particles = factor$particles, weights = weights)
-}
-
-population_local_factor_tail_diagnostic <- function(factor, theta, use_psis = TRUE) {
-  stopifnot(inherits(factor, "population_local_factor"))
-  theta_prepared <- population_model_prepare_theta(factor$population_model, theta)
-  logp <- population_log_alpha_given_sufficient_stats_many(
-    model = factor$population_model,
-    sufficient_stats = factor$sufficient_stats,
-    theta_prepared = theta_prepared
-  )[1L, ]
-  lw <- factor$log_base + logp
-  keep <- is.finite(lw)
-  if (!any(keep)) {
-    return(list(ess = 0, pareto_k = NA_real_, max_weight = NA_real_, q99_weight = NA_real_, n_finite = 0L))
-  }
-
-  lw <- lw[keep]
-  lse <- logsumexp(lw)
-  if (!is.finite(lse)) {
-    return(list(ess = 0, pareto_k = NA_real_, max_weight = NA_real_, q99_weight = NA_real_, n_finite = length(lw)))
-  }
-
-  w <- exp(lw - lse)
-  pareto_k <- NA_real_
-  if (isTRUE(use_psis) && length(lw) >= 5L && requireNamespace("loo", quietly = TRUE)) {
-    psis_obj <- tryCatch(
-      suppressWarnings(loo::psis(matrix(lw - max(lw), ncol = 1L))),
-      error = function(e) NULL
-    )
-    if (!is.null(psis_obj)) {
-      pareto_k <- as.numeric(loo::pareto_k_values(psis_obj)[1L])
-    }
-  }
-
-  list(
-    ess = as.numeric(1 / sum(w * w)),
-    pareto_k = pareto_k,
-    max_weight = as.numeric(max(w)),
-    q99_weight = as.numeric(stats::quantile(w, probs = 0.99, na.rm = TRUE, names = FALSE)),
-    n_finite = length(lw)
-  )
 }
 
 .population_factor_set_from_factors <- function(factors,
@@ -709,36 +608,6 @@ build_population_factor_set <- function(local_objects,
   )
 }
 
-update_population_factor_set_locals <- function(factor_set,
-                                                local_objects,
-                                                local_ids,
-                                                data_list = NULL,
-                                                loglik_fn = NULL,
-                                                local_n_cores = 1L) {
-  stopifnot(inherits(factor_set, "population_factor_set"))
-  local_ids <- sort(unique(as.integer(local_ids)))
-  local_ids <- local_ids[local_ids >= 1L & local_ids <= length(local_objects)]
-  if (!length(local_ids)) return(factor_set)
-
-  factors <- factor_set$factors
-  local_names <- names(local_objects)
-  for (i in local_ids) {
-    factors[[i]] <- build_population_local_factor(
-      local_objects[[i]],
-      population_model = factor_set$population_model,
-      data_i = .data_for_local_object(local_objects[[i]], i, data_list, local_names),
-      loglik_fn = loglik_fn,
-      local_n_cores = local_n_cores
-    )
-  }
-  names(factors) <- names(local_objects)
-  .population_factor_set_from_factors(
-    factors = factors,
-    population_model = factor_set$population_model,
-    particle_block_size = factor_set$stack$particle_block_size
-  )
-}
-
 .evaluate_factor_set_stacked <- function(factor_set, theta, include_constant = FALSE) {
   stopifnot(inherits(factor_set, "population_factor_set"))
   model <- factor_set$population_model
@@ -796,30 +665,6 @@ population_factor_set_loglik <- function(factor_set, theta, include_constant = F
     ))
   }
 
-  if (inherits(factor_set, "local_evidence_corrected_factor_set")) {
-    if (!exists("corrected_factor_set_loglik", mode = "function")) {
-      stop("corrected_factor_set_loglik() is unavailable; source local_charts.R.")
-    }
-    return(corrected_factor_set_loglik(
-      factor_set = factor_set,
-      theta = theta,
-      include_constant = include_constant,
-      n_cores = n_cores
-    ))
-  }
-
-  if (inherits(factor_set, "local_likelihood_sketch_factor_set")) {
-    out <- local_likelihood_sketch_set_loglik(
-      sketch_set = factor_set$sketch_set,
-      population_model = model,
-      theta = theta,
-      rho = factor_set$rho,
-      n_jobs = n_cores
-    )
-    if (isTRUE(include_constant)) out <- out + factor_set$log_constant
-    return(out)
-  }
-
   if (!length(factor_set$factors)) {
     out <- rep.int(0, nrow(theta))
     if (isTRUE(include_constant)) out <- out + factor_set$log_constant
@@ -850,107 +695,6 @@ population_factor_set_loglik <- function(factor_set, theta, include_constant = F
   }
   if (isTRUE(include_constant)) out <- out + factor_set$log_constant
   out
-}
-
-population_factor_set_loglik_by_local <- function(factor_set,
-                                                  theta,
-                                                  include_constant = TRUE,
-                                                  n_cores = 1L) {
-  stopifnot(inherits(factor_set, "population_factor_set"))
-  model <- factor_set$population_model
-  theta <- .as_hyper_matrix(theta, hyper_names = model$hyper_names, hyper_dim = model$hyper_dim)
-
-  if (inherits(factor_set, "local_evidence_atlas_factor_set")) {
-    if (!exists("local_evidence_atlas_factor_set_loglik_by_local", mode = "function")) {
-      stop("local_evidence_atlas_factor_set_loglik_by_local() is unavailable; source local_charts.R.")
-    }
-    return(local_evidence_atlas_factor_set_loglik_by_local(
-      factor_set = factor_set,
-      theta = theta,
-      include_constant = include_constant,
-      n_cores = n_cores
-    ))
-  }
-
-  if (inherits(factor_set, "local_evidence_corrected_factor_set")) {
-    if (!exists("corrected_factor_set_loglik_by_local", mode = "function")) {
-      stop("corrected_factor_set_loglik_by_local() is unavailable; source local_charts.R.")
-    }
-    return(corrected_factor_set_loglik_by_local(
-      factor_set = factor_set,
-      theta = theta,
-      include_constant = include_constant,
-      n_cores = n_cores
-    ))
-  }
-
-  if (inherits(factor_set, "local_likelihood_sketch_factor_set")) {
-    out <- local_likelihood_sketch_set_log_marginal_matrix(
-      sketch_set = factor_set$sketch_set,
-      population_model = model,
-      theta = theta,
-      rho = factor_set$rho,
-      n_jobs = n_cores
-    )
-    if (isTRUE(include_constant)) out <- out + factor_set$log_constant / max(ncol(out), 1L)
-    return(out)
-  }
-
-  if (!length(factor_set$factors)) {
-    return(matrix(numeric(0), nrow = nrow(theta), ncol = 0L))
-  }
-
-  eval_one <- function(factor) {
-    population_local_factor_log_marginal_many(
-      factor,
-      theta = theta,
-      include_constant = include_constant
-    )
-  }
-
-  parts <- if (as.integer(n_cores) <= 1L || length(factor_set$factors) <= 1L) {
-    lapply(factor_set$factors, eval_one)
-  } else {
-    parallel::mclapply(
-      factor_set$factors,
-      eval_one,
-      mc.cores = as.integer(min(n_cores, length(factor_set$factors)))
-    )
-  }
-  out <- do.call(cbind, parts)
-  colnames(out) <- names(factor_set$factors) %||% paste0("local_", seq_along(factor_set$factors))
-  out
-}
-
-population_factor_set_local_ess <- function(factor_set, theta) {
-  stopifnot(inherits(factor_set, "population_factor_set"))
-  if (inherits(factor_set, "local_evidence_corrected_factor_set")) {
-    if (!exists("validate_corrected_local_atlas_factor_set", mode = "function")) {
-      stop("validate_corrected_local_atlas_factor_set() is unavailable; source local_charts.R.")
-    }
-    factor_set <- validate_corrected_local_atlas_factor_set(factor_set)
-    out <- rep(NA_real_, factor_set$n_locals)
-    names(out) <- names(factor_set$base_factor_set$atlases)
-    return(out)
-  }
-  if (inherits(factor_set, "local_evidence_atlas_factor_set")) {
-    if (!exists("validate_local_atlas_factor_set", mode = "function")) {
-      stop("validate_local_atlas_factor_set() is unavailable; source local_charts.R.")
-    }
-    factor_set <- validate_local_atlas_factor_set(factor_set)
-    out <- rep(NA_real_, factor_set$n_locals)
-    names(out) <- names(factor_set$atlases)
-    return(out)
-  }
-  vapply(factor_set$factors, population_local_factor_ess, numeric(1), theta = theta)
-}
-
-population_factor_set_logposterior <- function(factor_set, theta, include_constant = TRUE, n_cores = 1L) {
-  stopifnot(inherits(factor_set, "population_factor_set"))
-  model <- factor_set$population_model
-  theta <- .as_hyper_matrix(theta, hyper_names = model$hyper_names, hyper_dim = model$hyper_dim)
-  population_model_log_hyperprior(model, theta) +
-    population_factor_set_loglik(factor_set, theta, include_constant = include_constant, n_cores = n_cores)
 }
 
 .outer_cheap_sort_order <- function(Z) {
@@ -1178,103 +922,6 @@ population_factor_set_logposterior <- function(factor_set, theta, include_consta
   )
 }
 
-update_outer_population_fit <- function(fit,
-                                        old_factor_set,
-                                        new_factor_set,
-                                        n_mcmc_moves = 3L,
-                                        min_mcmc_moves = 1L,
-                                        resample_threshold = 0.5,
-                                        rw_scale = NULL,
-                                        n_cores = 1L,
-                                        seed = 123L,
-                                        verbose = TRUE) {
-  stopifnot(inherits(old_factor_set, "population_factor_set"))
-  stopifnot(inherits(new_factor_set, "population_factor_set"))
-  theta <- as.matrix(fit$theta)
-  w_old <- normalize_reference_local_weights(fit$w)
-  old_loglik <- as.numeric(fit$loglik_dynamic %||%
-    population_factor_set_loglik(old_factor_set, theta, include_constant = FALSE, n_cores = n_cores))
-  new_loglik <- population_factor_set_loglik(
-    new_factor_set,
-    theta = theta,
-    include_constant = FALSE,
-    n_cores = n_cores
-  )
-
-  log_ratio <- new_loglik - old_loglik
-  ok <- is.finite(log_ratio)
-  if (!any(ok)) stop("Population factor update produced no finite correction weights.")
-  log_ratio[!ok] <- min(log_ratio[ok])
-  logw <- log(pmax(w_old, .Machine$double.eps)) + log_ratio
-  lse <- logsumexp(logw)
-  w <- exp(logw - lse)
-  w <- w / sum(w)
-  ess_frac <- ESS(w) / length(w)
-  resampled <- FALSE
-
-  model <- new_factor_set$population_model
-  logprior <- as.numeric(fit$logprior %||% population_model_log_hyperprior(model, theta))
-  if (ess_frac < as.numeric(resample_threshold)) {
-    sort_info <- .outer_resample_sort_order(theta = theta, w = w, ess_frac = ess_frac)
-    ord <- sort_info$order
-    idx <- ord[stratified_resample_sorted(w[ord])]
-    theta <- theta[idx, , drop = FALSE]
-    logprior <- logprior[idx]
-    new_loglik <- new_loglik[idx]
-    w <- rep(1 / nrow(theta), nrow(theta))
-    resampled <- TRUE
-  }
-
-  rejuvenated <- .outer_rejuvenate(
-    theta = theta,
-    logprior = logprior,
-    loglik_dynamic = new_loglik,
-    beta = 1,
-    factor_set = new_factor_set,
-    w = w,
-    min_n_moves = min_mcmc_moves,
-    max_n_moves = n_mcmc_moves,
-    rw_scale = as.numeric(rw_scale %||% tail(fit$meta$rw_scale_hist %||% 0.8, 1L)),
-    n_cores = n_cores,
-    resampled = resampled,
-    seed = seed
-  )
-  if (isTRUE(verbose)) {
-    cat(sprintf(
-      "Population factor update: ESS=%.3f | rejuvenation accept=%.3f%s\n",
-      ess_frac,
-      rejuvenated$accept_rate,
-      if (resampled) " | resampled" else ""
-    ))
-  }
-
-  fit$theta <- rejuvenated$theta
-  fit$w <- if (isTRUE(resampled)) {
-    rep(1 / nrow(rejuvenated$theta), nrow(rejuvenated$theta))
-  } else {
-    w
-  }
-  fit$logprior <- rejuvenated$logprior
-  fit$loglik_dynamic <- rejuvenated$loglik_dynamic
-  fit$bridge_stat <- rejuvenated$bridge_stat
-  fit$logbase <- rejuvenated$logbase
-  fit$logq0 <- rejuvenated$logq0
-  fit$population_model <- model
-  fit$log_evidence_dynamic <- as.numeric(fit$log_evidence_dynamic %||% 0) + lse
-  fit$log_evidence_constant <- new_factor_set$log_constant
-  fit$log_evidence <- fit$log_evidence_dynamic + new_factor_set$log_constant
-  fit$meta$factor_update <- c(
-    fit$meta$factor_update %||% list(),
-    list(list(
-      ess = ess_frac,
-      resampled = resampled,
-      accept_rate = rejuvenated$accept_rate,
-      moves = rejuvenated$n_moves_used
-    ))
-  )
-  fit
-}
-
 outer_population_smc <- function(factor_set,
                                  N = 2000L,
                                  initial_proposal = NULL,
@@ -1494,14 +1141,5 @@ outer_population_smc <- function(factor_set,
     initial_proposal = initial_proposal,
     proposal_bridge = proposal_bridge
   )
-  if (inherits(factor_set, "local_evidence_corrected_factor_set") &&
-      exists("summarize_corrected_outer_uncertainty", mode = "function")) {
-    fit$numerical_uncertainty <- summarize_corrected_outer_uncertainty(
-      factor_set = factor_set,
-      fit = fit
-    )
-    fit$log_evidence_numerical_se <- fit$numerical_uncertainty$evidence$numerical_se_log_evidence
-    fit$log_evidence_total_se <- fit$numerical_uncertainty$evidence$combined_se_log_evidence
-  }
   fit
 }

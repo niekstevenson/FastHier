@@ -46,27 +46,6 @@ if (!exists("normalize_population_model", mode = "function") ||
   out
 }
 
-theta_proposal_weighted_quantile <- function(x, w, probs) {
-  x <- as.numeric(x)
-  w <- pmax(as.numeric(w), 0)
-  ok <- is.finite(x) & is.finite(w) & w > 0
-  if (!any(ok)) {
-    return(stats::quantile(x, probs = probs, names = FALSE, type = 8))
-  }
-  x <- x[ok]
-  w <- w[ok]
-  ord <- order(x)
-  x <- x[ord]
-  w <- w[ord]
-  unique_x <- unique(x)
-  if (length(unique_x) < length(x)) {
-    w <- as.numeric(rowsum(w, group = match(x, unique_x), reorder = FALSE))
-    x <- unique_x
-  }
-  w <- w / sum(w)
-  stats::approx(cumsum(w), x, xout = probs, method = "constant", f = 1, rule = 2, ties = "ordered")$y
-}
-
 .theta_proposal_global_geometry <- function(theta, w) {
   d <- ncol(theta)
   mu <- colSums(theta * w)
@@ -324,61 +303,6 @@ normalize_theta_proposal <- function(proposal, population_model = NULL) {
   proposal
 }
 
-combine_theta_q0_proposals <- function(proposals,
-                                       weights = NULL,
-                                       population_model = NULL,
-                                       label = "combined_theta_q0") {
-  if (!is.list(proposals) || !length(proposals)) {
-    stop("proposals must be a non-empty list.")
-  }
-  base_model <- population_model %||% proposals[[1L]]$population_model
-  model <- normalize_population_model(base_model)
-  proposals <- lapply(proposals, normalize_theta_proposal, population_model = model)
-
-  weights <- pmax(as.numeric(weights %||% rep(1, length(proposals))), 0)
-  if (length(weights) != length(proposals)) {
-    stop("weights must match proposals.")
-  }
-  sw <- sum(weights)
-  if (!is.finite(sw) || sw <= 0) {
-    stop("weights must have positive finite mass.")
-  }
-  weights <- weights / sw
-
-  components <- list()
-  prior_weight <- 0
-  for (k in seq_along(proposals)) {
-    proposal <- proposals[[k]]
-    if (length(proposal$components)) {
-      scaled <- lapply(proposal$components, function(component) {
-        component$weight <- as.numeric(component$weight) * weights[k]
-        component$source_proposal <- proposal$name %||% paste0("proposal_", k)
-        component
-      })
-      components <- c(components, scaled)
-    }
-    prior_weight <- prior_weight + weights[k] * as.numeric(proposal$prior_weight %||% 0)
-  }
-
-  structure(
-    list(
-      name = as.character(label),
-      population_model = model,
-      components = components,
-      prior_weight = as.numeric(prior_weight),
-      hyper_names = model$hyper_names,
-      hyper_dim = model$hyper_dim,
-      diagnostics = list(
-        source_proposals = vapply(proposals, function(x) x$name %||% "theta_q0", character(1)),
-        source_weights = weights,
-        n_components = length(components),
-        prior_weight = as.numeric(prior_weight)
-      )
-    ),
-    class = "theta_q0_proposal"
-  )
-}
-
 theta_proposal_log_density <- function(proposal, theta) {
   proposal <- normalize_theta_proposal(proposal)
   theta <- .theta_proposal_align(theta, proposal$population_model)
@@ -430,37 +354,4 @@ theta_proposal_sample <- function(proposal, n, seed = NULL) {
   }
   colnames(out) <- proposal$hyper_names
   out
-}
-
-summarize_theta_proposal_reference <- function(proposal,
-                                               reference_theta,
-                                               n_draws = 5000L,
-                                               seed = NULL,
-                                               label = proposal$name) {
-  proposal <- normalize_theta_proposal(proposal)
-  reference_theta <- .theta_proposal_align(reference_theta, proposal$population_model)
-  draws <- theta_proposal_sample(proposal, n = n_draws, seed = seed)
-  logq_ref <- theta_proposal_log_density(proposal, reference_theta)
-  rows <- lapply(seq_len(ncol(reference_theta)), function(j) {
-    q_prop <- stats::quantile(draws[, j], probs = c(0.01, 0.05, 0.95, 0.99), names = FALSE, type = 8)
-    q_ref <- stats::quantile(reference_theta[, j], probs = c(0.01, 0.05, 0.95, 0.99), names = FALSE, type = 8)
-    data.frame(
-      method = as.character(label),
-      parameter = colnames(reference_theta)[j],
-      reference_inside_q01_q99 = mean(reference_theta[, j] >= q_prop[1L] & reference_theta[, j] <= q_prop[4L]),
-      reference_inside_q05_q95 = mean(reference_theta[, j] >= q_prop[2L] & reference_theta[, j] <= q_prop[3L]),
-      lower_q01_miss = max(q_prop[1L] - q_ref[1L], 0),
-      upper_q99_miss = max(q_ref[4L] - q_prop[4L], 0),
-      width99_ratio = (q_prop[4L] - q_prop[1L]) / max(q_ref[4L] - q_ref[1L], .Machine$double.eps),
-      q_wasserstein = mean(abs(
-        stats::quantile(draws[, j], probs = seq(0.01, 0.99, length.out = 99L), names = FALSE, type = 8) -
-          stats::quantile(reference_theta[, j], probs = seq(0.01, 0.99, length.out = 99L), names = FALSE, type = 8)
-      )),
-      reference_logq_min = min(logq_ref),
-      reference_logq_q01 = as.numeric(stats::quantile(logq_ref, 0.01, names = FALSE, type = 8)),
-      reference_logq_median = median(logq_ref),
-      check.names = FALSE
-    )
-  })
-  do.call(rbind, rows)
 }

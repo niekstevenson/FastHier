@@ -190,15 +190,6 @@ validate_bank_smc_node <- function(node, population_model = NULL) {
   node
 }
 
-bank_smc_node_log_prior <- function(node, population_model, theta) {
-  node <- validate_bank_smc_node(node, population_model = population_model)
-  population_model_log_alpha_given_theta(
-    population_model,
-    alpha = node$alpha,
-    theta = theta
-  )
-}
-
 build_bank_smc_node_from_local_fit <- function(local_fit,
                                                theta_anchor,
                                                population_model,
@@ -329,14 +320,6 @@ validate_bank_smc_local_bank <- function(bank, population_model = NULL) {
   bank
 }
 
-bank_smc_local_bank_node_count <- function(bank) {
-  validate_bank_smc_local_bank(bank)$n_nodes
-}
-
-bank_smc_local_bank_particle_count <- function(bank) {
-  validate_bank_smc_local_bank(bank)$n_particles
-}
-
 bank_smc_local_bank_theta_anchors <- function(bank, population_model = NULL) {
   bank <- validate_bank_smc_local_bank(bank, population_model = population_model)
   do.call(rbind, lapply(bank$nodes, `[[`, "theta_anchor"))
@@ -373,30 +356,6 @@ bank_smc_local_bank_add_node <- function(bank,
     ),
     population_model = population_model
   )
-}
-
-bank_smc_local_bank_replace_node <- function(bank,
-                                             index,
-                                             node,
-                                             eta = NULL,
-                                             population_model = NULL) {
-  bank <- validate_bank_smc_local_bank(bank, population_model = population_model)
-  index <- as.integer(index)
-  if (length(index) != 1L || index < 1L || index > length(bank$nodes)) {
-    stop("Replacement index is out of range.")
-  }
-  node <- validate_bank_smc_node(node, population_model = population_model)
-  if (is.finite(bank$local_id) && is.finite(node$local_id) && node$local_id != bank$local_id) {
-    stop("Replacement node local_id does not match the bank local_id.")
-  }
-  if (!is.finite(node$local_id)) node$local_id <- bank$local_id
-
-  bank$nodes[[index]] <- node
-  if (!is.null(eta)) {
-    bank$eta[index] <- as.numeric(eta)
-  }
-  bank$stack <- NULL
-  validate_bank_smc_local_bank(bank, population_model = population_model)
 }
 
 bank_smc_calibrate_local_bank_normalizers <- function(bank,
@@ -505,22 +464,6 @@ bank_smc_calibrate_banks_normalizers <- function(banks,
   out
 }
 
-bank_smc_calibration_summary <- function(banks) {
-  rows <- lapply(banks, function(bank) {
-    diag <- bank$support_diagnostics$normalizer_calibration %||% list()
-    data.frame(
-      local_id = as.integer(bank$local_id),
-      converged = isTRUE(diag$converged),
-      iterations = as.integer(diag$iterations %||% NA_integer_),
-      max_abs_delta = as.numeric(diag$max_abs_delta %||% NA_real_),
-      max_abs_shift_from_smc = as.numeric(diag$max_abs_shift_from_smc %||% NA_real_),
-      mean_abs_shift_from_smc = as.numeric(diag$mean_abs_shift_from_smc %||% NA_real_),
-      check.names = FALSE
-    )
-  })
-  do.call(rbind, rows)
-}
-
 bank_smc_local_bank_build_stack <- function(bank, population_model) {
   model <- normalize_population_model(population_model)
   bank <- validate_bank_smc_local_bank(bank, population_model = model)
@@ -570,20 +513,6 @@ bank_smc_local_bank_build_stack <- function(bank, population_model) {
     ),
     class = "bank_smc_local_bank_stack"
   )
-}
-
-bank_smc_local_bank_with_stack <- function(bank, population_model) {
-  bank <- validate_bank_smc_local_bank(bank, population_model = population_model)
-  stack <- bank$stack
-  if (!inherits(stack, "bank_smc_local_bank_stack") ||
-      is.null(stack$alpha) ||
-      is.null(stack$log_base) ||
-      nrow(stack$alpha) != bank$n_particles ||
-      length(stack$log_base) != bank$n_particles) {
-    stack <- bank_smc_local_bank_build_stack(bank, population_model)
-  }
-  bank$stack <- stack
-  bank
 }
 
 .bank_smc_stack_usable <- function(stack, bank) {
@@ -1630,64 +1559,6 @@ bank_smc_local_bank_certify_bridge_graph <- function(bank,
   list(bank = validate_bank_smc_local_bank(bank, population_model = model), graph = graph, insertions = insertions)
 }
 
-bank_smc_certify_banks_bridge_graph <- function(banks,
-                                                data_list,
-                                                loglik_fn,
-                                                population_model,
-                                                M = NULL,
-                                                min_edge_ess_frac = 0.05,
-                                                max_pareto_k = 0.7,
-                                                use_psis = TRUE,
-                                                max_rounds = 50L,
-                                                target_cess = 0.9,
-                                                n_mcmc_moves = 2L,
-                                                n_jobs = 1L,
-                                                local_n_cores = 1L,
-                                                seed = 123L,
-                                                verbose = FALSE,
-                                                ...) {
-  model <- normalize_population_model(population_model)
-  ids <- seq_along(banks)
-  certified <- parallel::mclapply(
-    ids,
-    function(pos) {
-      bank_smc_local_bank_certify_bridge_graph(
-        bank = banks[[pos]],
-        population_model = model,
-        data_i = data_list[[pos]],
-        loglik_fn = loglik_fn,
-        M = M,
-        min_edge_ess_frac = min_edge_ess_frac,
-        max_pareto_k = max_pareto_k,
-        use_psis = use_psis,
-        max_rounds = max_rounds,
-        target_cess = target_cess,
-        n_mcmc_moves = n_mcmc_moves,
-        n_cores = local_n_cores,
-        seed = as.integer(seed + 10000L * pos),
-        verbose = verbose,
-        ...
-      )
-    },
-    mc.cores = as.integer(max(1L, n_jobs))
-  )
-  failed <- vapply(certified, inherits, logical(1), what = "try-error")
-  if (any(failed)) {
-    msg <- conditionMessage(attr(certified[[which(failed)[1L]]], "condition"))
-    stop("Local bank bridge-graph certification failed for worker ", which(failed)[1L], ": ", msg)
-  }
-  rows <- vector("list", length(certified))
-  for (i in seq_along(certified)) {
-    banks[[i]] <- certified[[i]]$bank
-    rows[[i]] <- certified[[i]]$insertions
-  }
-  rows <- Filter(nrow, rows)
-  list(
-    banks = banks,
-    insertions = if (length(rows)) do.call(rbind, rows) else data.frame()
-  )
-}
-
 bank_smc_overlap_graph_summary <- function(banks) {
   rows <- lapply(banks, function(bank) {
     diag <- bank$support_diagnostics$overlap_graph %||% list()
@@ -2415,122 +2286,6 @@ bank_smc_anchor_design_fit <- function(anchor_candidates,
     ),
     class = "bank_smc_analytic_shape"
   )
-}
-
-.bank_smc_theta_feature_matrix <- function(theta, population_model) {
-  model <- normalize_population_model(population_model)
-  theta <- .as_hyper_matrix(theta, hyper_names = model$hyper_names, hyper_dim = model$hyper_dim)
-  eta <- .bank_gaussian_natural_eta(model, theta)
-  if (is.null(eta)) theta else eta
-}
-
-.bank_smc_feature_distances <- function(candidate, reference, population_model) {
-  model <- normalize_population_model(population_model)
-  X <- .bank_smc_theta_feature_matrix(candidate, model)
-  R <- .bank_smc_theta_feature_matrix(reference, model)
-  all <- rbind(X, R)
-  center <- colMeans(all)
-  scale <- apply(all, 2L, stats::sd)
-  scale[!is.finite(scale) | scale <= 0] <- 1
-  X <- sweep(sweep(X, 2L, center, "-"), 2L, scale, "/")
-  R <- sweep(sweep(R, 2L, center, "-"), 2L, scale, "/")
-  vapply(seq_len(nrow(X)), function(i) {
-    min(sqrt(rowSums(sweep(R, 2L, X[i, ], "-")^2)))
-  }, numeric(1))
-}
-
-.bank_smc_candidate_pool_indices <- function(theta, w, population_model, max_pool = 96L) {
-  model <- normalize_population_model(population_model)
-  theta <- .as_hyper_matrix(theta, hyper_names = model$hyper_names, hyper_dim = model$hyper_dim)
-  w <- .bank_normalize_weights(w)
-  max_pool <- as.integer(max(1L, max_pool))
-  if (nrow(theta) <= max_pool) return(seq_len(nrow(theta)))
-
-  features <- .bank_smc_theta_feature_matrix(theta, model)
-  S <- tryCatch(weighted_cov(features, w), error = function(e) stats::cov(features))
-  S <- regularize_cov(S, min_eig = 1e-8, cond_cap = 1e8)
-  eig <- eigen(S, symmetric = TRUE)
-  center <- .bank_weighted_mean(features, w)
-  pc <- as.numeric(scale(features, center = center, scale = FALSE) %*% eig$vectors[, 1L])
-
-  idx <- integer(0)
-  probs_pc <- seq(0.01, 0.99, length.out = min(max_pool, 64L))
-  vals <- .bank_weighted_quantile(pc, w, probs_pc)
-  idx <- c(idx, vapply(vals, function(v) which.min(abs(pc - v)), integer(1)))
-
-  tail_probs <- c(0.005, 0.025, 0.05, 0.95, 0.975, 0.995)
-  for (j in seq_len(ncol(theta))) {
-    vals <- .bank_weighted_quantile(theta[, j], w, tail_probs)
-    idx <- c(idx, vapply(vals, function(v) which.min(abs(theta[, j] - v)), integer(1)))
-  }
-
-  idx <- unique(idx)
-  if (length(idx) > max_pool) idx <- idx[seq_len(max_pool)]
-  idx
-}
-
-bank_smc_select_challenger_theta <- function(anchor_candidates,
-                                             population_model,
-                                             banks,
-                                             reference_theta,
-                                             max_points = 1L,
-                                             candidate_pool = 96L,
-                                             min_distance = 0.25,
-                                             relevance_temperature = 10,
-                                             target_ess_frac = 0.3,
-                                             score_local_count = 20L) {
-  if (is.null(anchor_candidates) || max_points <= 0L) {
-    return(NULL)
-  }
-  if (!inherits(anchor_candidates, "bank_smc_anchor_candidates")) {
-    stop("anchor_candidates must inherit from 'bank_smc_anchor_candidates'.")
-  }
-  model <- normalize_population_model(population_model)
-  theta <- .as_hyper_matrix(anchor_candidates$theta, hyper_names = model$hyper_names, hyper_dim = model$hyper_dim)
-  w <- .bank_normalize_weights(anchor_candidates$w %||% rep(1, nrow(theta)))
-  reference_theta <- .as_hyper_matrix(reference_theta, hyper_names = model$hyper_names, hyper_dim = model$hyper_dim)
-  pool <- .bank_smc_candidate_pool_indices(theta, w, model, max_pool = candidate_pool)
-  candidates <- .bank_unique_theta_rows(theta[pool, , drop = FALSE], model)
-  if (!nrow(candidates)) return(NULL)
-
-  novelty <- .bank_smc_feature_distances(candidates, reference_theta, model)
-  coverage <- .bank_score_theta_design_with_banks(
-    candidates,
-    banks = banks,
-    population_model = model,
-    target_ess_frac = target_ess_frac,
-    score_local_count = score_local_count
-  )
-  bank_factor_set <- bank_smc_banks_to_factor_set(banks, model)
-  logpost <- population_factor_set_logposterior(
-    bank_factor_set,
-    candidates,
-    include_constant = FALSE
-  )
-  finite_lp <- is.finite(logpost)
-  relative_logpost <- rep(-Inf, length(logpost))
-  if (any(finite_lp)) {
-    relative_logpost[finite_lp] <- logpost[finite_lp] - max(logpost[finite_lp])
-  }
-  relevance <- exp(pmin(relative_logpost, 0) / as.numeric(relevance_temperature))
-  score <- pmax(coverage, 0) * pmax(novelty, 0) * relevance
-  ord <- order(score, coverage, novelty, decreasing = TRUE)
-  selected <- vector("list", 0L)
-  selected_theta <- reference_theta
-  for (idx in ord) {
-    if (!is.finite(score[idx]) || score[idx] <= 0) next
-    cand <- candidates[idx, , drop = FALSE]
-    dist <- .bank_smc_feature_distances(cand, selected_theta, model)
-    if (is.finite(dist) && dist >= min_distance) {
-      selected[[length(selected) + 1L]] <- cand
-      selected_theta <- rbind(selected_theta, cand)
-    }
-    if (length(selected) >= as.integer(max_points)) break
-  }
-  if (!length(selected)) return(NULL)
-  out <- do.call(rbind, selected)
-  colnames(out) <- model$hyper_names
-  .bank_unique_theta_rows(out, model)
 }
 
 bank_smc_select_theta_design <- function(population_fit,

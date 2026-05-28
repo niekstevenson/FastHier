@@ -418,33 +418,6 @@ make_population_model_diag_gaussian <- function(alpha_names,
   )
 }
 
-default_population_model_diag_gaussian <- function(base_mu,
-                                                   base_Sigma,
-                                                   mean_var_scale = 1.0,
-                                                   sigma2_shape = 3.0,
-                                                   sigma2_mean = NULL,
-                                                   label = "diag_gaussian") {
-  base_mu <- as.numeric(base_mu)
-  base_Sigma <- as.matrix(base_Sigma)
-  d <- length(base_mu)
-  if (nrow(base_Sigma) != d || ncol(base_Sigma) != d) {
-    stop("base_Sigma dimensions do not match base_mu.")
-  }
-  var_diag <- pmax(diag(base_Sigma), 1e-8)
-  sigma2_mean <- rep_len(as.numeric(sigma2_mean %||% var_diag), d)
-  sigma2_shape <- rep_len(as.numeric(sigma2_shape), d)
-  sigma2_rate <- sigma2_mean * (sigma2_shape - 1)
-
-  make_population_model_diag_gaussian(
-    alpha_names = names(base_mu) %||% colnames(base_Sigma) %||% paste0("theta", seq_len(d)),
-    mean_prior_mean = base_mu,
-    mean_prior_var = mean_var_scale * var_diag,
-    sigma2_prior_shape = sigma2_shape,
-    sigma2_prior_rate = sigma2_rate,
-    label = label
-  )
-}
-
 summarize_population_posterior_diag <- function(theta, w, model) {
   model <- normalize_population_model(model)
   theta <- .as_hyper_matrix(theta, hyper_names = model$hyper_names, hyper_dim = model$hyper_dim)

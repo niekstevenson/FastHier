@@ -18,13 +18,6 @@ suppressPackageStartupMessages({
 
 # ----------------------------- log-sum-exp utils ---------------------------
 logsumexp <- function(x) { m <- max(x); m + log(sum(exp(x - m))) }
-logsumexp_w <- function(x, w) {
-  x <- as.numeric(x)
-  w <- as.numeric(w)
-  ok <- is.finite(x) & is.finite(w) & (w > 0)
-  if (!any(ok)) return(-Inf)
-  logsumexp(log(w[ok]) + x[ok])
-}
 .rowLogSumExp <- function(M) matrixStats::rowLogSumExps(M)
 rlogsumexp2 <- function(a, b) { m <- pmax(a, b); m + log(exp(a - m) + exp(b - m)) }
 
@@ -180,13 +173,6 @@ inflate_mixture_along_dims <- function(mix, weak_idx, factor = 3, min_eig = 3e-3
 }
 
 # ------------------------ weak-dimension identification ------------------------
-weak_dims_from_mat <- function(X, w, frac = 0.25, min_keep = 1L) {
-  w <- pmax(w, 0); w <- w / sum(w)
-  mu <- colSums(X * w)
-  v  <- colSums((sweep(X, 2L, mu, `-`)^2) * w)
-  ord <- order(v, decreasing = FALSE)
-  head(ord, max(min_keep, ceiling(length(v) * frac)))
-}
 
 # ------------------------ mixtures: defaults and blending ------------------------
 # Default standard normal mixture in d dimensions
@@ -401,32 +387,6 @@ build_hist_mixture <- function(elite_history, lambda,
 }
 
 # ------------------------------ resampling ---------------------------------
-residual_resample <- function(w, deterministic = TRUE) {
-  N <- length(w)
-  if (N <= 0) return(integer(0))
-  w <- w / sum(w)
-  Ni <- floor(N * w)
-  R  <- N - sum(Ni)
-  idx <- rep.int(seq_len(N), Ni)
-  if (R > 0) {
-    r <- N * w - Ni
-    s <- sum(r)
-    if (s > 0) {
-      r <- r / s
-      cw <- c(0, cumsum(r))
-      cw <- cw / cw[length(cw)]
-      u0 <- if (deterministic) 0.5 / R else runif(1) / R
-      u  <- u0 + (0:(R - 1)) / R
-      add <- findInterval(u, cw, rightmost.closed = TRUE)
-      idx <- c(idx, add)
-    } else {
-      idx <- c(idx, rep_len(which.max(w), R))
-    }
-  }
-  if (length(idx) > N) idx <- idx[seq_len(N)]
-  if (length(idx) < N) idx <- c(idx, rep_len(idx[length(idx)], N - length(idx)))
-  as.integer(idx)
-}
 
 # Hilbert-sort order utilities (Skilling 2004 Axes->Transpose)
 .axesto_transpose_uint <- function(x, bits) {
@@ -600,21 +560,6 @@ next_lambda_via_rCESS_stat <- function(w, h, lambda,
   env$total <- 0L
   env
 })
-
-ll_eval_counter_reset <- function(enabled = TRUE) {
-  .ll_eval_counter_state$enabled <- isTRUE(enabled)
-  .ll_eval_counter_state$total <- 0L
-  invisible(.ll_eval_counter_state$total)
-}
-
-ll_eval_counter_get <- function() {
-  as.integer(.ll_eval_counter_state$total %||% 0L)
-}
-
-ll_eval_counter_disable <- function() {
-  .ll_eval_counter_state$enabled <- FALSE
-  invisible(NULL)
-}
 
 .ll_eval_counter_add <- function(n) {
   if (!isTRUE(.ll_eval_counter_state$enabled)) return(invisible(NULL))
