@@ -293,6 +293,9 @@ What it does:
 
 -   Chooses a small batch of local/theta pairs where direct local SMC probes are most informative.
 -   The selector should target posterior-shape loss, not just the largest local residual.
+-   Active selection combines raw PMIS/PSIS/certification weakness, graph normalizer risk, residual-model mean risk, posterior-shape covariance reduction, and automatic full-metric novelty.
+-   Raw weakness includes leave-chart-out PMIS fragility: if removing the nearest chart changes `log m_i(theta)` materially, that local/theta query is weak even when ESS and PSIS pass.
+-   Learned residual directions are allowed to guide the model term, but an isotropic posterior-metric floor and exploration quota prevent hard-coded or prematurely learned axes from defining the only weakpoints.
 -   It should rank cheaply first, then spend SMC only on the shortlist.
 
 Current owners:
@@ -345,6 +348,7 @@ Failure mode:
 What it does:
 
 -   Adds charts at selected theta points or selected stencil points.
+-   Exact repairs are admitted for support/evaluator failures. Smooth residual repairs require coherent local shape evidence before stencil charts are admitted. Isolated large probes are held for replication or more probing.
 -   Treats new charts as support first.
 -   Promotes normalizers only after certified edge/direct/graph checks.
 -   Re-solves local normalizer graphs.

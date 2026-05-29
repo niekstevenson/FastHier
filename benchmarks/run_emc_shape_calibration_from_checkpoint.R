@@ -125,8 +125,10 @@ outer_mcmc_moves <- arg_int(cli_args, "outer_mcmc_moves", 3L)
 outer_max_rounds <- arg_int(cli_args, "outer_max_rounds", 90L)
 n_draws <- arg_int(cli_args, "n_draws", 3000L)
 smc_verbose <- arg_lgl(cli_args, "smc_verbose", FALSE)
-selector_raw <- tolower(arg_chr(cli_args, "selector", "risk"))
-selector <- if (selector_raw %in% c("active", "active_feature", "active_feature_residual")) "active" else "risk"
+selector <- tolower(arg_chr(cli_args, "selector", "risk"))
+if (!selector %in% c("risk", "active")) {
+  stop("selector must be 'risk' or 'active'.")
+}
 residual_source_files <- arg_chr_list(cli_args, "residual_source_files", character())
 active_round_ids <- arg_int_list(cli_args, "active_round_ids", integer())
 active_exclude_probe_sets <- arg_chr_list(cli_args, "active_exclude_probe_sets", "holdout")
@@ -134,16 +136,24 @@ active_lambda_shape <- arg_num(cli_args, "active_lambda_shape", 1)
 active_lambda_evidence <- arg_num(cli_args, "active_lambda_evidence", 0.10)
 active_lambda_mean_shape <- arg_num(cli_args, "active_lambda_mean_shape", 0.10)
 active_lambda_support <- arg_num(cli_args, "active_lambda_support", 0.10)
+active_lambda_raw_weakness <- arg_num(cli_args, "active_lambda_raw_weakness", 0.25)
+active_lambda_graph <- arg_num(cli_args, "active_lambda_graph", 0.20)
+active_lambda_novelty <- arg_num(cli_args, "active_lambda_novelty", 0.25)
+active_exploration_metric_floor <- arg_num(cli_args, "active_exploration_metric_floor", 0.05)
+active_exploration_residual_floor <- arg_num(cli_args, "active_exploration_residual_floor", 0.25)
+active_exploration_repair_fraction <- arg_num(cli_args, "active_exploration_repair_fraction", 0.35)
+active_exploration_holdout_fraction <- arg_num(cli_args, "active_exploration_holdout_fraction", 0.35)
+grouped_acquisition <- arg_lgl(cli_args, "grouped_acquisition", FALSE)
+grouped_max_base_theta <- arg_int(cli_args, "grouped_max_base_theta", 2L)
+grouped_stencil_locals_per_theta <- arg_int(cli_args, "grouped_stencil_locals_per_theta", 2L)
+grouped_total_panel_locals_per_theta <- arg_int(cli_args, "grouped_total_panel_locals_per_theta", 6L)
+grouped_min_local_theta <- arg_int(cli_args, "grouped_min_local_theta", 4L)
+grouped_max_directions <- arg_int(cli_args, "grouped_max_directions", 2L)
+grouped_stencil_radius <- arg_num(cli_args, "grouped_stencil_radius", 0.45)
 stop_after_probe <- arg_lgl(cli_args, "stop_after_probe", FALSE)
-repair_executor_raw <- tolower(arg_chr(
-  cli_args,
-  "repair_executor",
-  if (identical(selector, "active")) "selected_exact" else "geometry"
-))
-repair_executor <- if (repair_executor_raw %in% c("selected_exact", "active_exact", "probe_exact")) {
-  "selected_exact"
-} else {
-  "geometry"
+repair_executor <- tolower(arg_chr(cli_args, "repair_executor", "geometry"))
+if (!repair_executor %in% c("geometry", "selected_exact")) {
+  stop("repair_executor must be 'geometry' or 'selected_exact'.")
 }
 
 prefix <- file.path(out_dir, paste0("population_emc_", label))
@@ -234,12 +244,24 @@ settings <- list(
   force_outer_rerun = force_outer_rerun,
   outer_particles = outer_particles,
   selector = selector,
-  selector_raw = selector_raw,
   residual_source_files = residual_source_files,
   active_round_ids = active_round_ids,
   active_exclude_probe_sets = active_exclude_probe_sets,
+  active_lambda_raw_weakness = active_lambda_raw_weakness,
+  active_lambda_graph = active_lambda_graph,
+  active_lambda_novelty = active_lambda_novelty,
+  active_exploration_metric_floor = active_exploration_metric_floor,
+  active_exploration_residual_floor = active_exploration_residual_floor,
+  active_exploration_repair_fraction = active_exploration_repair_fraction,
+  active_exploration_holdout_fraction = active_exploration_holdout_fraction,
+  grouped_acquisition = grouped_acquisition,
+  grouped_max_base_theta = grouped_max_base_theta,
+  grouped_stencil_locals_per_theta = grouped_stencil_locals_per_theta,
+  grouped_total_panel_locals_per_theta = grouped_total_panel_locals_per_theta,
+  grouped_min_local_theta = grouped_min_local_theta,
+  grouped_max_directions = grouped_max_directions,
+  grouped_stencil_radius = grouped_stencil_radius,
   repair_executor = repair_executor,
-  repair_executor_raw = repair_executor_raw,
   smc_verbose = smc_verbose
 )
 save_stage(
@@ -268,6 +290,20 @@ selection_control <- list(
   lambda_evidence = active_lambda_evidence,
   lambda_mean_shape = active_lambda_mean_shape,
   lambda_support = active_lambda_support,
+  lambda_raw_weakness = active_lambda_raw_weakness,
+  lambda_graph = active_lambda_graph,
+  lambda_novelty = active_lambda_novelty,
+  exploration_metric_floor = active_exploration_metric_floor,
+  exploration_residual_floor = active_exploration_residual_floor,
+  exploration_repair_fraction = active_exploration_repair_fraction,
+  exploration_holdout_fraction = active_exploration_holdout_fraction,
+  grouped_acquisition = grouped_acquisition,
+  grouped_max_base_theta = grouped_max_base_theta,
+  grouped_stencil_locals_per_theta = grouped_stencil_locals_per_theta,
+  grouped_total_panel_locals_per_theta = grouped_total_panel_locals_per_theta,
+  grouped_min_local_theta = grouped_min_local_theta,
+  grouped_max_directions = grouped_max_directions,
+  grouped_stencil_radius = grouped_stencil_radius,
   certified_repair_fraction = 0.45,
   uncertified_repair_fraction = 0.30,
   tail_repair_fraction = 0.25,
